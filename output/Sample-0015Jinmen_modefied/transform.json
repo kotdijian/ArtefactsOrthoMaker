@@ -1,0 +1,254 @@
+{
+  "application": "Artifact Pose Normalizer",
+  "version": "0.1.4",
+  "source": {
+    "file": "/Users/noguchiatsushi/Documents/GitHub/ArtefactsOrthoMaker/input/Sample-0015Jinmen_modefied.ply",
+    "sha256": "2f17a2cb6aa1f3689ffdbcc4695971556a74a8a76c74aaa92608566be8538ae5",
+    "input_unit": "m",
+    "unit_to_mm": 1000.0,
+    "coordinate_values_rescaled": false,
+    "normals_status": "missing_recalculated",
+    "appearance_kind": "vertex_color"
+  },
+  "coordinate_system": {
+    "handedness": "right-handed",
+    "z_axis": "up",
+    "front_definition": "manual Z-axis rotation",
+    "origin_definition": "center_axis_intersection_with_posture_AABB_lower_plane"
+  },
+  "posture": {
+    "orientation_method": "slice",
+    "orientation_reference_normal_raw": [
+      0.31939491787257734,
+      -0.6864289375844895,
+      0.6533010026655391
+    ],
+    "oriented_bbox_zmin_before_translation": 0.04925183483321268,
+    "origin_in_oriented_coordinates": [
+      0.07532172828769576,
+      0.01694053597016553,
+      0.04925183483321269
+    ],
+    "origin_definition": "center_axis_intersection_with_posture_AABB_lower_plane",
+    "ground_plane_definition": "posture_AABB_zmin",
+    "initial_slice_axis": {
+      "point": [
+        0.1352639437956239,
+        -0.1118845298187111,
+        0.11509017528596353
+      ],
+      "direction": [
+        0.31939491787257734,
+        -0.6864289375844895,
+        0.6533010026655391
+      ],
+      "confidence": 0.7844478497207303,
+      "diagnostics": {
+        "anisotropy_median": 0.09000861347673142,
+        "radius_median": 0.09083868913644577,
+        "valid_slices": 36,
+        "slice_counts": [
+          18266,
+          8414,
+          6069,
+          6152,
+          5197,
+          6436,
+          6700,
+          6525,
+          6577,
+          7633,
+          8002,
+          7040,
+          7000,
+          7021,
+          8058,
+          7496,
+          7240,
+          7176,
+          6841,
+          6311,
+          6000,
+          5844,
+          6932,
+          6627,
+          5886,
+          5163,
+          5182,
+          5587,
+          4623,
+          4248,
+          4177,
+          4071,
+          4038,
+          3913,
+          3815,
+          3740
+        ],
+        "line_rms": 0.010102147765588996,
+        "straightness": 0.11120974841914436,
+        "low_end_centrality": 0.7523090904829454,
+        "high_end_centrality": 0.3245901558551283,
+        "sign_confidence": 1.0,
+        "opening_candidate": "low",
+        "candidate_scores": [
+          0.4236378587341645,
+          1.277484858399437,
+          1.3725545507320291
+        ],
+        "axis_method": "pca_candidates_plus_slice_symmetry"
+      }
+    },
+    "reference_plane": null,
+    "center_axis_after_posture": {
+      "point": [
+        0.0,
+        -6.938893903907228e-18,
+        0.14594008723338217
+      ],
+      "direction": [
+        0.0,
+        -5.5511151231257815e-17,
+        1.0
+      ],
+      "confidence": 0.7844478497207303,
+      "diagnostics": {
+        "anisotropy_median": 0.09000861347673142,
+        "radius_median": 0.09083868913644577,
+        "valid_slices": 36,
+        "slice_counts": [
+          18266,
+          8414,
+          6069,
+          6152,
+          5197,
+          6436,
+          6700,
+          6525,
+          6577,
+          7633,
+          8002,
+          7040,
+          7000,
+          7021,
+          8058,
+          7496,
+          7240,
+          7176,
+          6841,
+          6311,
+          6000,
+          5844,
+          6932,
+          6627,
+          5886,
+          5163,
+          5182,
+          5587,
+          4623,
+          4248,
+          4177,
+          4071,
+          4038,
+          3913,
+          3815,
+          3740
+        ],
+        "line_rms": 0.010102147765588996,
+        "straightness": 0.11120974841914436,
+        "low_end_centrality": 0.7523090904829454,
+        "high_end_centrality": 0.3245901558551283,
+        "sign_confidence": 1.0,
+        "opening_candidate": "low",
+        "candidate_scores": [
+          0.4236378587341645,
+          1.277484858399437,
+          1.3725545507320291
+        ],
+        "axis_method": "pca_candidates_plus_slice_symmetry",
+        "retained_from_initial_slice": true
+      },
+      "angle_to_z_deg": 0.0
+    },
+    "front_rotation_deg": -72.0
+  },
+  "transform": {
+    "matrix_convention": "row-major storage; column homogeneous vector application",
+    "transform_direction": "raw_to_normalized",
+    "equation": "p_normalized = M_raw_to_normalized @ [x, y, z, 1]^T",
+    "matrix_4x4": [
+      [
+        0.41606807888249364,
+        0.7209872256024995,
+        0.554134256523671,
+        -0.03938710121054857
+      ],
+      [
+        -0.8513954663798724,
+        0.09483002775829821,
+        0.5158808250586174,
+        0.06640030699802481
+      ],
+      [
+        0.31939491787257734,
+        -0.6864289375844895,
+        0.6533010026655391,
+        -0.04925183483321269
+      ],
+      [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    ],
+    "inverse_matrix_4x4": [
+      [
+        0.4160680788824938,
+        -0.8513954663798726,
+        0.31939491787257734,
+        0.08865142161940105
+      ],
+      [
+        0.7209872256024995,
+        0.09483002775829819,
+        -0.6864289375844893,
+        -0.011707030788112874
+      ],
+      [
+        0.5541342565236709,
+        0.5158808250586173,
+        0.6533010026655389,
+        0.019747369967298752
+      ],
+      [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    ]
+  },
+  "orthographic_export": {
+    "views": [
+      "front",
+      "back",
+      "left",
+      "right",
+      "top",
+      "bottom"
+    ],
+    "view_spacing_mm": 10.0,
+    "projection": "parallel/orthographic",
+    "render_modes": [
+      "texture",
+      "texture_normal",
+      "shade"
+    ],
+    "composite": true,
+    "individual_views": false,
+    "scale_bar_mm": 50.0,
+    "scale_bar_style": "simple black line with end ticks; centered label above",
+    "format": "PNG"
+  }
+}
