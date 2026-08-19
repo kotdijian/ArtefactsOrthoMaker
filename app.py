@@ -55,7 +55,7 @@ from pose_core import (
 )
 
 APP_NAME = "Artifact Pose Normalizer"
-APP_VERSION = "0.1.5"
+APP_VERSION = "0.1.4"
 SUPPORTED_SUFFIXES = {".obj", ".ply", ".glb"}
 WORK_DIR = Path(__file__).resolve().parent
 INPUT_DIR = WORK_DIR / "input"
@@ -509,7 +509,7 @@ class MainWindow(QMainWindow):
         try:
             angle = self.front_angle_deg if self.posture_done else 0.0
             self.current_poly = self._make_polydata(self._current_base_matrix())
-            self.plotter.renderer.clear_actors()
+            self.plotter.clear()
             self._viewer_scale_actor = None
             self._viewer_scale_text_actor = None
             self.plotter.set_background("white")
@@ -519,6 +519,7 @@ class MainWindow(QMainWindow):
                 appearance=self.show_appearance.isChecked(),
                 lighting=self.smooth_shading.isChecked(),
             )
+            self.plotter.add_axes()
             if self.actor is not None and self.posture_done:
                 try:
                     self.actor.origin = (0.0, 0.0, 0.0)
