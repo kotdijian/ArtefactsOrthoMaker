@@ -55,7 +55,7 @@ from pose_core import (
 )
 
 APP_NAME = "Artifact Pose Normalizer"
-APP_VERSION = "0.1.5"
+APP_VERSION = "0.1.4"
 SUPPORTED_SUFFIXES = {".obj", ".ply", ".glb"}
 WORK_DIR = Path(__file__).resolve().parent
 INPUT_DIR = WORK_DIR / "input"
@@ -293,17 +293,6 @@ class MainWindow(QMainWindow):
         self.plotter = QtInteractor(view_widget, auto_update=False, multi_samples=0)
         self.plotter.set_background("white")
         self.plotter.add_axes()
-
-        # GUI shading fix v0.1.5:
-        # Keep the proven QtInteractor construction path unchanged.
-        # Use vtkRenderer's built-in automatic light creation and
-        # camera-follow behavior only; do not rebuild PyVista light kits.
-        try:
-            self.plotter.renderer.AutomaticLightCreationOn()
-            self.plotter.renderer.LightFollowCameraOn()
-        except AttributeError:
-            pass
-
         self.plotter.installEventFilter(self)
         self._vtk_widget = self.plotter.interactor
         try:
@@ -514,69 +503,23 @@ class MainWindow(QMainWindow):
             return plotter.add_mesh(poly, scalars="RGB", rgb=True, **kwargs)
         return plotter.add_mesh(poly, color="lightgray", **kwargs)
 
-    def _configure_gui_actor_shading(self, actor, lighting: bool):
-        """Apply deterministic VTK shading only to the interactive GUI actor."""
-        if actor is None:
-            return
-        try:
-            prop = actor.GetProperty()
-        except (AttributeError, TypeError):
-            return
-
-        prop.SetLighting(bool(lighting))
-        if lighting:
-            prop.SetInterpolationToPhong()
-            prop.SetAmbient(0.12)
-            prop.SetDiffuse(0.88)
-            prop.SetSpecular(0.05)
-            prop.SetSpecularPower(12.0)
-
-    def _report_gui_shading_state(self, lighting: bool):
-        """Print a diagnostic line whenever the GUI shading state changes."""
-        try:
-            ren = self.plotter.renderer
-            prop = self.actor.GetProperty() if self.actor is not None else None
-            state = (
-                bool(lighting),
-                int(ren.GetAutomaticLightCreation()),
-                int(ren.GetLightFollowCamera()),
-                int(ren.GetLights().GetNumberOfItems()),
-                int(prop.GetLighting()) if prop is not None else -1,
-                int(prop.GetInterpolation()) if prop is not None else -1,
-            )
-            if state != getattr(self, "_last_gui_shading_state", None):
-                print(
-                    "GUI shading:",
-                    f"requested={state[0]}",
-                    f"auto_light={state[1]}",
-                    f"follow_camera={state[2]}",
-                    f"lights={state[3]}",
-                    f"actor_lighting={state[4]}",
-                    f"interpolation={state[5]}",
-                )
-                self._last_gui_shading_state = state
-        except (AttributeError, TypeError):
-            pass
-
     def refresh_view(self, *_args, reset_camera=False):
         if not self.asset:
             return
         try:
             angle = self.front_angle_deg if self.posture_done else 0.0
             self.current_poly = self._make_polydata(self._current_base_matrix())
-            self.plotter.renderer.clear_actors()
+            self.plotter.clear()
             self._viewer_scale_actor = None
             self._viewer_scale_text_actor = None
             self.plotter.set_background("white")
-            gui_lighting = self.smooth_shading.isChecked()
             self.actor = self._add_mesh_actor(
                 self.plotter,
                 self.current_poly,
                 appearance=self.show_appearance.isChecked(),
-                lighting=gui_lighting,
+                lighting=self.smooth_shading.isChecked(),
             )
-            self._configure_gui_actor_shading(self.actor, gui_lighting)
-
+            self.plotter.add_axes()
             if self.actor is not None and self.posture_done:
                 try:
                     self.actor.origin = (0.0, 0.0, 0.0)
@@ -598,7 +541,6 @@ class MainWindow(QMainWindow):
 
             self._update_viewer_scale_overlay(render=False)
             self.plotter.render()
-            self._report_gui_shading_state(gui_lighting)
         except Exception as e:
             self.statusBar().showMessage(f"表示更新エラー: {e}")
 
