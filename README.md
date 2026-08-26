@@ -1,8 +1,8 @@
-# ArtefactsOrthoMaker (旧 Artefact Pose Normaliser)
+# Artifact Pose Normalizer
 
-OBJ / PLY / GLB 形式の考古資料3Dモデルを読み込み、**土器**または**石器**として姿勢・座標系を正規化し、正規化モデル、変換行列、オルソ画像、輪郭線、断面図を作成する Python GUI アプリです。姿勢・座標系正規化のためのArtefactPoseNormaliserからアップグレードしました。
+OBJ / PLY / GLB 形式の考古資料3Dモデルを読み込み、**土器**または**石器**として姿勢・座標系を正規化し、正規化モデル、変換行列、オルソ画像、輪郭線、断面図を作成する Python GUI アプリです。
 
-現在の正式実行ファイルは **`app.py`** です。v0.1.x 系で完成した土器機能と、v0.2–0.3 系で追加した石器機能を統合しています。`APP_VERSION` は `0.4.1` です。
+現在の正式実行ファイルは **`app.py`** です。v0.1.x 系で完成した土器機能と、v0.2–0.3 系で追加した石器機能を統合しています。`APP_VERSION` は `0.4.2` です。
 
 ## ドキュメント内ナビゲーション
 
@@ -108,7 +108,8 @@ output/<stem>/
 5. Z 軸回転で正面を決定
 6. オルソ面・表現・特殊図・出力形式を設定
 7. 必要に応じてオルソ画像プレビューを確認
-8. `保存して次へ`
+8. `計測一覧出力`
+9. `保存して次へ`
 
 ## 2. 姿勢決定
 
@@ -207,14 +208,38 @@ y = (y_min + y_max) / 2
 
 の x-z 平面で作成します。
 
+v0.4.2 では断面線と断面塗りの処理を分離しています。`vtkCutter` / `vtkStripper` が返した断面 path は、線画・SVGでは **open / closed をそのまま保持**します。open path の始点と終点を無条件に直線で結ぶ処理は行わないため、欠損や非 watertight 部分で長い人工的な斜線が生成されることを防ぎます。
+
 ### 半截
 
 Front 側半分を除去した状態を正面から表示し、切断面を黒で示します。独立PNGではなく複合画像内へ配置します。
+
+黒い切断面の fill は、線画用 path を強制的に閉じるのではなく、fill 専用に次の順で再構成します。
+
+```text
+Cutter / Stripper の断面 path
+        ↓
+端点の近接 snap
+        ↓
+小さい gap + 接線方向が連続する path のみ stitch
+        ↓
+閉輪郭を even-odd rule で fill
+        ↓
+残った微小 gap は限定的な raster closing
+        ↓
+切断面を黒 fill
+```
+
+このため、断面線そのものには補完線を描かず、小さなメッシュ切れによる fill 欠落だけを補います。大きな gap は自動的に接続しません。
+
+複数の閉輪郭が入れ子になる場合は even-odd rule で塗りを反転するため、内側領域を一律に黒く塗り潰さないようにしています。
 
 ### 1/4半截
 
 - 左半分：通常 Front
 - 右半分：半截状態
+
+半截・1/4半截の黒い切断面には、上記の fill 専用断面再構成を共通して使用します。石器の断面抽出・配置ロジックはこの v0.4.2 修正の対象外です。
 
 ### 複合配置例
 
@@ -341,7 +366,8 @@ Mac：
 10. `プレビュー確認`
 11. 青い断面線を必要に応じて移動・追加・削除
 12. 再度 `プレビュー確認` で断面を再生成
-13. `保存して次へ`
+13. `計測一覧出力`
+14. `保存して次へ`
 
 `姿勢決定` 後も `石器姿勢に戻る` で姿勢調整画面へ戻り、再調整後に再度決定できます。
 
@@ -955,6 +981,7 @@ output/lithic001/
 ArtifactPoseNormalizer/
 ├── app.py
 ├── pose_core.py
+├── check_environment.py
 ├── self_test.py
 ├── requirements.txt
 ├── README.md
@@ -964,10 +991,15 @@ ArtifactPoseNormalizer/
 └── output/
 ```
 
-## 2. 検証・固定依存関係
+`pose_core.py` は **pip でインストールするライブラリではなく、このアプリに含まれる必須ファイル**です。`app.py` と同じフォルダに置いてください。
+
+`input/` と `output/` は存在しない場合、アプリ起動時に作成されます。
+
+## 2. requirements.txt の確認結果
+
+v0.4.2 の `app.py` と `pose_core.py` の import を再確認し、アプリが直接利用する第三者パッケージを `requirements.txt` に明示しました。
 
 ```text
-Python 3.13.x
 numpy==2.5.2
 scipy==1.18.0
 trimesh==5.0.0
@@ -975,23 +1007,86 @@ pyvista==0.48.4
 pyvistaqt==0.12.0
 vtk==9.6.2
 PySide6==6.10.3
+QtPy==2.4.3
 Pillow==12.3.0
 ```
 
-**SciPy は石器の `trimesh.bounds.oriented_bounds()` に必要です。**
+用途：
 
-## 3. macOS
+| パッケージ | 主な用途 |
+|---|---|
+| NumPy | 座標・行列・配列計算 |
+| SciPy | 石器 OBB の凸包計算、土器断面 fill の画像処理 |
+| Trimesh | OBJ / PLY / GLB 読込、OBB、メッシュ計測 |
+| PyVista | 3D表示、オルソレンダリング、VTK操作 |
+| PyVistaQt | PyVista の Qt GUI 埋め込み |
+| VTK | 3D描画、断面 Cutter / Stripper、輪郭処理 |
+| PySide6 | GUI |
+| QtPy | PyVistaQt が利用する Qt 抽象化レイヤ |
+| Pillow | PNG画像、輪郭・断面・スケール描画 |
+
+Python 標準ライブラリ（`csv`, `json`, `math`, `pathlib`, `tempfile`, `xml` など）は Python 本体に含まれるため `requirements.txt` には記載しません。
+
+また、上記パッケージ自身が必要とする内部依存パッケージは `pip` が自動的に導入します。**初心者の方が個別にモジュールを1つずつインストールする必要はありません。**
+
+**SciPy は必須です。** 石器の `trimesh.bounds.oriented_bounds()` に加えて、v0.4.2 の土器断面 fill repair でも `scipy.ndimage` を使用します。
+
+## 3. 最初に確認すること
+
+Python 3.13 系を推奨します。
+
+macOS：
+
+```bash
+python3.13 --version
+```
+
+Windows PowerShell：
+
+```powershell
+python --version
+```
+
+`Python 3.13.x` と表示されれば、以下の標準手順を使用できます。
+
+## 4. macOS：初回セットアップ
+
+ターミナルでプロジェクトフォルダへ移動します。
 
 ```bash
 cd /path/to/ArtifactPoseNormalizer
+```
+
+仮想環境 `venv` を作成・有効化します。
+
+```bash
 python3.13 -m venv venv
 source venv/bin/activate
-python -m pip install --upgrade pip
+```
+
+pip 関係を更新してから、**requirements.txt を1回インストールするだけで必要な外部パッケージをまとめて導入できます。**
+
+```bash
+python -m pip install --upgrade pip setuptools wheel
 python -m pip install -r requirements.txt
+```
+
+依存関係の整合性を確認します。
+
+```bash
+python -m pip check
+python check_environment.py
+```
+
+最後に起動します。
+
+```bash
 python app.py
 ```
 
-本プロジェクトの macOS 検証では `.venv` 環境で Qt platform plugin の file flags に関する問題を確認したため、README では `venv` を標準名にしています。一般論として `.venv` が使用不能という意味ではありません。
+### macOS の Qt 起動エラー
+
+本プロジェクトの検証では、`.venv` という名前の環境で Qt platform plugin の file flags に関する問題が発生した例があるため、通常手順では仮想環境名を **`venv`** に統一しています。`.venv` が一般に使用不能という意味ではありません。
 
 詳細：
 
@@ -999,25 +1094,155 @@ python app.py
 docs/macos_qt_venv_issue.md
 ```
 
-## 4. Windows / PowerShell
+最小 Qt 起動確認だけを行う場合：
+
+```bash
+python -c 'from PySide6.QtWidgets import QApplication; app=QApplication([]); print("QApplication OK"); app.quit()'
+```
+
+## 5. Windows / PowerShell：初回セットアップ
+
+PowerShell でプロジェクトフォルダへ移動します。
 
 ```powershell
 cd C:\path\to\ArtifactPoseNormalizer
-python -m venv venv
-.\venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-python app.py
 ```
 
-ExecutionPolicy で activation が拒否される場合：
+仮想環境を作成します。
+
+```powershell
+python -m venv venv
+```
+
+有効化します。
+
+```powershell
+.\venv\Scripts\Activate.ps1
+```
+
+`running scripts is disabled on this system` と表示された場合だけ、現在の PowerShell セッションについて実行を許可してから再度有効化します。
 
 ```powershell
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\venv\Scripts\Activate.ps1
 ```
 
-## 5. SELF TEST
+必要な外部パッケージをまとめて導入します。
+
+```powershell
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install -r requirements.txt
+```
+
+確認：
+
+```powershell
+python -m pip check
+python check_environment.py
+```
+
+起動：
+
+```powershell
+python app.py
+```
+
+## 6. `check_environment.py`
+
+初心者向けの依存関係確認スクリプトです。
+
+```bash
+python check_environment.py
+```
+
+次を順番に確認します。
+
+- NumPy
+- SciPy
+- Trimesh
+- PyVista
+- PyVistaQt
+- VTK
+- PySide6
+- QtPy
+- Pillow
+- ローカル `pose_core.py`
+- Qt `QApplication` / platform plugin
+
+正常な場合、最後に：
+
+```text
+ENVIRONMENT CHECK PASSED
+```
+
+と表示します。
+
+## 7. よくあるエラー
+
+### `ModuleNotFoundError: No module named '...'`
+
+まず仮想環境が有効か確認します。
+
+macOS：
+
+```bash
+which python
+```
+
+`.../ArtifactPoseNormalizer/venv/bin/python` のように表示されるのが正常です。
+
+Windows PowerShell：
+
+```powershell
+Get-Command python
+```
+
+`...\ArtifactPoseNormalizer\venv\Scripts\python.exe` を指していることを確認します。
+
+その後：
+
+```bash
+python -m pip install -r requirements.txt
+python -m pip check
+python check_environment.py
+```
+
+を再実行してください。
+
+### `No module named 'pose_core'`
+
+`pose_core.py` は pip パッケージではありません。
+
+```text
+app.py
+pose_core.py
+```
+
+が同じフォルダにあることを確認してください。
+
+### `No module named 'scipy'`
+
+v0.4.2 では SciPy は任意ではなく必須です。
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+を実行してください。SciPy だけを個別に追加する必要はありません。
+
+### Qt platform plugin エラー
+
+まず：
+
+```bash
+python check_environment.py
+```
+
+で Qt の段階だけが失敗しているか確認してください。macOS では `docs/macos_qt_venv_issue.md` も参照してください。
+
+## 8. SELF TEST
+
+共通計算コアの簡易テスト：
 
 ```bash
 python self_test.py
@@ -1029,7 +1254,21 @@ python self_test.py
 SELF TEST PASSED
 ```
 
-`self_test.py` は主として共通計算コアと従来の姿勢・Normal・メッシュ入出力を確認します。石器のGUI操作、3面ビュー、インタラクティブ断面線、展開図配置については `app.py` を起動して確認してください。
+`self_test.py` は主として姿勢・Normal・メッシュ計算を確認します。土器・石器の GUI 操作、3Dビュー、インタラクティブ断面線、オルソ配置は `app.py` を起動して確認してください。
+
+## 9. 更新時の推奨手順
+
+`requirements.txt` が変更された場合は、既存 `venv` 内で：
+
+```bash
+python -m pip install -r requirements.txt
+python -m pip check
+python check_environment.py
+```
+
+を実行してください。
+
+環境が大きく崩れた場合は、個別モジュールを継ぎ足すより `venv` を作り直し、`requirements.txt` から再構築する方が再現性があります。
 
 ---
 
