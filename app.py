@@ -65,7 +65,7 @@ from pose_core import (
 )
 
 APP_NAME = "Artifact Pose Normalizer"
-APP_VERSION = "0.4.1"
+APP_VERSION = "0.4.2"
 SUPPORTED_SUFFIXES = {".obj", ".ply", ".glb"}
 WORK_DIR = Path(__file__).resolve().parent
 INPUT_DIR = WORK_DIR / "input"
@@ -5541,7 +5541,12 @@ class MainWindow(QMainWindow):
         img = Image.new("RGBA", (width, height), (255, 255, 255, 0))
         draw = ImageDraw.Draw(img)
         if fill_section:
-            self._fill_section_paths(draw, paths, width_px)
+            self._fill_section_paths(
+                draw,
+                paths,
+                width_px,
+                canvas_size=(width, height),
+            )
         else:
             self._draw_polyline_paths(draw, paths, width_px)
         return np.asarray(img, dtype=np.uint8)
@@ -5596,7 +5601,12 @@ class MainWindow(QMainWindow):
         )
         half_im = Image.fromarray(np.asarray(half, dtype=np.uint8), mode="RGBA")
         draw = ImageDraw.Draw(half_im)
-        self._fill_section_paths(draw, projected, section_fill_width_px)
+        self._fill_section_paths(
+            draw,
+            projected,
+            section_fill_width_px,
+            canvas_size=half_im.size,
+        )
         return np.asarray(half_im, dtype=np.uint8)
 
     def _quarter_panel_for_mode(
@@ -5710,28 +5720,432 @@ class MainWindow(QMainWindow):
         return projected
 
     @staticmethod
-    def _draw_polyline_paths(draw, paths: list[np.ndarray], width_px: int, fill=(0, 0, 0, 255)):
+    def _draw_polyline_paths(
+        draw,
+        paths: list[np.ndarray],
+        width_px: int,
+        fill=(0, 0, 0, 255),
+    ):
+        """Draw section/outline polylines exactly as supplied.
+
+        In particular, open section paths are *not* force-closed.  This keeps
+        line/SVG output faithful to vtkCutter/vtkStripper and prevents a long
+        artificial diagonal between unrelated endpoints.
+        """
         width_px = max(1, int(width_px))
         for path in paths:
-            if len(path) < 2:
+            arr = np.asarray(path, dtype=float)
+            if len(arr) < 2:
                 continue
-            pts = [(int(round(float(x))), int(round(float(y)))) for x, y in path]
-            draw.line(pts, fill=fill, width=width_px, joint="curve")
+            pts = [
+                (int(round(float(x))), int(round(float(y))))
+                for x, y in arr
+                if np.isfinite(x) and np.isfinite(y)
+            ]
+            if len(pts) >= 2:
+                draw.line(
+                    pts,
+                    fill=fill,
+                    width=width_px,
+                    joint="curve",
+                )
 
     @staticmethod
-    def _fill_section_paths(draw, paths: list[np.ndarray], width_px: int):
-        width_px = max(1, int(width_px))
-        for path in paths:
+    def _clean_section_path_2d(path: np.ndarray) -> np.ndarray:
+        """Remove non-finite and consecutive duplicate 2D points."""
+        arr = np.asarray(path, dtype=float)
+        if arr.ndim != 2 or arr.shape[1] < 2:
+            return np.empty((0, 2), dtype=float)
+        arr = arr[:, :2]
+        arr = arr[np.isfinite(arr).all(axis=1)]
+        if len(arr) < 2:
+            return arr
+
+        keep = np.ones(len(arr), dtype=bool)
+        delta = np.linalg.norm(np.diff(arr, axis=0), axis=1)
+        keep[1:] = delta > 1.0e-6
+        return arr[keep]
+
+    @staticmethod
+    def _section_path_tangent(
+        path: np.ndarray,
+        at_start: bool,
+        sample_count: int = 4,
+    ) -> np.ndarray | None:
+        """Return the tangent pointing *into* the path from an endpoint."""
+        arr = np.asarray(path, dtype=float)
+        if len(arr) < 2:
+            return None
+
+        k = min(max(1, int(sample_count)), len(arr) - 1)
+        if at_start:
+            vec = arr[k] - arr[0]
+        else:
+            vec = arr[-1] - arr[-1 - k]
+
+        norm = float(np.linalg.norm(vec))
+        if norm <= 1.0e-12:
+            return None
+        return vec / norm
+
+    @staticmethod
+    def _section_connection_is_smooth(
+        path_a: np.ndarray,
+        path_b: np.ndarray,
+        max_angle_deg: float = 60.0,
+    ) -> bool:
+        """Check a proposed A(end) -> B(start) small-gap bridge."""
+        a = np.asarray(path_a, dtype=float)
+        b = np.asarray(path_b, dtype=float)
+        if len(a) < 2 or len(b) < 2:
+            return False
+
+        connection = b[0] - a[-1]
+        distance = float(np.linalg.norm(connection))
+        if distance <= 1.0e-12:
+            return True
+        conn = connection / distance
+
+        # A tangent must continue toward the bridge.
+        ta_into = MainWindow._section_path_tangent(a, at_start=False)
+        # _section_path_tangent(end) points from interior -> end, which is
+        # exactly the outward continuation direction at A.
+        # B tangent at start points from start -> interior.
+        tb_into = MainWindow._section_path_tangent(b, at_start=True)
+        if ta_into is None or tb_into is None:
+            return False
+
+        cos_limit = float(np.cos(np.deg2rad(max_angle_deg)))
+        return (
+            float(np.dot(ta_into, conn)) >= cos_limit
+            and float(np.dot(tb_into, conn)) >= cos_limit
+        )
+
+    @staticmethod
+    def _repair_section_paths_for_fill(
+        paths: list[np.ndarray],
+        canvas_size: tuple[int, int],
+    ) -> tuple[list[np.ndarray], list[np.ndarray], dict]:
+        """Reconstruct fill contours without altering visible section lines.
+
+        Vector repair stages:
+          1. clean consecutive duplicates,
+          2. snap/merge nearly coincident endpoints,
+          3. bridge only small gaps whose tangent directions are compatible,
+          4. close only small, compatible self-gaps.
+
+        Large gaps are never bridged here.
+        """
+        width, height = [max(1, int(v)) for v in canvas_size]
+        diagonal = float(np.hypot(width, height))
+
+        # Pixel-domain tolerances.  They scale with exported image size but
+        # remain bounded so high-resolution exports do not permit large,
+        # invented bridges.
+        snap_tol = max(1.25, min(3.0, diagonal * 0.0006))
+        gap_tol = max(3.0, min(12.0, diagonal * 0.0025))
+        tangent_limit_deg = 60.0
+
+        work = [
+            MainWindow._clean_section_path_2d(path)
+            for path in paths
+        ]
+        work = [path.copy() for path in work if len(path) >= 2]
+
+        def oriented_for_end(path: np.ndarray, endpoint: int) -> np.ndarray:
+            # endpoint 0=start, 1=end.  Return path with selected endpoint last.
+            return path[::-1].copy() if endpoint == 0 else path.copy()
+
+        def oriented_for_start(path: np.ndarray, endpoint: int) -> np.ndarray:
+            # Return path with selected endpoint first.
+            return path.copy() if endpoint == 0 else path[::-1].copy()
+
+        merge_count = 0
+        bridge_count = 0
+
+        # Greedy nearest admissible endpoint joining.  Section contour counts
+        # are normally small, so clarity/determinism is preferable to a more
+        # complex graph optimiser here.
+        while len(work) >= 2:
+            best = None
+
+            for i in range(len(work) - 1):
+                for j in range(i + 1, len(work)):
+                    for endpoint_i in (0, 1):
+                        for endpoint_j in (0, 1):
+                            a = oriented_for_end(work[i], endpoint_i)
+                            b = oriented_for_start(work[j], endpoint_j)
+                            d = float(np.linalg.norm(a[-1] - b[0]))
+                            if d > gap_tol:
+                                continue
+
+                            admissible = (
+                                d <= snap_tol
+                                or MainWindow._section_connection_is_smooth(
+                                    a,
+                                    b,
+                                    max_angle_deg=tangent_limit_deg,
+                                )
+                            )
+                            if not admissible:
+                                continue
+
+                            candidate = (
+                                d,
+                                i,
+                                j,
+                                endpoint_i,
+                                endpoint_j,
+                                a,
+                                b,
+                            )
+                            if best is None or candidate[0] < best[0]:
+                                best = candidate
+
+            if best is None:
+                break
+
+            d, i, j, _ei, _ej, a, b = best
+
+            if d <= snap_tol:
+                joint = (a[-1] + b[0]) * 0.5
+                a[-1] = joint
+                b[0] = joint
+                merged = np.vstack([a, b[1:]])
+            else:
+                # Keep an explicit short bridge only in the *fill repair*
+                # geometry.  It is never used by _draw_polyline_paths().
+                merged = np.vstack([a, b])
+                bridge_count += 1
+
+            work[i] = merged
+            del work[j]
+            merge_count += 1
+
+        closed: list[np.ndarray] = []
+        open_paths: list[np.ndarray] = []
+        self_close_count = 0
+
+        for path in work:
             if len(path) < 2:
                 continue
-            pts = [(int(round(float(x))), int(round(float(y)))) for x, y in path]
-            if len(pts) >= 3:
-                x = np.asarray([p[0] for p in pts], dtype=float)
-                y = np.asarray([p[1] for p in pts], dtype=float)
-                area = 0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
-                if area >= 1.0:
-                    draw.polygon(pts, fill=(0, 0, 0, 255))
-            draw.line(pts, fill=(0, 0, 0, 255), width=width_px, joint="curve")
+
+            d = float(np.linalg.norm(path[-1] - path[0]))
+            if d <= snap_tol:
+                joint = (path[-1] + path[0]) * 0.5
+                repaired = path.copy()
+                repaired[0] = joint
+                repaired[-1] = joint
+                closed.append(repaired)
+                continue
+
+            if d <= gap_tol:
+                # For closure, treat the same path as A(end) and B(start).
+                b = path.copy()
+                if MainWindow._section_connection_is_smooth(
+                    path,
+                    b,
+                    max_angle_deg=tangent_limit_deg,
+                ):
+                    repaired = np.vstack([path, path[0]])
+                    closed.append(repaired)
+                    self_close_count += 1
+                    continue
+
+            open_paths.append(path)
+
+        diagnostics = {
+            "snap_tolerance_px": snap_tol,
+            "gap_tolerance_px": gap_tol,
+            "tangent_limit_deg": tangent_limit_deg,
+            "merge_count": merge_count,
+            "short_bridge_count": bridge_count,
+            "self_close_count": self_close_count,
+            "closed_path_count": len(closed),
+            "open_path_count": len(open_paths),
+        }
+        return closed, open_paths, diagnostics
+
+    @staticmethod
+    def _fill_section_paths(
+        draw,
+        paths: list[np.ndarray],
+        width_px: int,
+        canvas_size: tuple[int, int] | None = None,
+    ):
+        """Fill pottery cut faces with repaired contours.
+
+        Visible linework is always drawn from the original vtkCutter paths.
+        Fill geometry is reconstructed independently:
+
+          * small endpoint gaps: vector snap/stitch with tangent constraint,
+          * closed contours: even-odd XOR fill,
+          * remaining small raster gaps: conservative morphology closing.
+
+        This avoids both failure modes:
+          1. long artificial diagonal lines from unconditional path closure,
+          2. missing black cut-face fill when vtkStripper returns a slightly
+             fragmented/open contour.
+
+        Large unresolved gaps are intentionally not invented.
+        """
+        from PIL import Image, ImageDraw
+        from scipy.ndimage import (
+            binary_closing,
+            binary_fill_holes,
+            generate_binary_structure,
+            iterate_structure,
+            label,
+        )
+
+        width_px = max(1, int(width_px))
+        if canvas_size is None:
+            # PIL's ImageDraw currently exposes its target image as _image.
+            # All in-app call sites pass canvas_size explicitly; this is only
+            # a defensive fallback for older callers.
+            target = getattr(draw, "_image", None)
+            if target is None:
+                raise RuntimeError("section fill requires canvas_size")
+            canvas_size = target.size
+
+        canvas_w, canvas_h = [
+            max(1, int(v)) for v in canvas_size
+        ]
+
+        raw_paths = [
+            MainWindow._clean_section_path_2d(path)
+            for path in paths
+        ]
+        raw_paths = [path for path in raw_paths if len(path) >= 2]
+        if not raw_paths:
+            return
+
+        closed_paths, open_paths, diag = (
+            MainWindow._repair_section_paths_for_fill(
+                raw_paths,
+                (canvas_w, canvas_h),
+            )
+        )
+
+        # --------------------------------------------------------------
+        # A. Even-odd vector fill.
+        #
+        # Each loop toggles the mask rather than simply OR-ing polygons.
+        # Nested loops therefore preserve holes instead of filling them.
+        # --------------------------------------------------------------
+        parity = np.zeros((canvas_h, canvas_w), dtype=bool)
+
+        for path in closed_paths:
+            if len(path) < 3:
+                continue
+            loop_img = Image.new(
+                "1",
+                (canvas_w, canvas_h),
+                0,
+            )
+            loop_draw = ImageDraw.Draw(loop_img)
+            pts = [
+                (int(round(float(x))), int(round(float(y))))
+                for x, y in path
+            ]
+            if len(pts) < 3:
+                continue
+            loop_draw.polygon(pts, fill=1)
+            parity ^= np.asarray(loop_img, dtype=bool)
+
+        # --------------------------------------------------------------
+        # B. Conservative raster fallback for small unresolved gaps.
+        #
+        # Only the still-open paths are rasterised here.  Morphological
+        # closing can repair a few-pixel Cutter/Stripper discontinuity but
+        # cannot create the old long diagonal because its radius is bounded
+        # by half the vector gap tolerance.
+        # --------------------------------------------------------------
+        if open_paths:
+            gap_tol = float(diag["gap_tolerance_px"])
+            radius = max(
+                1,
+                min(6, int(np.ceil(gap_tol * 0.5))),
+            )
+            pad = radius + 4
+            padded_size = (
+                canvas_w + 2 * pad,
+                canvas_h + 2 * pad,
+            )
+            boundary_img = Image.new("1", padded_size, 0)
+            boundary_draw = ImageDraw.Draw(boundary_img)
+
+            for path in open_paths:
+                pts = [
+                    (
+                        int(round(float(x))) + pad,
+                        int(round(float(y))) + pad,
+                    )
+                    for x, y in path
+                ]
+                if len(pts) >= 2:
+                    boundary_draw.line(
+                        pts,
+                        fill=1,
+                        width=max(1, min(2, width_px)),
+                    )
+
+            boundary = np.asarray(boundary_img, dtype=bool)
+            structure = iterate_structure(
+                generate_binary_structure(2, 2),
+                radius,
+            )
+            repaired_boundary = binary_closing(
+                boundary,
+                structure=structure,
+                iterations=1,
+            )
+            filled = binary_fill_holes(repaired_boundary)
+            interior = filled & ~repaired_boundary
+
+            # Crop away the padding.
+            interior = interior[
+                pad : pad + canvas_h,
+                pad : pad + canvas_w,
+            ]
+
+            # Accept only bounded interior components of reasonable size.
+            # A huge component would indicate that the contour is genuinely
+            # incomplete, in which case silently inventing a fill is worse
+            # than leaving that region unfilled.
+            labeled, count = label(interior)
+            canvas_area = float(canvas_w * canvas_h)
+            fallback = np.zeros_like(parity)
+            for component_id in range(1, count + 1):
+                component = labeled == component_id
+                area = int(np.count_nonzero(component))
+                if area < 4:
+                    continue
+                if area / max(canvas_area, 1.0) > 0.45:
+                    continue
+                fallback |= component
+
+            parity |= fallback
+
+        if np.any(parity):
+            mask_img = Image.fromarray(
+                (parity.astype(np.uint8) * 255),
+                mode="L",
+            )
+            draw.bitmap(
+                (0, 0),
+                mask_img,
+                fill=(0, 0, 0, 255),
+            )
+
+        # Draw the *original* linework last.  No repair bridge is exposed as
+        # a visible section line.
+        MainWindow._draw_polyline_paths(
+            draw,
+            raw_paths,
+            width_px,
+            fill=(0, 0, 0, 255),
+        )
 
     @staticmethod
     def _split_left_right(full_rgba, half_rgba):
@@ -5786,9 +6200,11 @@ class MainWindow(QMainWindow):
             if n >= 2:
                 ids = lines[i + 1 : i + 1 + n]
                 path = pts[ids]
-                if len(path) >= 2 and np.linalg.norm(path[0] - path[-1]) > 1e-9:
-                    path = np.vstack([path, path[0]])
-                paths.append(path)
+                # Preserve vtkCutter/vtkStripper topology exactly.
+                # Open paths stay open for line/SVG output; black section
+                # filling uses a separate conservative repair pipeline.
+                if len(path) >= 2:
+                    paths.append(path)
             i += n + 1
         return paths
 
@@ -5954,7 +6370,12 @@ class MainWindow(QMainWindow):
             for view in views:
                 base = Image.fromarray(np.asarray(half_rendered[view], dtype=np.uint8), mode="RGBA")
                 draw = ImageDraw.Draw(base)
-                self._fill_section_paths(draw, projected_sections.get(view, []), outline_width_px)
+                self._fill_section_paths(
+                    draw,
+                    projected_sections.get(view, []),
+                    outline_width_px,
+                    canvas_size=base.size,
+                )
                 half_arr = np.asarray(base, dtype=np.uint8)
 
                 if mode == "half_section":
