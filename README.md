@@ -1,6 +1,6 @@
-# Artifact Pose Normalizer
+# ArtifactsOrthoMaker (旧 Artefact Pose Normaliser)
 
-OBJ / PLY / GLB 形式の考古資料3Dモデルを読み込み、**土器**または**石器**として姿勢・座標系を正規化し、正規化モデル、変換行列、オルソ画像、輪郭線、断面図を作成する Python GUI アプリです。
+OBJ / PLY / GLB 形式の考古資料3Dモデルを読み込み、**土器**または**石器**として姿勢・座標系を正規化し、正規化モデル、変換行列、オルソ画像、輪郭線、断面図を作成する Python GUI アプリです。姿勢・座標系正規化のためのArtefactPoseNormaliserからアップグレードしました。
 
 現在の正式実行ファイルは **`app.py`** です。v0.1.x 系で完成した土器機能と、v0.2–0.3 系で追加した石器機能を統合しています。`APP_VERSION` は `0.4.1` です。
 
