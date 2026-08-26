@@ -8,9 +8,7 @@ OBJ / PLY / GLB 形式の考古資料3Dモデルを読み込み、**土器**ま�
 
 **注意事項：このリポジトリをZIPでダウンロードするか、Cloneしてください。**
 
-**app.pyだけを単独でダウンロードしないでください。**
-
-**pose_core.py と requirements.txt も必要です。**
+**app.pyだけを単独でダウンロードしないでください。pose_core.py と requirements.txt も必要です。**
 
 ## ドキュメント内ナビゲーション
 
