@@ -65,7 +65,7 @@ from pose_core import (
 )
 
 APP_NAME = "Artifact Pose Normalizer"
-APP_VERSION = "0.4.2"
+APP_VERSION = "0.4.3"
 SUPPORTED_SUFFIXES = {".obj", ".ply", ".glb"}
 WORK_DIR = Path(__file__).resolve().parent
 INPUT_DIR = WORK_DIR / "input"
@@ -3654,9 +3654,16 @@ class MainWindow(QMainWindow):
             pos = center + np.array([-dist, 0.0, 0.0])
             up = np.array([0.0, 1.0, 0.0])
         elif view == "top":
+            # Rectangular-prism net convention:
+            # Top is unfolded above Front, so the Front-facing (+Z) edge
+            # must appear at the bottom of the Top panel and the Back-facing
+            # (-Z) edge at the top. Using up=-Z also keeps screen-right=+X,
+            # aligned with Front.
             pos = center + np.array([0.0, dist, 0.0])
-            up = np.array([0.0, 0.0, 1.0])
+            up = np.array([0.0, 0.0, -1.0])
         elif view == "bottom":
+            # Bottom is unfolded below Front; Front-facing (+Z) therefore
+            # appears at the top of the Bottom panel.
             pos = center + np.array([0.0, -dist, 0.0])
             up = np.array([0.0, 0.0, 1.0])
         else:
