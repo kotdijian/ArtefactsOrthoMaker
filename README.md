@@ -4,7 +4,7 @@ OBJ / PLY / GLB 形式の考古資料3Dモデルを読み込み、**土器**ま�
 
 姿勢推定・座標系正規化（pose_core.py）をベースに、オルソ投影展開図作成用アプリとしてアップグレードしました。
 
-現在の正式実行ファイルは **`app.py`** です。v0.1.x 系で完成した土器機能と、v0.2–0.3 系で追加した石器機能を統合しています。`APP_VERSION` は `0.4.3` です。
+現在の正式実行ファイルは **`app.py`** です。v0.1.x 系で完成した土器機能と、v0.2–0.3 系で追加した石器機能を統合しています。`APP_VERSION` は `0.4.4` です。
 
 **注意事項：このリポジトリをZIPでダウンロードするか、Cloneしてください。**
 
@@ -658,13 +658,21 @@ Front / Back に対応する2本の縦青線として表示し、一方を移動
 
 ライン選択は描画順ではなく、クリック位置から最も近い断面線を View 側で判定します。
 
-新規追加した同方向断面は完全重複を避けるため、中央から交互にずらして配置します。
+断面を追加・削除して**断面数が変わるたびに、同方向の断面位置は全体 bbox に対して等間隔へリセット**されます。
+
+断面数を `N` とすると、初期位置は bbox の `k/(N+1)`（`k=1..N`）です。
 
 ```text
-60%, 40%, 70%, 30%, 80%, 20% ...
+1断面：1/2
+2断面：1/3, 2/3
+3断面：1/4, 2/4, 3/4
+4断面：1/5, 2/5, 3/5, 4/5
+...
 ```
 
-青線を移動した後、`プレビュー確認` を押すと対応する断面を再生成します。
+したがって、追加数を `n` とすると断面数は `n+1`、位置は `k/(n+2)`（`k=1..n+1`）になります。これは上記の具体例を一般化した式です。
+
+青線を手動で移動することは引き続き可能です。ただし、その後に断面を追加または削除すると、同方向の全断面は再び等間隔へリセットされます。位置変更後は `プレビュー確認` を押して対応する断面を再生成します。
 
 ## 10. 石器断面の配置
 
@@ -688,6 +696,8 @@ Front の下
 
 複数の X-Z 断面は下方向に配置します。ただし順序は断面線の追加・描画順ではなく、**Front 上での位置が上→下となる順**です。最も上側の横断面が先頭、その下側の断面が順に続きます。
 
+v0.4.4 から、断面図の配置間隔はモデル全体 bbox と同じ大きさの固定パネルではなく、**各断面輪郭そのものの tight bbox（外接矩形）**を基準にします。隣接する断面輪郭 bbox の端同士の距離を `面間隔` に保ちます。デフォルトは `10 mm` です。
+
 ### Y-Z 断面
 
 展開図の最右端に配置します。
@@ -701,6 +711,8 @@ Back の右
 になります。
 
 複数の Y-Z 断面の順序も断面線の追加・描画順ではなく、**Back 上での位置が左→右となる順**です。Back は左右反転表示なので、内部の正規化位置値では大きい値から小さい値へ並びます。
+
+Y-Z 断面についても、各断面輪郭の tight bbox の右端と次の断面輪郭 bbox の左端の間を `面間隔`（デフォルト `10 mm`）に保ちます。断面位置を移動して形状・寸法が変わった場合、`プレビュー確認` の再実行時に tight bbox を再計算し、指定間隔で再配置します。
 
 ## 11. 石器断面位置ティック
 
@@ -786,7 +798,13 @@ bbox_z_mm
 
 ### 石器のみ：断面 bbox
 
-同じ `<stem>_measurements.csv` に、設定された各断面を1行ずつ追加します。
+同じ `<stem>_measurements.csv` に、設定された各断面を1行ずつ追加します。さらに v0.4.4 から、断面 bbox だけをまとめた資料別CSVも必ず出力します。
+
+```text
+output/<stem>/<stem>_section_bboxes.csv
+```
+
+このファイルは `output/inventory-lithic.csv` のように複数資料を追記・更新する一覧ではありません。**各資料ごとに独立して作成**され、画像・PLY・Transform と同じ `output/<stem>/` フォルダに保存されます。1行が1断面です。
 
 現在の断面定義は：
 
@@ -810,9 +828,12 @@ Y-Z断面 → bbox_y, bbox_z
 
 ```text
 record_id
+section_axis
 section_plane
 section_position
+section_position_percent
 section_coordinate
+section_coordinate_mm
 status
 ```
 
@@ -968,6 +989,8 @@ output/lithic001/
 ├── transform_original_to_obb_cloudcompare.txt
 ├── transform_obb_to_result.csv                  # 必要な場合のみ
 ├── transform_obb_to_result_cloudcompare.txt     # 必要な場合のみ
+├── lithic001_measurements.csv
+├── lithic001_section_bboxes.csv
 ├── lithic001_ortho_texture.png
 ├── lithic001_ortho_texture_normal.png
 ├── lithic001_ortho_shade.png
@@ -1012,7 +1035,7 @@ output/lithic001/
 ## 1. 推奨フォルダ構成
 
 ```text
-ArtifactPoseNormalizer/
+ArtefactsOrthoMaker/
 ├── app.py
 ├── pose_core.py
 ├── check_environment.py
@@ -1031,7 +1054,7 @@ ArtifactPoseNormalizer/
 
 ## 2. requirements.txt の確認結果
 
-v0.4.3 の `app.py` と `pose_core.py` の import を再確認し、アプリが直接利用する第三者パッケージを `requirements.txt` に明示しました。
+v0.4.4 の `app.py` と `pose_core.py` の import を再確認し、アプリが直接利用する第三者パッケージを `requirements.txt` に明示しました。
 
 ```text
 numpy==2.5.2
@@ -1088,7 +1111,7 @@ python --version
 ターミナルでプロジェクトフォルダへ移動します。
 
 ```bash
-cd /path/to/ArtifactPoseNormalizer
+cd /path/to/ArtefactsOrthoMaker
 ```
 
 仮想環境 `venv` を作成・有効化します。
@@ -1139,7 +1162,7 @@ python -c 'from PySide6.QtWidgets import QApplication; app=QApplication([]); pri
 PowerShell でプロジェクトフォルダへ移動します。
 
 ```powershell
-cd C:\path\to\ArtifactPoseNormalizer
+cd C:\path\to\ArtefactsOrthoMaker
 ```
 
 仮想環境を作成します。
@@ -1223,7 +1246,7 @@ macOS：
 which python
 ```
 
-`.../ArtifactPoseNormalizer/venv/bin/python` のように表示されるのが正常です。
+`.../ArtefactsOrthoMaker/venv/bin/python` のように表示されるのが正常です。
 
 Windows PowerShell：
 
@@ -1231,7 +1254,7 @@ Windows PowerShell：
 Get-Command python
 ```
 
-`...\ArtifactPoseNormalizer\venv\Scripts\python.exe` を指していることを確認します。
+`...\ArtefactsOrthoMaker\venv\Scripts\python.exe` を指していることを確認します。
 
 その後：
 

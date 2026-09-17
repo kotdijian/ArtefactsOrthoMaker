@@ -65,7 +65,7 @@ from pose_core import (
 )
 
 APP_NAME = "Artifact Pose Normalizer"
-APP_VERSION = "0.4.3"
+APP_VERSION = "0.4.4"
 SUPPORTED_SUFFIXES = {".obj", ".ply", ".glb"}
 WORK_DIR = Path(__file__).resolve().parent
 INPUT_DIR = WORK_DIR / "input"
@@ -1919,6 +1919,31 @@ class MainWindow(QMainWindow):
             "石器姿勢調整へ戻りました。再度「姿勢決定」で確定できます。"
         )
 
+    def _redistribute_lithic_sections(self, axis: str) -> None:
+        """Reset all sections on one axis to equal bbox intervals.
+
+        For N sections, positions are k/(N+1), k=1..N.
+        Therefore:
+          N=1 -> 1/2
+          N=2 -> 1/3, 2/3
+          N=3 -> 1/4, 2/4, 3/4
+          N=4 -> 1/5, 2/5, 3/5, 4/5
+
+        This is intentionally called whenever the section count changes.
+        Manual drag positions are preserved only until the next add/delete.
+        """
+        axis = str(axis).upper()
+        group = sorted(
+            [s for s in self.lithic_sections if s["axis"] == axis],
+            key=lambda s: str(s.get("id", "")),
+        )
+        count = len(group)
+        if count == 0:
+            return
+        denominator = float(count + 1)
+        for index, section in enumerate(group, start=1):
+            section["position"] = float(index / denominator)
+
     def _add_lithic_section(
         self,
         axis: str,
@@ -1929,19 +1954,6 @@ class MainWindow(QMainWindow):
         if axis not in ("X", "Y"):
             return
 
-        existing_count = sum(
-            1 for section in self.lithic_sections
-            if section["axis"] == axis
-        )
-
-        if position is None:
-            # Avoid exact overlap of newly added section lines.
-            # Sequence: 0.60, 0.40, 0.70, 0.30, 0.80, 0.20 ...
-            step_index = existing_count + 1
-            magnitude = 0.10 * ((step_index + 1) // 2)
-            sign = 1.0 if step_index % 2 == 1 else -1.0
-            position = 0.5 + sign * magnitude
-
         self.lithic_section_counter[axis] = (
             int(self.lithic_section_counter.get(axis, 0)) + 1
         )
@@ -1950,12 +1962,25 @@ class MainWindow(QMainWindow):
             {
                 "id": section_id,
                 "axis": axis,
-                "position": float(max(0.02, min(0.98, position))),
+                "position": float(0.5 if position is None else position),
             }
         )
+
+        # User-added sections always reset every section on that axis to
+        # equal intervals across the full model bbox.  Explicit positions are
+        # used only by initialization/restoration code.
+        if position is None:
+            self._redistribute_lithic_sections(axis)
+
         self.lithic_active_section_id = section_id
-        self._update_lithic_section_status()
-        if refresh_overlay and self.viewer_stack.currentIndex() == 2:
+        in_preview = bool(
+            refresh_overlay and self.viewer_stack.currentIndex() == 2
+        )
+        self._update_lithic_section_status(dirty=in_preview)
+        if in_preview:
+            # Update all guide lines immediately.  The actual section panels
+            # are regenerated when the user presses Preview again, preserving
+            # the established workflow for section edits.
             self._rebuild_lithic_preview_lines()
 
     def _delete_selected_lithic_section(self):
@@ -1972,10 +1997,14 @@ class MainWindow(QMainWindow):
         if len(self.lithic_sections) == before:
             return
         self.lithic_active_section_id = None
+
+        # Any change in section count resets the remaining sections on the
+        # same axis to equal intervals across the full bbox.
+        self._redistribute_lithic_sections(str(sid)[0].upper())
         self._update_lithic_section_status()
 
-        # If a generated section panel exists, regenerate the preview now so
-        # that both the line and the previously acquired section disappear.
+        # Regenerate the preview so both section geometry and guide-line
+        # positions reflect the new equal-interval distribution.
         if self.viewer_stack.currentIndex() == 2:
             self._show_lithic_output_preview()
 
@@ -3161,11 +3190,14 @@ class MainWindow(QMainWindow):
             row = {
                 "record_type": "section_bbox",
                 "record_id": section["id"],
+                "section_axis": section["axis"],
                 "section_plane": (
                     "X-Z" if section["axis"] == "X" else "Y-Z"
                 ),
                 "section_position": float(section["position"]),
+                "section_position_percent": float(section["position"] * 100.0),
                 "section_coordinate": float(coord),
+                "section_coordinate_mm": float(coord * self.asset.unit_to_mm),
                 "bbox_x": "",
                 "bbox_y": "",
                 "bbox_z": "",
@@ -3226,9 +3258,12 @@ class MainWindow(QMainWindow):
             {
                 "record_type": "model_bbox",
                 "record_id": "model",
+                "section_axis": "",
                 "section_plane": "",
                 "section_position": "",
+                "section_position_percent": "",
                 "section_coordinate": "",
+                "section_coordinate_mm": "",
                 "bbox_x": float(ext[0]),
                 "bbox_y": float(ext[1]),
                 "bbox_z": float(ext[2]),
@@ -3254,9 +3289,12 @@ class MainWindow(QMainWindow):
             "input_unit",
             "record_type",
             "record_id",
+            "section_axis",
             "section_plane",
             "section_position",
+            "section_position_percent",
             "section_coordinate",
+            "section_coordinate_mm",
             "bbox_x",
             "bbox_y",
             "bbox_z",
@@ -3298,6 +3336,74 @@ class MainWindow(QMainWindow):
                 }
                 writer.writerow({**common, **row})
 
+        if self._is_lithic():
+            self._write_lithic_section_bbox_csv(
+                out_dir,
+                rows=[r for r in rows if r.get("record_type") == "section_bbox"],
+            )
+
+        return path
+
+    def _write_lithic_section_bbox_csv(
+        self,
+        out_dir: Path,
+        rows: list[dict],
+    ) -> Path:
+        """Write one per-artifact CSV containing one bbox row per section.
+
+        Unlike output/inventory-lithic.csv, this file is never merged across
+        multiple input artifacts.  It lives beside images and transforms in
+        output/<stem>/.
+        """
+        if not self.asset:
+            raise RuntimeError("モデルが読み込まれていません。")
+
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / f"{self.asset.source_path.stem}_section_bboxes.csv"
+        fieldnames = [
+            "source_file",
+            "source_stem",
+            "source_sha256",
+            "input_unit",
+            "section_id",
+            "section_axis",
+            "section_plane",
+            "section_position",
+            "section_position_percent",
+            "section_coordinate",
+            "section_coordinate_mm",
+            "bbox_x",
+            "bbox_y",
+            "bbox_z",
+            "bbox_x_mm",
+            "bbox_y_mm",
+            "bbox_z_mm",
+            "status",
+        ]
+        with path.open("w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({
+                    "source_file": self.asset.source_path.name,
+                    "source_stem": self.asset.source_path.stem,
+                    "source_sha256": self.asset.source_sha256,
+                    "input_unit": self.asset.input_unit,
+                    "section_id": row.get("record_id", ""),
+                    "section_axis": row.get("section_axis", ""),
+                    "section_plane": row.get("section_plane", ""),
+                    "section_position": row.get("section_position", ""),
+                    "section_position_percent": row.get("section_position_percent", ""),
+                    "section_coordinate": row.get("section_coordinate", ""),
+                    "section_coordinate_mm": row.get("section_coordinate_mm", ""),
+                    "bbox_x": row.get("bbox_x", ""),
+                    "bbox_y": row.get("bbox_y", ""),
+                    "bbox_z": row.get("bbox_z", ""),
+                    "bbox_x_mm": row.get("bbox_x_mm", ""),
+                    "bbox_y_mm": row.get("bbox_y_mm", ""),
+                    "bbox_z_mm": row.get("bbox_z_mm", ""),
+                    "status": row.get("status", ""),
+                })
         return path
 
     @staticmethod
@@ -3844,57 +3950,143 @@ class MainWindow(QMainWindow):
         )
         return x_sections, y_sections
 
+    @staticmethod
+    def _lithic_section_display_bbox(
+        paths_3d: list[np.ndarray],
+        axis: str,
+    ) -> tuple[float, float, float, float] | None:
+        """Return the tight section contour bbox in displayed plane axes.
+
+        Returns (u_min, v_min, u_max, v_max) in model units.
+          axis X (X-Z section): u=X, v=Z
+          axis Y (Y-Z section): u=-Z (screen right), v=Y
+        """
+        usable = [
+            np.asarray(path, dtype=float)
+            for path in paths_3d
+            if len(path) >= 2
+        ]
+        if not usable:
+            return None
+        points = np.vstack(usable)
+        axis = str(axis).upper()
+        if axis == "X":
+            u = points[:, 0]
+            v = points[:, 2]
+        elif axis == "Y":
+            u = -points[:, 2]
+            v = points[:, 1]
+        else:
+            raise ValueError(axis)
+        return (
+            float(np.min(u)),
+            float(np.min(v)),
+            float(np.max(u)),
+            float(np.max(v)),
+        )
+
+    def _build_lithic_section_geometry(
+        self,
+        poly: pv.PolyData,
+        bounds: np.ndarray,
+        sections: list[dict],
+    ) -> dict[str, dict]:
+        """Cut sections once and retain tight contour bounds for layout."""
+        geometry: dict[str, dict] = {}
+        x_sections, y_sections = self._ordered_lithic_sections_for_output(
+            sections
+        )
+        for section in [*x_sections, *y_sections]:
+            coord = self._lithic_section_coordinate(section, bounds)
+            paths = self._lithic_section_paths_3d(
+                poly, section["axis"], coord
+            )
+            display_bbox = self._lithic_section_display_bbox(
+                paths, section["axis"]
+            )
+            key = f'section_{section["id"]}'
+            geometry[key] = {
+                "section": section,
+                "coordinate": float(coord),
+                "paths_3d": paths,
+                "display_bbox": display_bbox,
+            }
+        return geometry
+
     def _lithic_layout_rects(
         self,
         bounds: np.ndarray,
         spacing_model: float,
         views: list[str],
         sections: list[dict],
+        section_geometry: dict[str, dict],
     ) -> tuple[
         dict[str, tuple[float, float, float, float]],
         dict[str, tuple[float, float, float, float]],
     ]:
-        main = self._lithic_main_layout_rects(bounds, spacing_model)
-        dx = float(bounds[1] - bounds[0])
-        dy = float(bounds[3] - bounds[2])
-        dz = float(bounds[5] - bounds[4])
-        s = float(spacing_model)
+        """Lay out section contours using their tight bboxes.
 
+        `spacing_model` is the requested visible gap between neighboring
+        section contour bboxes, not between full-model-sized section panels.
+        """
+        main = self._lithic_main_layout_rects(bounds, spacing_model)
+        s = float(spacing_model)
         section_rects: dict[str, tuple[float, float, float, float]] = {}
 
-        # Section drawings are ordered by model position, not by the order
-        # in which their blue guide lines were added/drawn.
-        #   X-Z: Front top -> bottom
-        #   Y-Z: Back left -> right
         x_sections, y_sections = self._ordered_lithic_sections_for_output(
             sections
         )
 
-        # X-axis sections (X-Z):
-        #   - when Bottom is selected, place them below Bottom
-        #   - otherwise place them below Front
+        # X-Z sections are stacked downward.  Their X coordinate remains
+        # registered to the model's global X axis, while vertical stacking
+        # uses each section contour's own Z extent.
         if "bottom" in views:
-            anchor_bottom = float(main["bottom"][1])
+            current_top = float(main["bottom"][1]) - s
         else:
-            anchor_bottom = float(main["front"][1])
+            current_top = float(main["front"][1]) - s
 
-        y_cursor = anchor_bottom - s - dz
-        for sdef in x_sections:
-            key = f'section_{sdef["id"]}'
-            section_rects[key] = (0.0, y_cursor, dx, y_cursor + dz)
-            y_cursor -= dz + s
+        for section in x_sections:
+            key = f'section_{section["id"]}'
+            item = section_geometry.get(key, {})
+            bbox = item.get("display_bbox")
+            if bbox is None:
+                continue
+            u0, _v0, u1, _v1 = bbox
+            width = max(0.0, float(u1 - u0))
+            height = max(0.0, float(_v1 - _v0))
+            if width <= 0.0 or height <= 0.0:
+                continue
+            # Main Front/Bottom x=0 corresponds to bounds[0].
+            x0 = float(u0 - bounds[0])
+            x1 = x0 + width
+            y1 = current_top
+            y0 = y1 - height
+            section_rects[key] = (x0, y0, x1, y1)
+            current_top = y0 - s
 
         selected = [main[v] for v in views]
-        max_x = max(r[2] for r in selected)
+        current_left = max(r[2] for r in selected) + s
 
-        # Y-axis sections (Y-Z) remain at the far right; with all six
-        # views selected this means immediately to the right of Back.
-        # y_sections is already ordered as Back left -> right.
-        x_cursor = max_x + s
-        for sdef in y_sections:
-            key = f'section_{sdef["id"]}'
-            section_rects[key] = (x_cursor, 0.0, x_cursor + dz, dy)
-            x_cursor += dz + s
+        # Y-Z sections are stacked to the right.  Their vertical location is
+        # registered to global Y, and each new contour starts exactly s model
+        # units after the previous contour's tight right edge.
+        for section in y_sections:
+            key = f'section_{section["id"]}'
+            item = section_geometry.get(key, {})
+            bbox = item.get("display_bbox")
+            if bbox is None:
+                continue
+            _u0, v0, _u1, v1 = bbox
+            width = max(0.0, float(_u1 - _u0))
+            height = max(0.0, float(v1 - v0))
+            if width <= 0.0 or height <= 0.0:
+                continue
+            x0 = current_left
+            x1 = x0 + width
+            y0 = float(v0 - bounds[2])
+            y1 = y0 + height
+            section_rects[key] = (x0, y0, x1, y1)
+            current_left = x1 + s
 
         return main, section_rects
 
@@ -3971,12 +4163,14 @@ class MainWindow(QMainWindow):
     def _lithic_project_section_paths(
         self,
         paths: list[np.ndarray],
-        bounds: np.ndarray,
         axis: str,
         ppu: float,
+        display_bbox: tuple[float, float, float, float],
     ) -> list[np.ndarray]:
+        """Project a section into a tight local image coordinate system."""
         projected: list[np.ndarray] = []
         axis = axis.upper()
+        u0, _v0, _u1, v1 = display_bbox
 
         for path in paths:
             p = np.asarray(path, dtype=float)
@@ -3984,53 +4178,47 @@ class MainWindow(QMainWindow):
                 continue
 
             if axis == "X":
-                # Match Bottom: screen right=+X, screen up=+Z.
-                x = (p[:, 0] - bounds[0]) * ppu
-                y = (bounds[5] - p[:, 2]) * ppu
+                # X-Z: screen right=+X, screen up=+Z.
+                u = p[:, 0]
+                v = p[:, 2]
             elif axis == "Y":
-                # Match Right: screen right=-Z, screen up=+Y.
-                x = (bounds[5] - p[:, 2]) * ppu
-                y = (bounds[3] - p[:, 1]) * ppu
+                # Y-Z: screen right=-Z, screen up=+Y.
+                u = -p[:, 2]
+                v = p[:, 1]
             else:
                 raise ValueError(axis)
 
+            x = (u - u0) * ppu
+            y = (v1 - v) * ppu
             projected.append(np.column_stack([x, y]))
         return projected
 
     def _lithic_section_panel_rgba(
         self,
         paths_3d: list[np.ndarray],
-        bounds: np.ndarray,
         axis: str,
         ppu: float,
         width_px: int,
+        display_bbox: tuple[float, float, float, float],
     ) -> tuple[np.ndarray, list[np.ndarray]]:
         from PIL import Image, ImageDraw
 
-        axis = axis.upper()
-        if axis == "X":
-            world_w = float(bounds[1] - bounds[0])
-            world_h = float(bounds[5] - bounds[4])
-        elif axis == "Y":
-            world_w = float(bounds[5] - bounds[4])
-            world_h = float(bounds[3] - bounds[2])
-        else:
-            raise ValueError(axis)
-
-        width = max(64, int(round(max(world_w, 1e-9) * ppu)))
-        height = max(64, int(round(max(world_h, 1e-9) * ppu)))
+        u0, v0, u1, v1 = display_bbox
+        world_w = max(float(u1 - u0), 1e-12)
+        world_h = max(float(v1 - v0), 1e-12)
+        width = max(1, int(np.ceil(world_w * ppu)) + 1)
+        height = max(1, int(np.ceil(world_h * ppu)) + 1)
         image = Image.new("RGBA", (width, height), (255, 255, 255, 0))
         draw = ImageDraw.Draw(image)
         projected = self._lithic_project_section_paths(
-            paths_3d, bounds, axis, ppu
+            paths_3d, axis, ppu, display_bbox
         )
         self._draw_polyline_paths(draw, projected, width_px)
         return np.asarray(image, dtype=np.uint8), projected
 
     def _prepare_lithic_sections(
         self,
-        poly: pv.PolyData,
-        bounds: np.ndarray,
+        section_geometry: dict[str, dict],
         ppu: float,
         width_px: int,
     ) -> tuple[
@@ -4040,24 +4228,19 @@ class MainWindow(QMainWindow):
         images: dict[str, np.ndarray] = {}
         projected_paths: dict[str, list[np.ndarray]] = {}
 
-        x_sections, y_sections = self._ordered_lithic_sections_for_output(
-            self.lithic_sections
-        )
-        for section in [*x_sections, *y_sections]:
-            coord = self._lithic_section_coordinate(section, bounds)
-            paths3d = self._lithic_section_paths_3d(
-                poly, section["axis"], coord
-            )
-            if not paths3d:
+        for key, item in section_geometry.items():
+            paths3d = item.get("paths_3d") or []
+            display_bbox = item.get("display_bbox")
+            section = item.get("section")
+            if not paths3d or display_bbox is None or section is None:
                 continue
             image, projected = self._lithic_section_panel_rgba(
                 paths3d,
-                bounds,
                 section["axis"],
                 ppu,
                 width_px,
+                display_bbox,
             )
-            key = f'section_{section["id"]}'
             images[key] = image
             projected_paths[key] = projected
 
@@ -4296,16 +4479,12 @@ class MainWindow(QMainWindow):
         path: Path,
         section: dict,
         paths: list[np.ndarray],
-        bounds: np.ndarray,
+        display_bbox: tuple[float, float, float, float],
         ppu: float,
     ):
-        axis = section["axis"]
-        if axis == "X":
-            world_w = float(bounds[1] - bounds[0])
-            world_h = float(bounds[5] - bounds[4])
-        else:
-            world_w = float(bounds[5] - bounds[4])
-            world_h = float(bounds[3] - bounds[2])
+        u0, v0, u1, v1 = display_bbox
+        world_w = float(u1 - u0)
+        world_h = float(v1 - v0)
 
         unit_to_mm = float(self.asset.unit_to_mm)
         width_mm = world_w * unit_to_mm
@@ -4358,11 +4537,15 @@ class MainWindow(QMainWindow):
         bounds = np.asarray(poly.bounds, dtype=float)
 
         spacing_model = float(spacing_mm) / float(self.asset.unit_to_mm)
+        section_geometry = self._build_lithic_section_geometry(
+            poly, bounds, self.lithic_sections
+        )
         main_rects, section_rects = self._lithic_layout_rects(
             bounds,
             spacing_model,
             views,
             self.lithic_sections,
+            section_geometry,
         )
         all_rects = [main_rects[v] for v in views] + list(
             section_rects.values()
@@ -4403,8 +4586,7 @@ class MainWindow(QMainWindow):
             del masks
 
         section_images, section_paths = self._prepare_lithic_sections(
-            poly,
-            bounds,
+            section_geometry,
             ppu,
             outline_width_px,
         )
@@ -4469,11 +4651,12 @@ class MainWindow(QMainWindow):
                     if key not in section_paths:
                         continue
                     p = out_dir / f'{stem}_section_{section["id"]}.svg'
+                    display_bbox = section_geometry[key]["display_bbox"]
                     self._write_lithic_section_svg(
                         p,
                         section,
                         section_paths[key],
-                        bounds,
+                        display_bbox,
                         ppu,
                     )
                     written.append(p)
@@ -4621,11 +4804,15 @@ class MainWindow(QMainWindow):
                 float(self.lithic_view_spacing.value())
                 / float(self.asset.unit_to_mm)
             )
+            section_geometry = self._build_lithic_section_geometry(
+                poly, bounds, self.lithic_sections
+            )
             main_rects, section_rects = self._lithic_layout_rects(
                 bounds,
                 spacing_model,
                 views,
                 self.lithic_sections,
+                section_geometry,
             )
             all_rects = [main_rects[v] for v in views] + list(
                 section_rects.values()
@@ -4665,8 +4852,7 @@ class MainWindow(QMainWindow):
                 }
 
             section_images, _section_paths = self._prepare_lithic_sections(
-                poly,
-                bounds,
+                section_geometry,
                 ppu,
                 self._selected_lithic_outline_width_px(),
             )

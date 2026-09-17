@@ -5,7 +5,7 @@ ArtefactsOrthoMaker is a Python GUI application for loading archaeological 3D mo
 
 The application was upgraded from the original pose-estimation and coordinate-normalization workflow (`pose_core.py`) into a tool for producing orthographic projection layouts.
 
-The current official executable is **`app.py`**. It integrates the pottery functions completed in the v0.1.x series with the lithic functions added in the v0.2–0.3 series. The current `APP_VERSION` is `0.4.3`.
+The current official executable is **`app.py`**. It integrates the pottery functions completed in the v0.1.x series with the lithic functions added in the v0.2–0.3 series. The current `APP_VERSION` is `0.4.4`.
 
 **Important: download this repository as a ZIP file or clone the entire repository.**
 
@@ -645,13 +645,21 @@ It appears as two linked vertical blue guide lines corresponding to Front and Ba
 
 Line selection is based on the guide line nearest to the click position in the View, rather than on drawing order.
 
-To avoid exact overlap, newly added sections of the same orientation are staggered alternately away from the center:
+Whenever a section is added or deleted and the **section count changes, all sections of the same orientation are reset to equal intervals across the full model bbox**.
+
+For `N` sections, the initial positions are `k/(N+1)` of the bbox (`k=1..N`):
 
 ```text
-60%, 40%, 70%, 30%, 80%, 20% ...
+1 section : 1/2
+2 sections: 1/3, 2/3
+3 sections: 1/4, 2/4, 3/4
+4 sections: 1/5, 2/5, 3/5, 4/5
+...
 ```
 
-After moving a blue guide line, click `プレビュー確認` (Preview) to regenerate the corresponding section.
+Equivalently, after `n` additions there are `n+1` sections at `k/(n+2)` (`k=1..n+1`). This formula is the generalization of the examples above.
+
+Guide lines can still be moved manually. However, after any subsequent add/delete operation, all sections of that orientation are redistributed to equal intervals. After changing section positions, click `プレビュー確認` (Preview) to regenerate the sections.
 
 ## 10. Lithic Section Layout
 
@@ -671,6 +679,8 @@ below Front
 
 Multiple X-Z sections extend downward. Their order is based on model position rather than the order in which the section lines were added or drawn: they are arranged in **top-to-bottom order as seen on Front**. The uppermost transverse section comes first, followed by sections farther down.
 
+Since v0.4.4, section spacing is measured from the **tight bounding box of the actual section contour**, rather than from a fixed panel sized to the full model bbox. The gap between neighboring section-contour bounding boxes is kept equal to the configured View Spacing; the default is `10 mm`.
+
 ### Y-Z Sections
 
 Y-Z sections are placed at the far right of the orthographic layout.
@@ -682,6 +692,8 @@ to the right of Back
 ```
 
 Multiple Y-Z sections are also ordered by model position rather than creation / drawing order: they are arranged **left-to-right as seen on Back**. Because Back is horizontally mirrored, this corresponds internally to sorting normalized section positions from larger to smaller values.
+
+For Y-Z sections, the distance from the tight right edge of one section contour to the tight left edge of the next is likewise kept equal to the configured View Spacing (default `10 mm`). When section positions change, the tight contour bboxes are recalculated on the next Preview and the sections are laid out again at the requested spacing.
 
 ## 11. Lithic Section-Position Tick Marks
 
@@ -756,7 +768,13 @@ bbox_z_mm
 
 ### Lithics Only: Section Bounding Boxes
 
-Each configured section is added as one row in the same `<stem>_measurements.csv`.
+Each configured section is added as one row in the same `<stem>_measurements.csv`. Since v0.4.4, a dedicated per-artifact CSV containing only the section bounding boxes is also always written:
+
+```text
+output/<stem>/<stem>_section_bboxes.csv
+```
+
+Unlike `output/inventory-lithic.csv`, this file is **not accumulated or updated across multiple input artifacts**. One independent file is created for each artifact in the same `output/<stem>/` folder as its images, normalized PLY, and transform files. Each row represents one section.
 
 The current section definitions are:
 
@@ -778,9 +796,12 @@ The following fields are also recorded:
 
 ```text
 record_id
+section_axis
 section_plane
 section_position
+section_position_percent
 section_coordinate
+section_coordinate_mm
 status
 ```
 
@@ -929,6 +950,8 @@ output/lithic001/
 ├── transform_original_to_obb_cloudcompare.txt
 ├── transform_obb_to_result.csv                  # only when required
 ├── transform_obb_to_result_cloudcompare.txt     # only when required
+├── lithic001_measurements.csv
+├── lithic001_section_bboxes.csv
 ├── lithic001_ortho_texture.png
 ├── lithic001_ortho_texture_normal.png
 ├── lithic001_ortho_shade.png
@@ -973,7 +996,7 @@ For the lithic automatic correction based on the central section, triangle-plane
 ## 1. Recommended Folder Structure
 
 ```text
-ArtifactPoseNormalizer/
+ArtefactsOrthoMaker/
 ├── app.py
 ├── pose_core.py
 ├── check_environment.py
@@ -992,7 +1015,7 @@ If `input/` and `output/` do not exist, they are created when the application st
 
 ## 2. Verified `requirements.txt`
 
-The imports used by v0.4.3 `app.py` and `pose_core.py` were reviewed, and the third-party packages directly used by the application are explicitly listed in `requirements.txt`.
+The imports used by v0.4.4 `app.py` and `pose_core.py` were reviewed, and the third-party packages directly used by the application are explicitly listed in `requirements.txt`.
 
 ```text
 numpy==2.5.2
@@ -1049,7 +1072,7 @@ If `Python 3.13.x` is displayed, the standard setup instructions below can be us
 Open Terminal and move to the project folder:
 
 ```bash
-cd /path/to/ArtifactPoseNormalizer
+cd /path/to/ArtefactsOrthoMaker
 ```
 
 Create and activate a virtual environment named `venv`:
@@ -1100,7 +1123,7 @@ python -c 'from PySide6.QtWidgets import QApplication; app=QApplication([]); pri
 Open PowerShell and move to the project folder:
 
 ```powershell
-cd C:\path\to\ArtifactPoseNormalizer
+cd C:\path\to\ArtefactsOrthoMaker
 ```
 
 Create the virtual environment:
@@ -1187,7 +1210,7 @@ which python
 It should point to something similar to:
 
 ```text
-.../ArtifactPoseNormalizer/venv/bin/python
+.../ArtefactsOrthoMaker/venv/bin/python
 ```
 
 Windows PowerShell:
@@ -1199,7 +1222,7 @@ Get-Command python
 It should point to:
 
 ```text
-...\ArtifactPoseNormalizer\venv\Scripts\python.exe
+...\ArtefactsOrthoMaker\venv\Scripts\python.exe
 ```
 
 Then run:
@@ -1227,7 +1250,7 @@ are in the same folder.
 
 ### `No module named 'scipy'`
 
-SciPy is mandatory in v0.4.3 (and has been required since the v0.4.2 section-fill update).
+SciPy is mandatory in v0.4.4 (and has been required since the v0.4.2 section-fill update).
 
 Run:
 
