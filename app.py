@@ -65,7 +65,7 @@ from pose_core import (
 )
 
 APP_NAME = "Artifact Pose Normalizer"
-APP_VERSION = "0.4.4"
+APP_VERSION = "0.4.5"
 SUPPORTED_SUFFIXES = {".obj", ".ply", ".glb"}
 WORK_DIR = Path(__file__).resolve().parent
 INPUT_DIR = WORK_DIR / "input"
@@ -1840,6 +1840,11 @@ class MainWindow(QMainWindow):
         appearance = self.show_appearance.isChecked()
         lighting = self.smooth_shading.isChecked()
 
+        # Pose-adjustment preview: show the current axis-aligned bounding box
+        # in every Front / Right / Bottom viewport.  This is display-only;
+        # it is not included in orthographic image output.
+        bbox_outline = poly.outline()
+
         for view, plotter in self.lithic_plotters.items():
             plotter.renderer.clear_actors()
             plotter.set_background("white")
@@ -1851,6 +1856,15 @@ class MainWindow(QMainWindow):
                 lighting=lighting,
             )
             self._configure_gui_actor_shading(actor, lighting)
+            plotter.add_mesh(
+                bbox_outline,
+                color="gray",
+                line_width=2.0,
+                opacity=0.75,
+                lighting=False,
+                show_scalar_bar=False,
+                pickable=False,
+            )
             self._set_lithic_camera(plotter, bounds, view)
             plotter.render()
 

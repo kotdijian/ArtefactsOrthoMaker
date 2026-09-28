@@ -5,7 +5,7 @@ ArtefactsOrthoMaker is a Python GUI application for loading archaeological 3D mo
 
 The application was upgraded from the original pose-estimation and coordinate-normalization workflow (`pose_core.py`) into a tool for producing orthographic projection layouts.
 
-The current official executable is **`app.py`**. It integrates the pottery functions completed in the v0.1.x series with the lithic functions added in the v0.2–0.3 series. The current `APP_VERSION` is `0.4.4`.
+The current official executable is **`app.py`**. It integrates the pottery functions completed in the v0.1.x series with the lithic functions added in the v0.2–0.3 series. The current `APP_VERSION` is `0.4.5`.
 
 **Important: download this repository as a ZIP file or clone the entire repository.**
 
@@ -439,6 +439,10 @@ Bottom (X-Z)
 ```
 
 The **default display is Shade**.
+
+Since v0.4.5, each pose-adjustment view — `Front (X-Y)`, `Right (Y-Z)`, and `Bottom (X-Z)` — also displays the current **axis-aligned bounding box (AABB)** as a gray wireframe. The bbox is recalculated and redrawn whenever the X / Y / Z pose rotation changes, making it easier to check how the artifact fits the coordinate axes from all three directions.
+
+The gray bbox is a **pose-checking display aid only** and is not included in exported orthographic images, outlines, or section drawings.
 
 ### Orthographic Net Orientation Convention
 
