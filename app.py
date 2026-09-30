@@ -65,7 +65,7 @@ from pose_core import (
 )
 
 APP_NAME = "Artifact Pose Normalizer"
-APP_VERSION = "0.4.5"
+APP_VERSION = "0.4.7"
 SUPPORTED_SUFFIXES = {".obj", ".ply", ".glb"}
 WORK_DIR = Path(__file__).resolve().parent
 INPUT_DIR = WORK_DIR / "input"
@@ -76,6 +76,7 @@ OUTLINE_PNG_WIDTH_PX = 2
 OUTLINE_SVG_STROKE_MM = 0.25
 MAX_PNG_DIMENSION_PX = 16384
 MAX_PNG_PIXELS = 100_000_000
+SPLIT_EXPORT_IN_PROGRESS_MARKER = ".aom_in_progress"
 
 
 
@@ -440,6 +441,10 @@ class MainWindow(QMainWindow):
         self.lithic_confirmed_final_matrix: np.ndarray | None = None
         self.lithic_obb_to_result_matrix = np.eye(4)
         self.lithic_pose_confirmed = False
+        # Base pose used before manual X/Y/Z rotations:
+        #   "input"     = preserve the coordinates/orientation as loaded
+        #   "automatic" = OBB + central X-Z section leveling
+        self.lithic_pose_base_mode = "input"
 
         # Interactive section definitions.  Axis "X" means an X-Z section
         # (plane y=constant); axis "Y" means a Y-Z section (plane x=constant).
@@ -641,13 +646,25 @@ class MainWindow(QMainWindow):
         lithic_layout = QVBoxLayout(self.lithic_pose_group)
 
         self.lithic_obb_label = QLabel(
-            "石器を選択すると minimum-volume oriented_bounds() を自動適用します。"
+            "石器は読込時の姿勢を保持します。必要な場合だけ自動姿勢推定を実行してください。"
         )
         self.lithic_obb_label.setWordWrap(True)
         self.lithic_obb_label.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
         lithic_layout.addWidget(self.lithic_obb_label)
+
+        self.lithic_auto_pose_btn = QPushButton(
+            "自動姿勢推定（OBB + 中央X-Z水平化）"
+        )
+        self.lithic_auto_pose_btn.clicked.connect(
+            self._apply_lithic_oriented_bounds
+        )
+        lithic_layout.addWidget(self.lithic_auto_pose_btn)
+
+        self.lithic_input_pose_btn = QPushButton("読込姿勢に戻す")
+        self.lithic_input_pose_btn.clicked.connect(self._use_lithic_input_pose)
+        lithic_layout.addWidget(self.lithic_input_pose_btn)
 
         self.lithic_rotation_controls = {}
         for axis, axis_label, meaning in [("y", "Y", "長さ"), ("x", "X", "幅"), ("z", "Z", "厚さ")]:
@@ -700,15 +717,16 @@ class MainWindow(QMainWindow):
             }
             lithic_layout.addWidget(axis_box)
 
-        self.lithic_reset_btn = QPushButton("自動姿勢に戻す（手動回転 0°）")
+        self.lithic_reset_btn = QPushButton("基準姿勢に戻す（手動回転 0°）")
         self.lithic_reset_btn.clicked.connect(self._reset_lithic_rotations)
         lithic_layout.addWidget(self.lithic_reset_btn)
 
         self.lithic_hint = QLabel(
-            "自動初期姿勢: ① minimum-volume OBBで X=幅 / Y=長さ / "
-            "Z=厚さ、②中央X-Z断面の左右端を結ぶ線がX軸に平行になるよう "
-            "Y軸回転で自動補正。各軸の±90°ボタン、ダイヤル、数値入力は "
-            "この自動姿勢に対する追加回転です。"
+            "初期状態では入力PLYの姿勢をそのまま使用します。"
+            "「自動姿勢推定」を押した場合のみ、① minimum-volume OBBで "
+            "X=幅 / Y=長さ / Z=厚さ、②中央X-Z断面の左右端を結ぶ線がX軸に "
+            "平行になるようY軸回転で自動補正します。各軸の±90°ボタン、"
+            "ダイヤル、数値入力は現在の基準姿勢に対する追加回転です。"
         )
         self.lithic_hint.setWordWrap(True)
         lithic_layout.addWidget(self.lithic_hint)
@@ -828,20 +846,38 @@ class MainWindow(QMainWindow):
         self.lithic_preview_btn.clicked.connect(self._show_lithic_output_preview)
         lithic_output_layout.addWidget(self.lithic_preview_btn)
 
-        self.lithic_save_next_btn = QPushButton("保存して次へ")
-        self.lithic_save_next_btn.clicked.connect(self.save_current_and_next)
-        self.lithic_inventory_btn = QPushButton("計測一覧出力")
-        self.lithic_inventory_btn.clicked.connect(self.export_measurement_inventory)
+        # Split lithic export into independent products. This allows a
+        # normalized *_rev.ply to be re-opened only to regenerate orthographic
+        # drawings without redundantly writing measurement data or another PLY.
+        self.lithic_measurement_export_btn = QPushButton("計測データ出力")
+        self.lithic_measurement_export_btn.clicked.connect(
+            self._export_lithic_measurements
+        )
+        self.lithic_ortho_export_btn = QPushButton("展開図出力")
+        self.lithic_ortho_export_btn.clicked.connect(
+            self._export_lithic_orthographic_files
+        )
+        self.lithic_ply_export_btn = QPushButton("PLY / Transform出力")
+        self.lithic_ply_export_btn.clicked.connect(
+            self._export_lithic_ply_files
+        )
+        self.lithic_next_btn = QPushButton("次のファイルへ")
+        self.lithic_next_btn.clicked.connect(self._finish_lithic_and_next)
+
         self.lithic_export_stage_label = QLabel("待機")
         self.lithic_export_progress = QProgressBar()
         self.lithic_export_progress.setRange(0, 100)
         self.lithic_export_progress.setValue(0)
-        lithic_output_layout.addWidget(self.lithic_inventory_btn)
+
+        lithic_output_layout.addWidget(QLabel("出力"))
+        lithic_output_layout.addWidget(self.lithic_measurement_export_btn)
+        lithic_output_layout.addWidget(self.lithic_ortho_export_btn)
+        lithic_output_layout.addWidget(self.lithic_ply_export_btn)
         lithic_output_layout.addWidget(QLabel(
-            "計測一覧出力: geometry inventory と 3D model inventory を更新します。"
-            "「保存して次へ」の前に実行してください。"
+            "展開図 / PLY は計測データ未保存でも出力できます。"
+            "未保存の場合は確認メッセージを表示します。"
         ))
-        lithic_output_layout.addWidget(self.lithic_save_next_btn)
+        lithic_output_layout.addWidget(self.lithic_next_btn)
         lithic_output_layout.addWidget(self.lithic_export_stage_label)
         lithic_output_layout.addWidget(self.lithic_export_progress)
         left_layout.addWidget(self.lithic_output_group)
@@ -1050,9 +1086,13 @@ class MainWindow(QMainWindow):
             self.view_mode_combo, self.viewer_scale_combo,
             self.zoom_out_btn, self.zoom_reset_btn, self.zoom_in_btn, self.zoom_slider,
             self.preview_btn, self.save_next_btn, self.inventory_btn,
+            self.lithic_auto_pose_btn, self.lithic_input_pose_btn,
             self.lithic_reset_btn, self.lithic_confirm_btn,
             self.lithic_return_pose_btn, self.lithic_preview_btn,
-            self.lithic_save_next_btn, self.lithic_inventory_btn,
+            self.lithic_measurement_export_btn,
+            self.lithic_ortho_export_btn,
+            self.lithic_ply_export_btn,
+            self.lithic_next_btn,
             self.lithic_view_spacing, self.lithic_scale_bar_combo,
             self.lithic_outline_width_combo,
             self.lithic_output_png, self.lithic_output_svg,
@@ -1279,7 +1319,7 @@ class MainWindow(QMainWindow):
 
         self._configure_appearance_options()
         if self._is_lithic():
-            self._apply_lithic_oriented_bounds()
+            self._use_lithic_input_pose()
         else:
             self.pose_label.setText("姿勢未確定")
             self.refresh_view(reset_camera=True)
@@ -1327,7 +1367,11 @@ class MainWindow(QMainWindow):
         return Rz @ Rx @ Ry
 
     def _current_lithic_unorigin_matrix(self) -> np.ndarray:
-        """Raw -> current orientation, still centered around the OBB center."""
+        """Raw -> current orientation before final bbox-origin translation.
+
+        In input-pose mode the base matrices are identity. In automatic mode
+        the base is the centered OBB plus the central X-Z leveling correction.
+        """
         return (
             self._lithic_adjustment_matrix()
             @ self.lithic_auto_rotation_matrix
@@ -1559,6 +1603,100 @@ class MainWindow(QMainWindow):
         )
         return correction, diag
 
+    def _update_lithic_pose_status_label(self):
+        """Refresh the lithic pose label for the current base-pose mode."""
+        if not self.asset:
+            return
+
+        unit = self.asset.input_unit
+        scale = float(self.asset.unit_to_mm)
+
+        if (
+            self.lithic_pose_base_mode == "automatic"
+            and self.lithic_obb_extents is not None
+        ):
+            ex = np.asarray(self.lithic_obb_extents, dtype=float)
+            elapsed = self.lithic_obb_elapsed_sec or 0.0
+            residual = (
+                self.lithic_section_level_residual_deg
+                if self.lithic_section_level_residual_deg is not None
+                else 0.0
+            )
+            self.lithic_obb_label.setText(
+                "自動姿勢推定済み<br>"
+                "① minimum-volume OBB<br>"
+                f"X = 幅: {ex[0]:.3f} {unit} ({ex[0] * scale:.2f} mm)<br>"
+                f"Y = 長さ: {ex[1]:.3f} {unit} ({ex[1] * scale:.2f} mm)<br>"
+                f"Z = 厚さ: {ex[2]:.3f} {unit} ({ex[2] * scale:.2f} mm)<br>"
+                "② 中央X-Z断面水平化<br>"
+                f"Y軸自動補正: {self.lithic_section_level_angle_deg:+.3f}°<br>"
+                f"補正後残差: {residual:+.4f}°<br>"
+                f"断面点数: {self.lithic_section_point_count:,}<br>"
+                f"oriented_bounds: {elapsed:.3f} s"
+            )
+            return
+
+        bounds = np.asarray(self.asset.mesh.bounds, dtype=float)
+        extents = bounds[1] - bounds[0]
+        self.lithic_obb_label.setText(
+            "読込姿勢を使用中（自動姿勢推定は未適用）<br>"
+            "入力PLYのX/Y/Z方向をそのまま保持します。<br>"
+            f"X extent: {extents[0]:.3f} {unit} "
+            f"({extents[0] * scale:.2f} mm)<br>"
+            f"Y extent: {extents[1]:.3f} {unit} "
+            f"({extents[1] * scale:.2f} mm)<br>"
+            f"Z extent: {extents[2]:.3f} {unit} "
+            f"({extents[2] * scale:.2f} mm)"
+        )
+
+    def _use_lithic_input_pose(self):
+        """Use the PLY coordinates/orientation exactly as loaded.
+
+        This is the default lithic base pose. It is especially important for
+        *_rev.ply files that were already normalized by ArtefactsOrthoMaker:
+        re-running OBB estimation can otherwise change their established axes.
+        """
+        if not self.asset:
+            return
+
+        self.lithic_pose_base_mode = "input"
+        self.lithic_raw_to_obb_centered_matrix = np.eye(4)
+        self.lithic_original_to_obb_matrix = np.eye(4)
+        self.lithic_auto_rotation_matrix = np.eye(4)
+        self.lithic_confirmed_final_matrix = None
+        self.lithic_obb_to_result_matrix = np.eye(4)
+        self.lithic_pose_confirmed = False
+
+        self.lithic_obb_native_extents = None
+        self.lithic_obb_extents = None
+        self.lithic_obb_elapsed_sec = None
+        self.lithic_section_level_angle_deg = 0.0
+        self.lithic_section_level_residual_deg = None
+        self.lithic_section_left_point = None
+        self.lithic_section_right_point = None
+        self.lithic_section_point_count = 0
+
+        self.lithic_angles_deg = {"x": 0.0, "y": 0.0, "z": 0.0}
+        self._sync_lithic_rotation_controls()
+        self.pose_matrix = np.eye(4)
+        self.center_axis_after_pose = None
+        self.front_angle_deg = 0.0
+        self.posture_done = True
+        self.pose_info = {
+            "artifact_type": "lithic",
+            "method": "input_pose_preserved",
+            "automatic_pose_steps": [],
+            "input_pose_preserved": True,
+        }
+        self._reset_lithic_section_definitions()
+        self._update_lithic_pose_status_label()
+        self._update_artifact_type_ui()
+        self.refresh_view(reset_camera=True)
+        self.statusBar().showMessage(
+            "石器: 読込時の姿勢を保持しています。"
+            "必要な場合だけ「自動姿勢推定」を実行してください。"
+        )
+
     def _apply_lithic_oriented_bounds(self):
         if not self.asset:
             return
@@ -1640,6 +1778,7 @@ class MainWindow(QMainWindow):
             #   Step 1: minimum-volume OBB
             #   Step 2: rotate about Y so the robust left/right line of the
             #           central X-Z section is parallel to X.
+            self.lithic_pose_base_mode = "automatic"
             self.lithic_raw_to_obb_centered_matrix = raw_to_obb_centered
             self.lithic_original_to_obb_matrix = original_to_obb
             self.lithic_auto_rotation_matrix = section_correction
@@ -1707,24 +1846,7 @@ class MainWindow(QMainWindow):
                 "section_leveling": section_diag,
             }
 
-            unit = self.asset.input_unit
-            scale = float(self.asset.unit_to_mm)
-            ex = self.lithic_obb_extents
-            self.lithic_obb_label.setText(
-                "自動姿勢推定済み<br>"
-                "① minimum-volume OBB<br>"
-                f"X = 幅: {ex[0]:.3f} {unit} "
-                f"({ex[0] * scale:.2f} mm)<br>"
-                f"Y = 長さ: {ex[1]:.3f} {unit} "
-                f"({ex[1] * scale:.2f} mm)<br>"
-                f"Z = 厚さ: {ex[2]:.3f} {unit} "
-                f"({ex[2] * scale:.2f} mm)<br>"
-                "② 中央X-Z断面水平化<br>"
-                f"Y軸自動補正: {self.lithic_section_level_angle_deg:+.3f}°<br>"
-                f"補正後残差: {self.lithic_section_level_residual_deg:+.4f}°<br>"
-                f"断面点数: {self.lithic_section_point_count:,}<br>"
-                f"oriented_bounds: {elapsed:.3f} s"
-            )
+            self._update_lithic_pose_status_label()
 
             self.refresh_view(reset_camera=True)
             self.statusBar().showMessage(
@@ -1732,9 +1854,12 @@ class MainWindow(QMainWindow):
                 "必要に応じてX/Y/Z軸回転で微調整してください。"
             )
         except Exception as e:
-            self.posture_done = False
-            self.pose_matrix = np.eye(4)
-            self.lithic_obb_label.setText(f"石器自動姿勢推定エラー: {e}")
+            # Do not invalidate the loaded/input pose merely because optional
+            # automatic estimation failed.
+            self.lithic_obb_label.setText(
+                f"石器自動姿勢推定エラー: {e}<br>"
+                "「読込姿勢に戻す」で入力PLYの姿勢を使用できます。"
+            )
             self._show_error("石器 自動姿勢推定エラー", e)
         finally:
             QApplication.restoreOverrideCursor()
@@ -1884,7 +2009,7 @@ class MainWindow(QMainWindow):
     def _confirm_lithic_pose(self):
         if not self.asset or not self.posture_done:
             QMessageBox.warning(
-                self, "未確定", "石器の自動姿勢推定が完了していません。"
+                self, "未確定", "石器の基準姿勢を準備できていません。"
             )
             return
         try:
@@ -2330,10 +2455,23 @@ class MainWindow(QMainWindow):
             )
         return files
 
+    def _input_output_is_complete(self, path: Path) -> bool:
+        """Return True when the input should be treated as completed.
+
+        v0.4.7 split exports may create output/<stem>/ before the user has
+        finished all desired products. Such folders carry a temporary marker.
+        Legacy output folders without the marker remain backward-compatible
+        completion flags.
+        """
+        out_dir = OUTPUT_DIR / path.stem
+        if not out_dir.exists():
+            return False
+        return not (out_dir / SPLIT_EXPORT_IN_PROGRESS_MARKER).exists()
+
     def scan_queue_and_load(self):
         try:
             self.queue_all = self._scan_files()
-            pending = [p for p in self.queue_all if not (OUTPUT_DIR / p.stem).exists()]
+            pending = [p for p in self.queue_all if not self._input_output_is_complete(p)]
             done = len(self.queue_all) - len(pending)
             self.queue_label.setText(
                 f"全 {len(self.queue_all)} / 完了 {done} / 未処理 {len(pending)}\n"
@@ -2411,11 +2549,11 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"3D表示を更新中: {path.name}")
             QApplication.processEvents()
             if self._is_lithic():
-                self._apply_lithic_oriented_bounds()
+                self._use_lithic_input_pose()
             else:
                 self.refresh_view(reset_camera=True)
                 self._schedule_preview_refresh()
-            pending = [p for p in self.queue_all if not (OUTPUT_DIR / p.stem).exists()]
+            pending = [p for p in self.queue_all if not self._input_output_is_complete(p)]
             index = pending.index(path) + 1 if path in pending else 1
             self.statusBar().showMessage(
                 f"未処理 {index}/{len(pending)}: {path.name} — 姿勢方式を選んでください。"
@@ -2431,27 +2569,8 @@ class MainWindow(QMainWindow):
             self.asset.input_unit = unit
             self.asset.unit_to_mm = UNIT_TO_MM[unit]
             self._update_qa()
-            if self._is_lithic() and self.lithic_obb_extents is not None:
-                ex = self.lithic_obb_extents
-                scale = float(self.asset.unit_to_mm)
-                elapsed = self.lithic_obb_elapsed_sec or 0.0
-                residual = (
-                    self.lithic_section_level_residual_deg
-                    if self.lithic_section_level_residual_deg is not None
-                    else 0.0
-                )
-                self.lithic_obb_label.setText(
-                    "自動姿勢推定済み<br>"
-                    "① minimum-volume OBB<br>"
-                    f"X = 幅: {ex[0]:.3f} {unit} ({ex[0] * scale:.2f} mm)<br>"
-                    f"Y = 長さ: {ex[1]:.3f} {unit} ({ex[1] * scale:.2f} mm)<br>"
-                    f"Z = 厚さ: {ex[2]:.3f} {unit} ({ex[2] * scale:.2f} mm)<br>"
-                    "② 中央X-Z断面水平化<br>"
-                    f"Y軸自動補正: {self.lithic_section_level_angle_deg:+.3f}°<br>"
-                    f"補正後残差: {residual:+.4f}°<br>"
-                    f"断面点数: {self.lithic_section_point_count:,}<br>"
-                    f"oriented_bounds: {elapsed:.3f} s"
-                )
+            if self._is_lithic():
+                self._update_lithic_pose_status_label()
 
     def _update_qa(self):
         if not self.asset:
@@ -3586,8 +3705,9 @@ class MainWindow(QMainWindow):
     ) -> bool:
         """Check that both inventories already contain the current values.
 
-        This enforces the intended workflow: inventory output must occur after
-        the final pose and before "保存して次へ".
+        Used by split lithic export to decide whether a warning is needed
+        before orthographic or PLY output. Missing measurements no longer block
+        those exports.
         """
         if not self.asset:
             return False
@@ -3681,7 +3801,7 @@ class MainWindow(QMainWindow):
 
         return True
 
-    def export_measurement_inventory(self):
+    def export_measurement_inventory(self, *_args, show_message: bool = True) -> bool:
         """Write both inventory types for the current specimen.
 
         Geometry representative values:
@@ -3730,17 +3850,20 @@ class MainWindow(QMainWindow):
                     "記録されています。"
                 )
             )
-            QMessageBox.information(
-                self,
-                "計測一覧出力",
-                f"Geometry inventory: {geometry_path.name} "
-                f"({geometry_action})\n"
-                f"3D model inventory: {model_path.name} "
-                f"({model_action})"
-                f"{volume_note}",
-            )
+            if show_message:
+                QMessageBox.information(
+                    self,
+                    "計測一覧出力",
+                    f"Geometry inventory: {geometry_path.name} "
+                    f"({geometry_action})\n"
+                    f"3D model inventory: {model_path.name} "
+                    f"({model_action})"
+                    f"{volume_note}",
+                )
+            return True
         except Exception as e:
             self._show_error("計測一覧出力エラー", e)
+            return False
 
 
     # ---------- Lithic orthographic rendering / preview / export ----------
@@ -5017,6 +5140,7 @@ class MainWindow(QMainWindow):
             },
             "posture": {
                 **self.pose_info,
+                "pose_base_mode": self.lithic_pose_base_mode,
                 "manual_axis_rotations_deg": dict(
                     self.lithic_angles_deg
                 ),
@@ -5028,8 +5152,14 @@ class MainWindow(QMainWindow):
                     "row-major storage; column homogeneous vector application"
                 ),
                 "equation_final": (
-                    "p_result = M_obb_to_result @ "
-                    "M_original_to_obb @ [x,y,z,1]^T"
+                    (
+                        "p_result = M_final @ [x,y,z,1]^T"
+                    )
+                    if self.lithic_pose_base_mode == "input"
+                    else (
+                        "p_result = M_obb_to_result @ "
+                        "M_original_to_obb @ [x,y,z,1]^T"
+                    )
                 ),
                 "original_to_obb_matrix_4x4": (
                     self.lithic_original_to_obb_matrix
@@ -5042,20 +5172,32 @@ class MainWindow(QMainWindow):
                 ),
                 "final_original_to_result_matrix_4x4": final_matrix,
                 "final_inverse_matrix_4x4": inverse,
-                "matrix_files": {
-                    "original_to_obb": [
-                        "transform_original_to_obb.csv",
-                        "transform_original_to_obb_cloudcompare.txt",
-                    ],
-                    "obb_to_result": (
-                        [
-                            "transform_obb_to_result.csv",
-                            "transform_obb_to_result_cloudcompare.txt",
-                        ]
-                        if second_matrix_written
-                        else []
-                    ),
-                },
+                "matrix_files": (
+                    {
+                        "final": [
+                            "transform_matrix.csv",
+                            "transform_matrix_cloudcompare.txt",
+                        ],
+                        "original_to_obb": [],
+                        "obb_to_result": [],
+                    }
+                    if self.lithic_pose_base_mode == "input"
+                    else {
+                        "final": [],
+                        "original_to_obb": [
+                            "transform_original_to_obb.csv",
+                            "transform_original_to_obb_cloudcompare.txt",
+                        ],
+                        "obb_to_result": (
+                            [
+                                "transform_obb_to_result.csv",
+                                "transform_obb_to_result_cloudcompare.txt",
+                            ]
+                            if second_matrix_written
+                            else []
+                        ),
+                    }
+                ),
             },
             "sections": sections,
             "orthographic_export": {
@@ -5210,7 +5352,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(text)
         QApplication.processEvents()
 
-    def _save_lithic_current_and_next(self):
+    def _require_confirmed_lithic_pose(self) -> bool:
         if (
             not self.asset
             or not self.posture_done
@@ -5222,19 +5364,149 @@ class MainWindow(QMainWindow):
                 "姿勢未決定",
                 "先に石器の「姿勢決定」を押してください。",
             )
-            return
+            return False
+        return True
 
-        final_inventory_matrix = np.asarray(
+    def _confirm_lithic_export_without_measurements(
+        self,
+        product_label: str,
+    ) -> bool:
+        """Warn, but allow export, when current measurement data is absent."""
+        if not self._require_confirmed_lithic_pose():
+            return False
+
+        final_matrix = np.asarray(
             self.lithic_confirmed_final_matrix,
             dtype=float,
         )
-        if not self._inventory_is_current(final_inventory_matrix):
-            QMessageBox.warning(
-                self,
-                "計測一覧未出力",
-                "「保存して次へ」の前に「計測一覧出力」を実行してください。\n"
-                "姿勢・単位を変更した場合は、計測一覧を再出力してください。",
+        if self._inventory_is_current(final_matrix):
+            return True
+
+        answer = QMessageBox.question(
+            self,
+            "計測データ未保存",
+            "現在の姿勢・単位に対応する計測データが保存されていません。\n\n"
+            f"計測データを保存せずに「{product_label}」を実行しますか？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
+    def _lithic_final_output_dir(self) -> Path:
+        if not self.asset:
+            raise RuntimeError("モデルが読み込まれていません。")
+        final_dir = OUTPUT_DIR / self.asset.source_path.stem
+        final_dir.mkdir(parents=True, exist_ok=True)
+        marker = final_dir / SPLIT_EXPORT_IN_PROGRESS_MARKER
+        marker.touch(exist_ok=True)
+        return final_dir
+
+    def _lithic_component_staging_dir(self, component: str) -> Path:
+        if not self.asset:
+            raise RuntimeError("モデルが読み込まれていません。")
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        staging = OUTPUT_DIR / (
+            f"{self.asset.source_path.stem}.__working_{component}__"
+        )
+        if staging.exists():
+            shutil.rmtree(staging)
+        staging.mkdir(parents=True, exist_ok=False)
+        return staging
+
+    @staticmethod
+    def _merge_component_files(staging: Path, final_dir: Path) -> list[Path]:
+        """Atomically expose a completed component at file granularity."""
+        written: list[Path] = []
+        for source in sorted(staging.iterdir()):
+            if not source.is_file():
+                continue
+            target = final_dir / source.name
+            if target.exists():
+                target.unlink()
+            source.replace(target)
+            written.append(target)
+        shutil.rmtree(staging)
+        return written
+
+    def _remove_existing_lithic_ortho_files(self, final_dir: Path) -> None:
+        """Remove prior lithic drawing products before regenerating them.
+
+        Measurement CSVs, PLY, transform files, and the in-progress marker are
+        deliberately preserved.
+        """
+        if not self.asset or not final_dir.exists():
+            return
+        stem = self.asset.source_path.stem
+        view_tokens = (
+            "_ortho_",
+            "_front_",
+            "_back_",
+            "_left_",
+            "_right_",
+            "_top_",
+            "_bottom_",
+            "_section_",
+        )
+        for path in list(final_dir.iterdir()):
+            if (
+                path.is_file()
+                and path.name.startswith(stem)
+                and path.suffix.lower() in (".png", ".svg")
+                and any(token in path.name for token in view_tokens)
+            ):
+                path.unlink()
+
+    def _export_lithic_measurements(self):
+        if not self._require_confirmed_lithic_pose():
+            return
+
+        staging = None
+        try:
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            self.lithic_measurement_export_btn.setEnabled(False)
+            self._set_export_progress(5, "石器 計測データを書き出し中")
+            QApplication.processEvents()
+
+            final_m = np.asarray(
+                self.lithic_confirmed_final_matrix,
+                dtype=float,
             )
+            staging = self._lithic_component_staging_dir("measurements")
+
+            # Per-specimen measurements and section bbox CSVs.
+            self._write_individual_measurement_csv(staging, final_m)
+
+            # Cross-specimen inventories.
+            if not self.export_measurement_inventory(show_message=False):
+                raise RuntimeError("計測一覧の更新に失敗しました。")
+
+            final_dir = self._lithic_final_output_dir()
+            written = self._merge_component_files(staging, final_dir)
+
+            self._set_export_progress(
+                100,
+                f"計測データ出力完了: {final_dir}",
+            )
+            QMessageBox.information(
+                self,
+                "計測データ出力",
+                "計測データを書き出しました。\n"
+                f"保存先: {final_dir}\n"
+                f"個体別CSV: {len(written)} ファイル\n"
+                "あわせて geometry / 3D model inventory を更新しました。",
+            )
+        except Exception as e:
+            if staging is not None and staging.exists():
+                shutil.rmtree(staging, ignore_errors=True)
+            self._set_export_progress(0, "計測データ出力失敗")
+            self._show_error("石器 計測データ出力エラー", e)
+        finally:
+            QApplication.restoreOverrideCursor()
+            if self.asset is not None:
+                self.lithic_measurement_export_btn.setEnabled(True)
+
+    def _export_lithic_orthographic_files(self):
+        if not self._confirm_lithic_export_without_measurements("展開図出力"):
             return
 
         views = self._selected_lithic_views()
@@ -5263,91 +5535,20 @@ class MainWindow(QMainWindow):
             )
             return
 
-        stem = self.asset.source_path.stem
-        final_dir = OUTPUT_DIR / stem
-        if final_dir.exists():
-            QMessageBox.warning(
-                self,
-                "処理済み",
-                f"{final_dir} が存在するため処理済みです。"
-                "再処理する場合はこのフォルダを削除してください。",
-            )
-            self.scan_queue_and_load()
-            return
-
-        staging = OUTPUT_DIR / f"{stem}.__working__"
+        staging = None
         try:
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-            self.lithic_save_next_btn.setEnabled(False)
-            self._set_export_progress(
-                2, f"石器 保存準備中: {self.asset.source_path.name}"
-            )
-            if staging.exists():
-                shutil.rmtree(staging)
-            staging.mkdir(parents=True, exist_ok=False)
-
-            final_m = np.asarray(
-                self.lithic_confirmed_final_matrix, dtype=float
-            )
-            mesh_path = staging / f"{stem}_rev.ply"
-            self._set_export_progress(
-                10, f"正規化PLYを書き出し中: {mesh_path.name}"
-            )
-            export_normalized_mesh(self.asset, final_m, mesh_path)
-
-            self._set_export_progress(
-                20, "石器 Transform 情報を書き出し中"
-            )
-            export_transform_json(
-                staging / "transform.json",
-                self._metadata(final_m),
-            )
-
-            self._set_export_progress(
-                22, "石器 計測CSVを書き出し中"
-            )
-            self._write_individual_measurement_csv(
-                staging,
-                final_m,
-            )
-
-            # Requested staged transformation matrices.
-            # The combined original->result matrix remains in transform.json,
-            # while standalone matrix files are kept as original->OBB and,
-            # only when needed, OBB->result.
-            export_matrix_csv(
-                staging / "transform_original_to_obb.csv",
-                self.lithic_original_to_obb_matrix,
-            )
-            export_matrix_txt(
-                staging / "transform_original_to_obb_cloudcompare.txt",
-                self.lithic_original_to_obb_matrix,
-            )
-
-            has_post_obb = not np.allclose(
-                self.lithic_obb_to_result_matrix,
-                np.eye(4),
-                atol=1e-9,
-                rtol=0.0,
-            )
-            if has_post_obb:
-                export_matrix_csv(
-                    staging / "transform_obb_to_result.csv",
-                    self.lithic_obb_to_result_matrix,
-                )
-                export_matrix_txt(
-                    staging / "transform_obb_to_result_cloudcompare.txt",
-                    self.lithic_obb_to_result_matrix,
-                )
+            self.lithic_ortho_export_btn.setEnabled(False)
+            staging = self._lithic_component_staging_dir("orthos")
 
             def ortho_progress(frac: float, message: str):
                 self._set_export_progress(
-                    25 + int(68 * float(frac)),
+                    5 + int(88 * float(frac)),
                     message,
                 )
 
             self._set_export_progress(
-                25, "石器オルソ / 輪郭 / 断面生成を開始"
+                5, "石器オルソ / 輪郭 / 断面生成を開始"
             )
             written = self.export_lithic_orthos(
                 staging,
@@ -5355,9 +5556,7 @@ class MainWindow(QMainWindow):
                 modes=modes,
                 spacing_mm=float(self.lithic_view_spacing.value()),
                 scale_bar_mm=self._selected_lithic_scale_bar_mm(),
-                outline_width_px=(
-                    self._selected_lithic_outline_width_px()
-                ),
+                outline_width_px=self._selected_lithic_outline_width_px(),
                 individual=self.lithic_export_individual.isChecked(),
                 export_png_plain=export_png_plain,
                 export_svg=export_svg,
@@ -5365,12 +5564,8 @@ class MainWindow(QMainWindow):
                 progress_callback=ortho_progress,
             )
 
-            png_files = [
-                p for p in written if p.suffix.lower() == ".png"
-            ]
-            svg_files = [
-                p for p in written if p.suffix.lower() == ".svg"
-            ]
+            png_files = [p for p in written if p.suffix.lower() == ".png"]
+            svg_files = [p for p in written if p.suffix.lower() == ".svg"]
 
             if export_png_plain:
                 plain_pngs = [
@@ -5395,44 +5590,167 @@ class MainWindow(QMainWindow):
                     "「SVG」がONですがSVGが生成されませんでした。"
                 )
 
-            for p in png_files:
-                self._verify_png_file(p)
-            for p in svg_files:
-                self._verify_svg_file(p)
+            for path in png_files:
+                self._verify_png_file(path)
+            for path in svg_files:
+                self._verify_svg_file(path)
 
-            self._set_export_progress(96, "石器出力フォルダを確定中")
-            staging.rename(final_dir)
+            final_dir = self._lithic_final_output_dir()
+            self._remove_existing_lithic_ortho_files(final_dir)
+            merged = self._merge_component_files(staging, final_dir)
 
-            final_outputs = sorted(
-                p for p in final_dir.iterdir() if p.is_file()
+            self._set_export_progress(
+                100,
+                f"展開図出力完了: {final_dir}",
             )
-            summary = (
-                f"保存完了: {final_dir} "
-                f"(matrix {'2段' if has_post_obb else 'OBBのみ1段'} / "
-                f"全{len(final_outputs)}ファイル)"
+            QMessageBox.information(
+                self,
+                "展開図出力",
+                f"展開図を書き出しました。\n保存先: {final_dir}\n"
+                f"出力ファイル: {len(merged)}",
             )
-            self._set_export_progress(100, summary)
-            print(summary)
-            for p in final_outputs:
-                print(f"  - {p.name}")
-
-            self.scan_queue_and_load()
         except Exception as e:
-            try:
-                if staging.exists():
-                    shutil.rmtree(staging)
-            except Exception:
-                pass
-            self._set_export_progress(0, "石器 保存失敗")
-            self._show_error("石器 保存エラー", e)
+            if staging is not None and staging.exists():
+                shutil.rmtree(staging, ignore_errors=True)
+            self._set_export_progress(0, "展開図出力失敗")
+            self._show_error("石器 展開図出力エラー", e)
         finally:
             QApplication.restoreOverrideCursor()
             if self.asset is not None:
-                self.lithic_save_next_btn.setEnabled(True)
+                self.lithic_ortho_export_btn.setEnabled(True)
+
+    def _write_lithic_transform_files(
+        self,
+        out_dir: Path,
+        final_m: np.ndarray,
+    ) -> list[Path]:
+        """Write transform metadata associated with the PLY product."""
+        written: list[Path] = []
+
+        json_path = out_dir / "transform.json"
+        export_transform_json(json_path, self._metadata(final_m))
+        written.append(json_path)
+
+        if getattr(self, "lithic_pose_base_mode", "automatic") == "input":
+            # No OBB stage exists in input-pose mode, so avoid misleading
+            # original_to_obb filenames and write the actual final transform.
+            csv_path = out_dir / "transform_matrix.csv"
+            txt_path = out_dir / "transform_matrix_cloudcompare.txt"
+            export_matrix_csv(csv_path, final_m)
+            export_matrix_txt(txt_path, final_m)
+            written.extend([csv_path, txt_path])
+            return written
+
+        csv_path = out_dir / "transform_original_to_obb.csv"
+        txt_path = out_dir / "transform_original_to_obb_cloudcompare.txt"
+        export_matrix_csv(csv_path, self.lithic_original_to_obb_matrix)
+        export_matrix_txt(txt_path, self.lithic_original_to_obb_matrix)
+        written.extend([csv_path, txt_path])
+
+        has_post_obb = not np.allclose(
+            self.lithic_obb_to_result_matrix,
+            np.eye(4),
+            atol=1e-9,
+            rtol=0.0,
+        )
+        if has_post_obb:
+            csv_path = out_dir / "transform_obb_to_result.csv"
+            txt_path = out_dir / "transform_obb_to_result_cloudcompare.txt"
+            export_matrix_csv(csv_path, self.lithic_obb_to_result_matrix)
+            export_matrix_txt(txt_path, self.lithic_obb_to_result_matrix)
+            written.extend([csv_path, txt_path])
+
+        return written
+
+    def _export_lithic_ply_files(self):
+        if not self._confirm_lithic_export_without_measurements(
+            "PLY / Transform出力"
+        ):
+            return
+
+        staging = None
+        try:
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            self.lithic_ply_export_btn.setEnabled(False)
+            staging = self._lithic_component_staging_dir("ply")
+
+            final_m = np.asarray(
+                self.lithic_confirmed_final_matrix,
+                dtype=float,
+            )
+            stem = self.asset.source_path.stem
+            mesh_path = staging / f"{stem}_rev.ply"
+
+            self._set_export_progress(
+                10, f"正規化PLYを書き出し中: {mesh_path.name}"
+            )
+            export_normalized_mesh(self.asset, final_m, mesh_path)
+            self._set_export_progress(70, "Transform情報を書き出し中")
+            self._write_lithic_transform_files(staging, final_m)
+
+            final_dir = self._lithic_final_output_dir()
+            merged = self._merge_component_files(staging, final_dir)
+
+            self._set_export_progress(
+                100,
+                f"PLY / Transform出力完了: {final_dir}",
+            )
+            QMessageBox.information(
+                self,
+                "PLY / Transform出力",
+                f"PLYとTransform情報を書き出しました。\n"
+                f"保存先: {final_dir}\n"
+                f"出力ファイル: {len(merged)}",
+            )
+        except Exception as e:
+            if staging is not None and staging.exists():
+                shutil.rmtree(staging, ignore_errors=True)
+            self._set_export_progress(0, "PLY / Transform出力失敗")
+            self._show_error("石器 PLY / Transform出力エラー", e)
+        finally:
+            QApplication.restoreOverrideCursor()
+            if self.asset is not None:
+                self.lithic_ply_export_btn.setEnabled(True)
+
+    def _finish_lithic_and_next(self):
+        """Mark split export work complete and advance the input queue."""
+        if not self.asset or not self._is_lithic():
+            return
+
+        final_dir = OUTPUT_DIR / self.asset.source_path.stem
+        if not final_dir.exists():
+            answer = QMessageBox.question(
+                self,
+                "出力なし",
+                "この資料ではまだ出力ファイルが作成されていません。\n"
+                "出力なしで完了扱いにして次のファイルへ進みますか？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            final_dir.mkdir(parents=True, exist_ok=True)
+
+        marker = final_dir / SPLIT_EXPORT_IN_PROGRESS_MARKER
+        if marker.exists():
+            marker.unlink()
+
+        self.statusBar().showMessage(
+            f"完了: {self.asset.source_path.name} — 次のファイルへ進みます。"
+        )
+        self.scan_queue_and_load()
 
     def save_current_and_next(self):
         if self._is_lithic():
-            self._save_lithic_current_and_next()
+            # Lithic export is split into measurement / orthographic / PLY
+            # products in v0.4.7. This legacy entry point is retained only for
+            # compatibility with older UI bindings.
+            QMessageBox.information(
+                self,
+                "石器出力",
+                "石器は「計測データ出力」「展開図出力」"
+                "「PLY / Transform出力」を個別に使用してください。",
+            )
             return
         if not self.asset or not self.posture_done:
             QMessageBox.warning(self, "未確定", "先に姿勢と正面を確定してください。")
