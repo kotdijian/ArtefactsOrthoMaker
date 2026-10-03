@@ -1,0 +1,11573 @@
+from __future__ import annotations
+
+import csv
+import io
+import json
+import math
+import shutil
+import sys
+import tempfile
+import traceback
+from pathlib import Path
+
+import numpy as np
+import pyvista as pv
+import trimesh
+import pose_core as _pose_core
+from pyvistaqt import QtInteractor
+from PySide6.QtCore import Qt, QEvent, QTimer
+from PySide6.QtGui import QAction, QColor, QPainter, QPen, QPixmap
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDial,
+    QDoubleSpinBox,
+    QFileDialog,
+    QFormLayout,
+    QGraphicsItem,
+    QGraphicsLineItem,
+    QGraphicsScene,
+    QGraphicsView,
+    QGridLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QProgressBar,
+    QScrollArea,
+    QSlider,
+    QSpinBox,
+    QTableWidget,
+    QTableWidgetItem,
+    QHeaderView,
+    QSplitter,
+    QStackedWidget,
+    QVBoxLayout,
+    QWidget,
+)
+
+from pose_core import (
+    AxisEstimate,
+    MeshAsset,
+    PlaneEstimate,
+    UNIT_TO_MM,
+    angle_between_deg,
+    build_pose_transform,
+    estimate_base_plane,
+    estimate_rim_plane,
+    estimate_slice_axis,
+    export_matrix_csv,
+    export_matrix_txt,
+    export_normalized_mesh,
+    export_transform_json,
+    final_transform_matrix,
+    plane_from_three_points,
+    transform_points,
+)
+
+APP_NAME = "ArtefactsOrthoMaker"
+APP_VERSION = "1.0.0"
+SUPPORTED_SUFFIXES = {".obj", ".ply", ".glb"}
+WORK_DIR = Path(__file__).resolve().parent
+INPUT_DIR = WORK_DIR / "input"
+OUTPUT_DIR = WORK_DIR / "output"
+ORTHO_COMPOSITE_LONG_EDGE_PX = 3600
+OUTLINE_ALPHA_THRESHOLD = 127.5
+OUTLINE_PNG_WIDTH_PX = 2
+OUTLINE_SVG_STROKE_MM = 0.25
+MAX_PNG_DIMENSION_PX = 16384
+MAX_PNG_PIXELS = 100_000_000
+PNG_WARNING_PIXELS = 75_000_000
+PNG_WARNING_ESTIMATED_MB = 100.0
+PNG_WORKING_BYTES_PER_PIXEL = 16.0
+PNG_FILESIZE_SAFETY_FACTOR = 1.20
+PNG_FILESIZE_SAMPLE_LONG_EDGE_PX = 1200
+PNG_TARGET_MB = {"S": 10.0, "M": 50.0, "L": 100.0}
+
+
+SPLIT_EXPORT_IN_PROGRESS_MARKER = ".aom_in_progress"
+
+POTTERY_CURVE_SURFACE_LABELS = {
+    "outer": "外面",
+    "inner": "内面",
+    "upper": "上面",
+}
+
+
+def load_mesh_asset(path: str | Path, input_unit: str) -> MeshAsset:
+    """Load an artifact mesh, preserving OBJ UV seams correctly.
+
+    OBJ stores geometry-vertex indices (v) and texture-coordinate indices (vt)
+    independently. A single geometric vertex can therefore be referenced by
+    multiple UV coordinates at texture seams.  Trimesh's maintain_order=True
+    path can collapse those corner-specific UV assignments to one UV per
+    original geometric vertex.
+
+    For OBJ only, load with maintain_order=False and process=False.  This lets
+    Trimesh duplicate render vertices where required by (v, vt) combinations
+    while leaving triangle geometry and face ordering intact.  PLY/GLB retain
+    the existing pose_core loader behavior.
+    """
+    path = Path(path).expanduser().resolve()
+    if path.suffix.lower() != ".obj":
+        return _pose_core.load_mesh_asset(path, input_unit)
+
+    if input_unit not in UNIT_TO_MM:
+        raise ValueError(f"Unsupported unit: {input_unit}")
+
+    notes: list[str] = []
+    normals_present = _pose_core.source_has_normals(path)
+
+    loaded = trimesh.load(
+        path,
+        process=False,
+        maintain_order=False,
+    )
+
+    source_scene = None
+    if isinstance(loaded, trimesh.Scene):
+        mesh = _pose_core._scene_to_single_mesh(loaded, notes)
+    elif isinstance(loaded, trimesh.Trimesh):
+        mesh = loaded
+    else:
+        raise ValueError(f"Unsupported geometry object: {type(loaded).__name__}")
+
+    if len(mesh.vertices) == 0 or len(mesh.faces) == 0:
+        raise ValueError("Mesh has no vertices or faces.")
+    if np.asarray(mesh.faces).shape[1] != 3:
+        raise ValueError("Triangle mesh is required.")
+
+    computed = _pose_core.area_weighted_vertex_normals(
+        np.asarray(mesh.vertices),
+        np.asarray(mesh.faces),
+    )
+    valid = (
+        np.isfinite(computed).all()
+        and np.all(np.linalg.norm(computed, axis=1) > 0.5)
+    )
+    if not valid:
+        raise ValueError(
+            "Normals could not be calculated reliably from the mesh geometry."
+        )
+
+    normals_status = (
+        "source_present_validated"
+        if normals_present
+        else "missing_recalculated"
+    )
+    appearance_kind, texture_image, uv, vertex_colors = (
+        _pose_core._appearance_from_mesh(mesh, notes)
+    )
+
+    if appearance_kind == "texture" and uv is not None:
+        notes.append(
+            "OBJ UV seam-safe load: "
+            f"{len(mesh.vertices):,} render vertices / "
+            f"{len(mesh.faces):,} faces; "
+            "corner-specific UV seams preserved; V coordinate kept unchanged."
+        )
+    elif getattr(mesh.visual, "kind", None) == "texture":
+        notes.append(
+            "OBJ texture metadata was detected, but a directly usable UV/image "
+            "pair could not be retained; fallback appearance handling was used."
+        )
+
+    return MeshAsset(
+        mesh=mesh,
+        source_path=path,
+        source_sha256=_pose_core.sha256_file(path),
+        input_unit=input_unit,
+        unit_to_mm=UNIT_TO_MM[input_unit],
+        source_normals_present=normals_present,
+        normals_status=normals_status,
+        appearance_kind=appearance_kind,
+        texture_image=texture_image,
+        uv=uv,
+        vertex_colors=vertex_colors,
+        vertex_normals=computed,
+        source_scene=source_scene,
+        notes=notes,
+    )
+
+
+
+class OrthoPreviewWindow(QMainWindow):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("オルソ画像プレビュー")
+        self.resize(1280, 900)
+
+        self._items: list[tuple[str, QLabel, QPixmap]] = []
+        self._zoom_percent = 100
+        self._fit_width_mode = True
+
+        root = QWidget()
+        self.setCentralWidget(root)
+        layout = QVBoxLayout(root)
+
+        self.info_label = QLabel("姿勢決定後にプレビューできます。")
+        self.info_label.setWordWrap(True)
+        layout.addWidget(self.info_label)
+
+        toolbar = QHBoxLayout()
+        toolbar.addWidget(QLabel("表示倍率"))
+        self.zoom_out_btn = QPushButton("-")
+        self.zoom_out_btn.clicked.connect(lambda: self._step_zoom(-10))
+        toolbar.addWidget(self.zoom_out_btn)
+
+        self.zoom_label = QLabel("Fit width")
+        self.zoom_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.zoom_label.setMinimumWidth(90)
+        toolbar.addWidget(self.zoom_label)
+
+        self.zoom_reset_btn = QPushButton("100%")
+        self.zoom_reset_btn.clicked.connect(self._set_actual_size)
+        toolbar.addWidget(self.zoom_reset_btn)
+
+        self.zoom_fit_btn = QPushButton("Fit width")
+        self.zoom_fit_btn.clicked.connect(self._set_fit_width)
+        toolbar.addWidget(self.zoom_fit_btn)
+
+        self.zoom_in_btn = QPushButton("+")
+        self.zoom_in_btn.clicked.connect(lambda: self._step_zoom(10))
+        toolbar.addWidget(self.zoom_in_btn)
+        toolbar.addStretch(1)
+        layout.addLayout(toolbar)
+
+        self.gesture_hint = QLabel(
+            "トラックパッド: ピンチでZoom / 2本指スクロールで移動　"
+            "マウス: Ctrl+ホイールでZoom"
+        )
+        self.gesture_hint.setWordWrap(True)
+        layout.addWidget(self.gesture_hint)
+
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.viewport().installEventFilter(self)
+        try:
+            self.scroll.viewport().setAttribute(
+                Qt.WidgetAttribute.WA_AcceptTouchEvents, True
+            )
+        except Exception:
+            pass
+        layout.addWidget(self.scroll)
+
+        self.container = QWidget()
+        self.container_layout = QVBoxLayout(self.container)
+        self.container_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.scroll.setWidget(self.container)
+
+        self._update_zoom_label()
+
+    def _clear_items(self):
+        self._items.clear()
+        while self.container_layout.count():
+            item = self.container_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+    def _update_zoom_label(self):
+        if self._fit_width_mode:
+            self.zoom_label.setText(f"Fit width ({self._zoom_percent}%)")
+        else:
+            self.zoom_label.setText(f"{self._zoom_percent}%")
+
+    def _fit_base_width(self) -> int:
+        vw = max(200, self.scroll.viewport().width() - 24)
+        return vw
+
+    def _apply_zoom(self):
+        if not self._items:
+            return
+        fit_w = self._fit_base_width()
+        for _title, image_label, pix in self._items:
+            if pix.isNull():
+                continue
+            if self._fit_width_mode:
+                target_w = fit_w
+            else:
+                target_w = int(round(fit_w * (self._zoom_percent / 100.0)))
+            target_w = max(100, target_w)
+            scaled = pix.scaledToWidth(target_w, Qt.TransformationMode.SmoothTransformation)
+            image_label.setPixmap(scaled)
+        self._update_zoom_label()
+
+    def _set_fit_width(self):
+        self._fit_width_mode = True
+        self._zoom_percent = 100
+        self._apply_zoom()
+
+    def _set_actual_size(self):
+        self._fit_width_mode = False
+        self._zoom_percent = 100
+        self._apply_zoom()
+
+    def _step_zoom(self, delta: int):
+        if self._fit_width_mode:
+            self._fit_width_mode = False
+            self._zoom_percent = 100
+        self._zoom_percent = max(10, min(800, self._zoom_percent + delta))
+        self._apply_zoom()
+
+    def set_message(self, message: str):
+        self.info_label.setText(message)
+        self._clear_items()
+
+    def set_images(self, items: list[tuple[str, str]], summary: str = ""):
+        self.info_label.setText(summary or "")
+        self._clear_items()
+        if not items:
+            empty = QLabel("表示できるオルソPNGがありません。")
+            empty.setWordWrap(True)
+            self.container_layout.addWidget(empty)
+            return
+
+        for title, path in items:
+            title_label = QLabel(title)
+            title_label.setWordWrap(True)
+            self.container_layout.addWidget(title_label)
+
+            pix = QPixmap(path)
+            image_label = QLabel()
+            image_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+            if pix.isNull():
+                image_label.setText(f"画像を読み込めませんでした: {path}")
+            else:
+                self._items.append((title, image_label, pix))
+            self.container_layout.addWidget(image_label)
+
+        self._set_fit_width()
+
+    def _native_pinch_zoom(self, value: float):
+        """Apply macOS trackpad pinch zoom.
+
+        QNativeGestureEvent.value() is a signed zoom delta.  Use an
+        exponential scale factor so repeated small deltas feel smooth and
+        symmetric for pinch-in / pinch-out.
+        """
+        try:
+            value = float(value)
+        except Exception:
+            return
+        if not math.isfinite(value) or abs(value) < 1e-9:
+            return
+
+        if self._fit_width_mode:
+            self._fit_width_mode = False
+            self._zoom_percent = 100
+
+        factor = math.exp(value)
+        target = int(round(self._zoom_percent * factor))
+        self._zoom_percent = max(10, min(800, target))
+        self._apply_zoom()
+
+    def wheelEvent(self, event):
+        # Ctrl + wheel = zoom, plain wheel = normal scroll.
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            delta = event.angleDelta().y()
+            if delta != 0:
+                self._step_zoom(10 if delta > 0 else -10)
+                event.accept()
+                return
+        super().wheelEvent(event)
+
+    def eventFilter(self, watched, event):
+        if watched is self.scroll.viewport():
+            etype = event.type()
+
+            if etype == QEvent.Type.NativeGesture:
+                try:
+                    if (
+                        event.gestureType()
+                        == Qt.NativeGestureType.ZoomNativeGesture
+                    ):
+                        self._native_pinch_zoom(event.value())
+                        event.accept()
+                        return True
+                except (AttributeError, TypeError):
+                    pass
+
+            if etype == QEvent.Type.Wheel:
+                if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+                    delta = event.angleDelta().y()
+                    if delta != 0:
+                        self._step_zoom(10 if delta > 0 else -10)
+                        event.accept()
+                        return True
+
+            elif etype == QEvent.Type.Resize:
+                self._apply_zoom()
+
+        return super().eventFilter(watched, event)
+
+
+class LithicPreviewGraphicsView(QGraphicsView):
+    """Embedded lithic unfolded-view preview with robust line interaction."""
+
+    def __init__(self, owner, parent=None):
+        super().__init__(parent)
+        self.owner = owner
+        self.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+        self.setTransformationAnchor(
+            QGraphicsView.ViewportAnchor.AnchorUnderMouse
+        )
+        self.setResizeAnchor(
+            QGraphicsView.ViewportAnchor.AnchorViewCenter
+        )
+        self._fit_on_next_resize = True
+        self._drag_section: tuple[str, str, str] | None = None
+
+    def fit_scene(self):
+        if self.scene() is None or self.scene().sceneRect().isEmpty():
+            return
+        self.fitInView(
+            self.scene().sceneRect(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+        )
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self._fit_on_next_resize:
+            self.fit_scene()
+
+    def wheelEvent(self, event):
+        delta = event.angleDelta().y()
+        if delta == 0:
+            super().wheelEvent(event)
+            return
+        factor = 1.12 if delta > 0 else 1.0 / 1.12
+        self.scale(factor, factor)
+        self._fit_on_next_resize = False
+        event.accept()
+
+    def _event_scene_pos(self, event):
+        try:
+            point = event.position().toPoint()
+        except AttributeError:
+            point = event.pos()
+        return self.mapToScene(point)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            scene_pos = self._event_scene_pos(event)
+            hit = self.owner._pick_lithic_section_line(scene_pos)
+            if hit is not None:
+                self._drag_section = hit
+                section_id, _axis, _panel_key = hit
+                self.owner._select_lithic_section(section_id)
+                event.accept()
+                return
+        self._drag_section = None
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._drag_section is not None:
+            section_id, axis, panel_key = self._drag_section
+            self.owner._drag_lithic_section_line(
+                section_id,
+                axis,
+                panel_key,
+                self._event_scene_pos(event),
+            )
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if (
+            self._drag_section is not None
+            and event.button() == Qt.MouseButton.LeftButton
+        ):
+            section_id, _axis, _panel_key = self._drag_section
+            self.owner._lithic_section_line_released(section_id)
+            self._drag_section = None
+            event.accept()
+            return
+        self._drag_section = None
+        super().mouseReleaseEvent(event)
+
+
+class LithicSectionLineItem(QGraphicsLineItem):
+    """Passive blue section line; mouse interaction is handled by the view."""
+
+    def __init__(
+        self,
+        owner,
+        section_id: str,
+        axis: str,
+        panel_key: str,
+        selected: bool = False,
+    ):
+        super().__init__()
+        self.owner = owner
+        self.section_id = section_id
+        self.axis = axis
+        self.panel_key = panel_key
+        self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self.setZValue(50.0)
+        self._set_pen(selected)
+
+    def _set_pen(self, selected: bool):
+        pen = QPen(QColor(0, 110, 255))
+        pen.setWidth(5 if selected else 3)
+        pen.setCosmetic(True)
+        self.setPen(pen)
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
+        self.resize(1500, 900)
+
+        self.asset: MeshAsset | None = None
+        self.initial_axis: AxisEstimate | None = None
+        self.reference_plane: PlaneEstimate | None = None
+        self.pose_matrix = np.eye(4)
+        self.front_angle_deg = 0.0
+        self.center_axis_after_pose: AxisEstimate | None = None
+
+        # Lithic mode: minimum-volume OBB is the automatic initial pose.
+        # Axis convention after OBB:
+        #   X = short axis
+        #   Y = long axis (maximum extent)
+        #   Z = thickness axis (minimum extent)
+        self.lithic_angles_deg = {"x": 0.0, "y": 0.0, "z": 0.0}
+        self.lithic_obb_native_extents: np.ndarray | None = None
+        self.lithic_obb_extents: np.ndarray | None = None
+        self.lithic_obb_elapsed_sec: float | None = None
+        self.lithic_section_level_angle_deg: float = 0.0
+        self.lithic_section_level_residual_deg: float | None = None
+        self.lithic_section_left_point: np.ndarray | None = None
+        self.lithic_section_right_point: np.ndarray | None = None
+        self.lithic_section_point_count: int = 0
+
+        # Lithic transform decomposition:
+        # original -> OBB and OBB -> result are retained separately.
+        self.lithic_raw_to_obb_centered_matrix = np.eye(4)
+        self.lithic_original_to_obb_matrix = np.eye(4)
+        self.lithic_auto_rotation_matrix = np.eye(4)
+        self.lithic_confirmed_final_matrix: np.ndarray | None = None
+        self.lithic_obb_to_result_matrix = np.eye(4)
+        self.lithic_pose_confirmed = False
+        # Base pose used before manual X/Y/Z rotations:
+        #   "input"     = preserve the coordinates/orientation as loaded
+        #   "automatic" = OBB + central X-Z section leveling
+        self.lithic_pose_base_mode = "input"
+
+        # Interactive section definitions.  Axis "X" means an X-Z section
+        # (plane y=constant); axis "Y" means a Y-Z section (plane x=constant).
+        self.lithic_sections: list[dict] = []
+        self.lithic_section_counter = {"X": 0, "Y": 0}
+        self.lithic_active_section_id: str | None = None
+        self.lithic_preview_panel_rects: dict[str, tuple[float, float, float, float]] = {}
+        self.lithic_preview_line_items: dict[str, list[LithicSectionLineItem]] = {}
+        self.lithic_preview_scene: QGraphicsScene | None = None
+        self.lithic_preview_pixmap_path: Path | None = None
+        self._lithic_preview_temp_dir: Path | None = None
+        self.lithic_png_bpp_estimate: float | None = None
+        self._lithic_output_size_refresh_pending = False
+
+        self._setting_lithic_rotation = False
+        self.pose_info: dict = {}
+        self.posture_done = False
+        self.manual_points: list[np.ndarray] = []
+        self.pick_mode = False
+        self.front_drag_enabled = False
+        self.dragging_front = False
+        self.last_mouse_x = 0.0
+        self.actor = None
+        self.current_poly = None
+        self._viewer_scale_actor = None
+        self._viewer_scale_text_actor = None
+        self._zoom_base_parallel_scale: float | None = None
+        self._zoom_percent = 100
+        self._updating_zoom_ui = False
+        self._ortho_preview_window: OrthoPreviewWindow | None = None
+        self._preview_temp_dir: Path | None = None
+        self._preview_refresh_pending = False
+        self._setting_dial = False
+        self._setting_pottery_curve_controls = False
+        self._setting_pottery_z_cursor = False
+        self.pottery_curve_z_pick_mode = False
+        self._pottery_curve_z_click_consuming = False
+        self.pottery_curve_png_bpp_estimate: float | None = None
+        self.pottery_ortho_png_bpp_estimate: float | None = None
+        self._pottery_curve_size_refresh_pending = False
+        self.pottery_cylinder_breakpoints_mm: list[float] = []
+        self.queue_all: list[Path] = []
+        self.current_queue_path: Path | None = None
+
+        self._build_ui()
+        self._build_menu()
+        self.statusBar().showMessage("inputフォルダを確認しています…")
+        QTimer.singleShot(0, self.scan_queue_and_load)
+
+    # ---------- UI ----------
+    def _build_ui(self):
+        root = QWidget()
+        self.setCentralWidget(root)
+        root_layout = QHBoxLayout(root)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        root_layout.addWidget(splitter)
+
+        controls = QWidget()
+        left_layout = QVBoxLayout(controls)
+        left_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+
+        file_group = QGroupBox("1. 入力キュー / 単位")
+        file_form = QFormLayout(file_group)
+        self.artifact_type_combo = QComboBox()
+        self.artifact_type_combo.addItems(["土器", "石器"])
+        self.artifact_type_combo.setCurrentText("土器")
+        self.artifact_type_combo.currentTextChanged.connect(self._artifact_type_changed)
+
+        self.unit_combo = QComboBox()
+        self.unit_combo.addItems(["mm", "cm", "m"])
+        self.unit_combo.setCurrentText("mm")
+        self.unit_combo.currentTextChanged.connect(self._unit_changed)
+        self.reload_queue_btn = QPushButton("inputフォルダを再読込")
+        self.reload_queue_btn.clicked.connect(self.scan_queue_and_load)
+        self.queue_label = QLabel("—")
+        self.queue_label.setWordWrap(True)
+        self.file_label = QLabel("未読込")
+        self.file_label.setWordWrap(True)
+        file_form.addRow("モデル種別", self.artifact_type_combo)
+        file_form.addRow("入力単位", self.unit_combo)
+        file_form.addRow(self.reload_queue_btn)
+        file_form.addRow("キュー", self.queue_label)
+        file_form.addRow("現在", self.file_label)
+        left_layout.addWidget(file_group)
+
+        qa_group = QGroupBox("Mesh QA")
+        qa_layout = QVBoxLayout(qa_group)
+        self.qa_label = QLabel("—")
+        self.qa_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.qa_label.setWordWrap(True)
+        qa_layout.addWidget(self.qa_label)
+        left_layout.addWidget(qa_group)
+
+        display_group = QGroupBox("表示")
+        display_layout = QVBoxLayout(display_group)
+        self.show_appearance = QCheckBox("テクスチャ / 頂点カラー")
+        self.show_appearance.setChecked(True)
+        self.show_appearance.stateChanged.connect(self.refresh_view)
+        self.smooth_shading = QCheckBox("Normalシェード")
+        self.smooth_shading.setChecked(True)
+        self.smooth_shading.stateChanged.connect(self.refresh_view)
+
+        view_mode_row = QHBoxLayout()
+        view_mode_row.addWidget(QLabel("表示方向"))
+        self.view_mode_combo = QComboBox()
+        self.view_mode_combo.addItems(["Ortho Front", "Oblique"])
+        self.view_mode_combo.setCurrentText("Oblique")
+        self.view_mode_combo.currentTextChanged.connect(self._view_mode_changed)
+        view_mode_row.addWidget(self.view_mode_combo)
+
+        viewer_scale_row = QHBoxLayout()
+        viewer_scale_row.addWidget(QLabel("表示スケール"))
+        self.viewer_scale_combo = QComboBox()
+        self.viewer_scale_combo.addItems(["20 mm", "50 mm", "100 mm"])
+        self.viewer_scale_combo.setCurrentText("50 mm")
+        self.viewer_scale_combo.currentTextChanged.connect(self._viewer_scale_changed)
+        viewer_scale_row.addWidget(self.viewer_scale_combo)
+
+        zoom_row = QHBoxLayout()
+        zoom_row.addWidget(QLabel("Zoom"))
+        self.zoom_out_btn = QPushButton("-")
+        self.zoom_out_btn.clicked.connect(lambda: self._step_zoom(-10))
+        zoom_row.addWidget(self.zoom_out_btn)
+        self.zoom_label = QLabel("100%")
+        self.zoom_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.zoom_label.setMinimumWidth(56)
+        zoom_row.addWidget(self.zoom_label)
+        self.zoom_reset_btn = QPushButton("100%")
+        self.zoom_reset_btn.clicked.connect(self._reset_zoom)
+        zoom_row.addWidget(self.zoom_reset_btn)
+        self.zoom_in_btn = QPushButton("+")
+        self.zoom_in_btn.clicked.connect(lambda: self._step_zoom(10))
+        zoom_row.addWidget(self.zoom_in_btn)
+
+        self.zoom_slider = QSlider(Qt.Orientation.Horizontal)
+        self.zoom_slider.setRange(25, 400)
+        self.zoom_slider.setSingleStep(5)
+        self.zoom_slider.setPageStep(25)
+        self.zoom_slider.setValue(100)
+        self.zoom_slider.valueChanged.connect(self._zoom_slider_changed)
+
+        display_layout.addWidget(self.show_appearance)
+        display_layout.addWidget(self.smooth_shading)
+        display_layout.addLayout(view_mode_row)
+        display_layout.addLayout(viewer_scale_row)
+        display_layout.addLayout(zoom_row)
+        display_layout.addWidget(self.zoom_slider)
+        display_layout.addWidget(QLabel("Ortho Front＝正面平行投影 / Oblique＝斜め平行投影"))
+        left_layout.addWidget(display_group)
+
+        self.pottery_posture_group = QGroupBox("2. 水平・傾き")
+        posture_layout = QVBoxLayout(self.pottery_posture_group)
+        self.method_combo = QComboBox()
+        self.method_combo.addItems(["Slice", "Rim", "Base", "Manual (3 points)"])
+        posture_layout.addWidget(self.method_combo)
+
+        row = QHBoxLayout()
+        self.estimate_btn = QPushButton("推定 / 適用")
+        self.estimate_btn.clicked.connect(self.estimate_and_apply_posture)
+        self.flip_z_btn = QPushButton("Z上下反転")
+        self.flip_z_btn.clicked.connect(self.flip_z_and_reapply)
+        row.addWidget(self.estimate_btn)
+        row.addWidget(self.flip_z_btn)
+        posture_layout.addLayout(row)
+
+        self.manual_pick_btn = QPushButton("手動水平：3点を選択")
+        self.manual_pick_btn.clicked.connect(self.start_manual_pick)
+        posture_layout.addWidget(self.manual_pick_btn)
+        self.manual_pick_label = QLabel("選択点: 0 / 3")
+        posture_layout.addWidget(self.manual_pick_label)
+        self.pose_label = QLabel("姿勢未確定")
+        self.pose_label.setWordWrap(True)
+        self.pose_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        posture_layout.addWidget(self.pose_label)
+        left_layout.addWidget(self.pottery_posture_group)
+
+        self.pottery_front_group = QGroupBox("3. 正面（Z軸回転）")
+        front_layout = QVBoxLayout(self.pottery_front_group)
+        self.front_drag_check = QCheckBox("3D画面の左ドラッグでZ回転")
+        self.front_drag_check.setChecked(True)
+        self.front_drag_check.stateChanged.connect(self._front_drag_changed)
+        front_layout.addWidget(self.front_drag_check)
+        self.front_dial = QDial()
+        self.front_dial.setRange(-1800, 1800)
+        self.front_dial.setNotchesVisible(True)
+        self.front_dial.valueChanged.connect(self._dial_changed)
+        front_layout.addWidget(self.front_dial)
+        angle_row = QHBoxLayout()
+        self.angle_spin = QDoubleSpinBox()
+        self.angle_spin.setRange(-180.0, 180.0)
+        self.angle_spin.setDecimals(1)
+        self.angle_spin.setSuffix("°")
+        self.angle_spin.valueChanged.connect(self._spin_changed)
+        angle_row.addWidget(QLabel("Z回転"))
+        angle_row.addWidget(self.angle_spin)
+        front_layout.addLayout(angle_row)
+        presets = QHBoxLayout()
+        for label, deg in [("0°", 0), ("90°", 90), ("180°", 180), ("-90°", -90)]:
+            b = QPushButton(label)
+            b.clicked.connect(lambda _=False, d=deg: self.set_front_angle(d))
+            presets.addWidget(b)
+        front_layout.addLayout(presets)
+        self.front_hint = QLabel("通常の左ドラッグ＝モデルのZ回転。Shift+左ドラッグ＝カメラ操作。")
+        self.front_hint.setWordWrap(True)
+        front_layout.addWidget(self.front_hint)
+        left_layout.addWidget(self.pottery_front_group)
+
+        # Pottery output branches become available after posture has been
+        # normalized to the common Z-up coordinate system.  Source Y-up data
+        # therefore reaches every output branch as Z-up after pose estimation.
+        self.pottery_output_branch_group = QGroupBox("4. 土器 出力方式")
+        pottery_branch_layout = QVBoxLayout(self.pottery_output_branch_group)
+        self.pottery_output_branch_combo = QComboBox()
+        self.pottery_output_branch_combo.addItems([
+            "オルソ展開図",
+            "円筒展開図",
+            "扇形展開図",
+        ])
+        self.pottery_output_branch_combo.currentTextChanged.connect(
+            self._pottery_output_branch_changed
+        )
+        pottery_branch_layout.addWidget(QLabel(
+            "姿勢決定後の正規化座標は Z=器軸です。出力方式を選択してください。"
+        ))
+        pottery_branch_layout.addWidget(self.pottery_output_branch_combo)
+        left_layout.addWidget(self.pottery_output_branch_group)
+
+        # Common raster-output sizing for every pottery branch.  Keeping this
+        # outside the orthographic/curved branch panels makes the same DPI or
+        # target-file-size policy visible regardless of the selected output.
+        self.pottery_image_size_group = QGroupBox(
+            "5. 画像出力サイズ（オルソ / 円筒 / 扇形 共通）"
+        )
+        pottery_size_form = QFormLayout(self.pottery_image_size_group)
+        self.pottery_curve_image_size_mode_combo = QComboBox()
+        self.pottery_curve_image_size_mode_combo.addItems([
+            "印刷スケール指定",
+            "ファイルサイズ指定",
+        ])
+        self.pottery_curve_print_dpi_combo = QComboBox()
+        self.pottery_curve_print_dpi_combo.addItems(["150 dpi", "300 dpi"])
+        self.pottery_curve_print_dpi_combo.setCurrentText("300 dpi")
+        self.pottery_curve_print_scale_combo = QComboBox()
+        self.pottery_curve_print_scale_combo.addItems(["50%", "66.6667%", "100%"])
+        self.pottery_curve_print_scale_combo.setCurrentText("100%")
+        self.pottery_curve_file_size_combo = QComboBox()
+        self.pottery_curve_file_size_combo.addItems([
+            "S ≤ 10 MB", "M ≤ 50 MB", "L ≤ 100 MB", "Maximum"
+        ])
+        for w in (
+            self.pottery_curve_image_size_mode_combo,
+            self.pottery_curve_print_dpi_combo,
+            self.pottery_curve_print_scale_combo,
+            self.pottery_curve_file_size_combo,
+        ):
+            w.currentTextChanged.connect(self._pottery_curve_output_setting_changed)
+        pottery_size_form.addRow("モード", self.pottery_curve_image_size_mode_combo)
+        pottery_size_form.addRow("印刷解像度", self.pottery_curve_print_dpi_combo)
+        pottery_size_form.addRow("印刷倍率", self.pottery_curve_print_scale_combo)
+        pottery_size_form.addRow("容量上限", self.pottery_curve_file_size_combo)
+        self.pottery_curve_output_size_label = QLabel(
+            "姿勢決定後に出力サイズを計算します。"
+        )
+        self.pottery_curve_output_size_label.setWordWrap(True)
+        pottery_size_form.addRow(self.pottery_curve_output_size_label)
+        left_layout.addWidget(self.pottery_image_size_group)
+
+        self.lithic_pose_group = QGroupBox("2. 石器姿勢（OBB + 3軸回転）")
+        lithic_layout = QVBoxLayout(self.lithic_pose_group)
+
+        self.lithic_obb_label = QLabel(
+            "石器は読込時の姿勢を保持します。必要な場合だけ自動姿勢推定を実行してください。"
+        )
+        self.lithic_obb_label.setWordWrap(True)
+        self.lithic_obb_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        lithic_layout.addWidget(self.lithic_obb_label)
+
+        self.lithic_auto_pose_btn = QPushButton(
+            "自動姿勢推定（OBB + 中央X-Z水平化）"
+        )
+        self.lithic_auto_pose_btn.clicked.connect(
+            self._apply_lithic_oriented_bounds
+        )
+        lithic_layout.addWidget(self.lithic_auto_pose_btn)
+
+        self.lithic_input_pose_btn = QPushButton("読込姿勢に戻す")
+        self.lithic_input_pose_btn.clicked.connect(self._use_lithic_input_pose)
+        lithic_layout.addWidget(self.lithic_input_pose_btn)
+
+        self.lithic_rotation_controls = {}
+        for axis, axis_label, meaning in [("y", "Y", "長さ"), ("x", "X", "幅"), ("z", "Z", "厚さ")]:
+            axis_box = QGroupBox(f"{axis_label}軸回転（{meaning}）")
+            axis_layout = QVBoxLayout(axis_box)
+
+            button_row = QHBoxLayout()
+            minus90 = QPushButton("-90°")
+            minus90.clicked.connect(
+                lambda _=False, a=axis: self._increment_lithic_axis(a, -90.0)
+            )
+            zero = QPushButton("0°")
+            zero.clicked.connect(
+                lambda _=False, a=axis: self._set_lithic_axis_angle(a, 0.0)
+            )
+            plus90 = QPushButton("+90°")
+            plus90.clicked.connect(
+                lambda _=False, a=axis: self._increment_lithic_axis(a, 90.0)
+            )
+            button_row.addWidget(minus90)
+            button_row.addWidget(zero)
+            button_row.addWidget(plus90)
+            axis_layout.addLayout(button_row)
+
+            dial = QDial()
+            dial.setRange(-1800, 1800)
+            dial.setNotchesVisible(True)
+            dial.setWrapping(False)
+            dial.valueChanged.connect(
+                lambda value, a=axis: self._lithic_dial_changed(a, value)
+            )
+            axis_layout.addWidget(dial)
+
+            spin = QDoubleSpinBox()
+            spin.setRange(-180.0, 180.0)
+            spin.setDecimals(1)
+            spin.setSingleStep(1.0)
+            spin.setSuffix("°")
+            spin.valueChanged.connect(
+                lambda value, a=axis: self._lithic_spin_changed(a, value)
+            )
+            axis_layout.addWidget(spin)
+
+            self.lithic_rotation_controls[axis] = {
+                "dial": dial,
+                "spin": spin,
+                "minus90": minus90,
+                "zero": zero,
+                "plus90": plus90,
+            }
+            lithic_layout.addWidget(axis_box)
+
+        self.lithic_reset_btn = QPushButton("基準姿勢に戻す（手動回転 0°）")
+        self.lithic_reset_btn.clicked.connect(self._reset_lithic_rotations)
+        lithic_layout.addWidget(self.lithic_reset_btn)
+
+        self.lithic_hint = QLabel(
+            "初期状態では入力PLYの姿勢をそのまま使用します。"
+            "「自動姿勢推定」を押した場合のみ、① minimum-volume OBBで "
+            "X=幅 / Y=長さ / Z=厚さ、②中央X-Z断面の左右端を結ぶ線がX軸に "
+            "平行になるようY軸回転で自動補正します。各軸の±90°ボタン、"
+            "ダイヤル、数値入力は現在の基準姿勢に対する追加回転です。"
+        )
+        self.lithic_hint.setWordWrap(True)
+        lithic_layout.addWidget(self.lithic_hint)
+
+        self.lithic_confirm_btn = QPushButton("姿勢決定")
+        self.lithic_confirm_btn.clicked.connect(self._confirm_lithic_pose)
+        lithic_layout.addWidget(self.lithic_confirm_btn)
+        left_layout.addWidget(self.lithic_pose_group)
+
+        # Lithic output panel.  It becomes visible after "姿勢決定".
+        self.lithic_output_group = QGroupBox("3. 石器 出力 / 断面設定")
+        lithic_output_layout = QVBoxLayout(self.lithic_output_group)
+
+        self.lithic_return_pose_btn = QPushButton("石器姿勢に戻る")
+        self.lithic_return_pose_btn.clicked.connect(self._return_to_lithic_pose)
+        lithic_output_layout.addWidget(self.lithic_return_pose_btn)
+
+        lithic_output_layout.addWidget(QLabel("出力面（デフォルト6面）"))
+        self.lithic_view_checks = {}
+        for key, label in [
+            ("front", "Front"),
+            ("back", "Back"),
+            ("left", "Left"),
+            ("right", "Right"),
+            ("top", "Top"),
+            ("bottom", "Bottom"),
+        ]:
+            cb = QCheckBox(label)
+            cb.setChecked(True)
+            self.lithic_view_checks[key] = cb
+            lithic_output_layout.addWidget(cb)
+
+        lithic_output_layout.addWidget(QLabel("表現"))
+        self.lithic_mode_texture = QCheckBox("テクスチャ / 頂点カラー")
+        self.lithic_mode_texture_normal = QCheckBox(
+            "テクスチャ / 頂点カラー + Normal"
+        )
+        self.lithic_mode_shade = QCheckBox("Normalのみ（シェード）")
+        for cb in (
+            self.lithic_mode_texture,
+            self.lithic_mode_texture_normal,
+            self.lithic_mode_shade,
+        ):
+            cb.setChecked(True)
+            lithic_output_layout.addWidget(cb)
+
+        lithic_spacing_row = QHBoxLayout()
+        lithic_spacing_row.addWidget(QLabel("面間隔"))
+        self.lithic_view_spacing = QDoubleSpinBox()
+        self.lithic_view_spacing.setRange(0.0, 10000.0)
+        self.lithic_view_spacing.setValue(10.0)
+        self.lithic_view_spacing.setDecimals(1)
+        self.lithic_view_spacing.setSuffix(" mm")
+        lithic_spacing_row.addWidget(self.lithic_view_spacing)
+        lithic_output_layout.addLayout(lithic_spacing_row)
+
+        lithic_scale_row = QHBoxLayout()
+        lithic_scale_row.addWidget(QLabel("スケールバー"))
+        self.lithic_scale_bar_combo = QComboBox()
+        self.lithic_scale_bar_combo.addItems(["20 mm", "50 mm", "100 mm"])
+        self.lithic_scale_bar_combo.setCurrentText("50 mm")
+        lithic_scale_row.addWidget(self.lithic_scale_bar_combo)
+        lithic_output_layout.addLayout(lithic_scale_row)
+
+        image_size_group = QGroupBox("画像出力サイズ")
+        image_size_form = QFormLayout(image_size_group)
+
+        self.lithic_image_size_mode_combo = QComboBox()
+        self.lithic_image_size_mode_combo.addItems([
+            "印刷スケール指定",
+            "ファイルサイズ指定",
+        ])
+        image_size_form.addRow("モード", self.lithic_image_size_mode_combo)
+
+        self.lithic_print_dpi_combo = QComboBox()
+        self.lithic_print_dpi_combo.addItems(["150 dpi", "300 dpi"])
+        self.lithic_print_dpi_combo.setCurrentText("300 dpi")
+        image_size_form.addRow("印刷解像度", self.lithic_print_dpi_combo)
+
+        self.lithic_print_scale_combo = QComboBox()
+        self.lithic_print_scale_combo.addItems(["50 %", "66.6667 %", "100 %"])
+        self.lithic_print_scale_combo.setCurrentText("100 %")
+        image_size_form.addRow("印刷倍率", self.lithic_print_scale_combo)
+
+        self.lithic_file_size_combo = QComboBox()
+        self.lithic_file_size_combo.addItems([
+            "S  ≤ 10 MB",
+            "M  ≤ 50 MB",
+            "L  ≤ 100 MB",
+            "Maximum",
+        ])
+        self.lithic_file_size_combo.setCurrentText("M  ≤ 50 MB")
+        image_size_form.addRow("PNG上限", self.lithic_file_size_combo)
+
+        self.lithic_output_size_label = QLabel("—")
+        self.lithic_output_size_label.setWordWrap(True)
+        image_size_form.addRow("出力見積", self.lithic_output_size_label)
+        lithic_output_layout.addWidget(image_size_group)
+
+        for combo in (
+            self.lithic_image_size_mode_combo,
+            self.lithic_print_dpi_combo,
+            self.lithic_print_scale_combo,
+            self.lithic_file_size_combo,
+        ):
+            combo.currentTextChanged.connect(
+                self._lithic_image_output_setting_changed
+            )
+        self._lithic_image_output_setting_changed()
+
+        lithic_output_layout.addWidget(QLabel("出力形式"))
+        self.lithic_output_png = QCheckBox("PNGのみ")
+        self.lithic_output_png.setChecked(True)
+        self.lithic_output_svg = QCheckBox("SVG")
+        self.lithic_output_svg.setChecked(False)
+        self.lithic_outline_overlay = QCheckBox("PNG+輪郭（SVG由来）")
+        self.lithic_outline_overlay.setChecked(False)
+        lithic_output_layout.addWidget(self.lithic_output_png)
+        lithic_output_layout.addWidget(self.lithic_output_svg)
+        lithic_output_layout.addWidget(self.lithic_outline_overlay)
+
+        lithic_outline_width_row = QHBoxLayout()
+        lithic_outline_width_row.addWidget(QLabel("PNG輪郭線太さ"))
+        self.lithic_outline_width_combo = QComboBox()
+        self.lithic_outline_width_combo.addItems(["1 px", "2 px", "3 px", "5 px"])
+        self.lithic_outline_width_combo.setCurrentText("2 px")
+        lithic_outline_width_row.addWidget(self.lithic_outline_width_combo)
+        lithic_output_layout.addLayout(lithic_outline_width_row)
+
+        self.lithic_export_individual = QCheckBox(
+            "各面・断面を個別ファイルでも出力"
+        )
+        self.lithic_export_individual.setChecked(False)
+        lithic_output_layout.addWidget(self.lithic_export_individual)
+
+        for cb in (
+            *self.lithic_view_checks.values(),
+            self.lithic_mode_texture,
+            self.lithic_mode_texture_normal,
+            self.lithic_mode_shade,
+            self.lithic_output_png,
+            self.lithic_output_svg,
+            self.lithic_outline_overlay,
+            self.lithic_export_individual,
+        ):
+            cb.stateChanged.connect(self._schedule_lithic_output_size_update)
+        self.lithic_view_spacing.valueChanged.connect(
+            self._schedule_lithic_output_size_update
+        )
+        self.lithic_scale_bar_combo.currentTextChanged.connect(
+            self._schedule_lithic_output_size_update
+        )
+
+        lithic_output_layout.addWidget(QLabel("断面設定"))
+        section_buttons = QHBoxLayout()
+        self.lithic_add_section_x_btn = QPushButton("断面追加（X）")
+        self.lithic_add_section_x_btn.clicked.connect(
+            lambda: self._add_lithic_section("X")
+        )
+        self.lithic_add_section_y_btn = QPushButton("断面追加（Y）")
+        self.lithic_add_section_y_btn.clicked.connect(
+            lambda: self._add_lithic_section("Y")
+        )
+        self.lithic_delete_section_btn = QPushButton("削除")
+        self.lithic_delete_section_btn.clicked.connect(
+            self._delete_selected_lithic_section
+        )
+        section_buttons.addWidget(self.lithic_add_section_x_btn)
+        section_buttons.addWidget(self.lithic_add_section_y_btn)
+        section_buttons.addWidget(self.lithic_delete_section_btn)
+        lithic_output_layout.addLayout(section_buttons)
+
+        self.lithic_section_status_label = QLabel(
+            "初期断面: X=Y長さ1/2（X-Z断面） / "
+            "Y=X幅1/2（Y-Z断面）"
+        )
+        self.lithic_section_status_label.setWordWrap(True)
+        lithic_output_layout.addWidget(self.lithic_section_status_label)
+
+        self.lithic_preview_btn = QPushButton("プレビュー確認")
+        self.lithic_preview_btn.clicked.connect(self._show_lithic_output_preview)
+        lithic_output_layout.addWidget(self.lithic_preview_btn)
+
+        # Split lithic export into independent products. This allows a
+        # normalized *_rev.ply to be re-opened only to regenerate orthographic
+        # drawings without redundantly writing measurement data or another PLY.
+        self.lithic_measurement_export_btn = QPushButton("計測データ出力")
+        self.lithic_measurement_export_btn.clicked.connect(
+            self._export_lithic_measurements
+        )
+        self.lithic_ortho_export_btn = QPushButton("展開図出力")
+        self.lithic_ortho_export_btn.clicked.connect(
+            self._export_lithic_orthographic_files
+        )
+        self.lithic_ply_export_btn = QPushButton("PLY / Transform出力")
+        self.lithic_ply_export_btn.clicked.connect(
+            self._export_lithic_ply_files
+        )
+        self.lithic_next_btn = QPushButton("次のファイルへ")
+        self.lithic_next_btn.clicked.connect(self._finish_lithic_and_next)
+
+        self.lithic_export_stage_label = QLabel("待機")
+        self.lithic_export_progress = QProgressBar()
+        self.lithic_export_progress.setRange(0, 100)
+        self.lithic_export_progress.setValue(0)
+
+        lithic_output_layout.addWidget(QLabel("出力"))
+        lithic_output_layout.addWidget(self.lithic_measurement_export_btn)
+        lithic_output_layout.addWidget(self.lithic_ortho_export_btn)
+        lithic_output_layout.addWidget(self.lithic_ply_export_btn)
+        lithic_output_layout.addWidget(QLabel(
+            "展開図 / PLY は計測データ未保存でも出力できます。"
+            "未保存の場合は確認メッセージを表示します。"
+        ))
+        lithic_output_layout.addWidget(self.lithic_next_btn)
+        lithic_output_layout.addWidget(self.lithic_export_stage_label)
+        lithic_output_layout.addWidget(self.lithic_export_progress)
+        left_layout.addWidget(self.lithic_output_group)
+
+        self.ortho_group = QGroupBox("6A. オルソ画像 / 輪郭線")
+        ortho_layout = QVBoxLayout(self.ortho_group)
+        ortho_layout.addWidget(QLabel("出力面（デフォルト6面）"))
+        self.view_checks = {}
+        for key, label in [
+            ("front", "Front"), ("back", "Back"), ("left", "Left"),
+            ("right", "Right"), ("top", "Top"), ("bottom", "Bottom")
+        ]:
+            cb = QCheckBox(label)
+            cb.setChecked(True)
+            self.view_checks[key] = cb
+            ortho_layout.addWidget(cb)
+
+        ortho_layout.addWidget(QLabel("表現（基本3種はデフォルトON、特殊図はデフォルトOFF）"))
+        self.mode_texture = QCheckBox("テクスチャ / 頂点カラー")
+        self.mode_texture_normal = QCheckBox("テクスチャ / 頂点カラー + Normal")
+        self.mode_shade = QCheckBox("Normalのみ（シェード）")
+        self.mode_section = QCheckBox("縦断面")
+        self.mode_half_section = QCheckBox("半截")
+        self.mode_quarter_half = QCheckBox("1/4半截")
+        for cb in (self.mode_texture, self.mode_texture_normal, self.mode_shade):
+            cb.setChecked(True)
+            ortho_layout.addWidget(cb)
+        for cb in (self.mode_section, self.mode_half_section, self.mode_quarter_half):
+            cb.setChecked(False)
+            ortho_layout.addWidget(cb)
+
+        spacing_row = QHBoxLayout()
+        spacing_row.addWidget(QLabel("面間隔"))
+        self.view_spacing = QDoubleSpinBox()
+        self.view_spacing.setRange(0.0, 10000.0)
+        self.view_spacing.setValue(10.0)
+        self.view_spacing.setDecimals(1)
+        self.view_spacing.setSuffix(" mm")
+        spacing_row.addWidget(self.view_spacing)
+        ortho_layout.addLayout(spacing_row)
+
+        scale_row = QHBoxLayout()
+        scale_row.addWidget(QLabel("スケールバー"))
+        self.scale_bar_combo = QComboBox()
+        self.scale_bar_combo.addItems(["20 mm", "50 mm", "100 mm"])
+        self.scale_bar_combo.setCurrentText("50 mm")
+        scale_row.addWidget(self.scale_bar_combo)
+        ortho_layout.addLayout(scale_row)
+
+        ortho_layout.addWidget(QLabel("出力形式"))
+        self.output_png = QCheckBox("PNGのみ")
+        self.output_png.setChecked(True)
+        self.output_svg = QCheckBox("SVG")
+        self.output_svg.setChecked(False)
+        self.outline_overlay = QCheckBox("PNG+輪郭（SVG由来）")
+        self.outline_overlay.setChecked(False)
+        ortho_layout.addWidget(self.output_png)
+        ortho_layout.addWidget(self.output_svg)
+        ortho_layout.addWidget(self.outline_overlay)
+
+        outline_width_row = QHBoxLayout()
+        outline_width_row.addWidget(QLabel("PNG輪郭線太さ"))
+        self.outline_width_combo = QComboBox()
+        self.outline_width_combo.addItems(["1 px", "2 px", "3 px", "5 px"])
+        self.outline_width_combo.setCurrentText("2 px")
+        outline_width_row.addWidget(self.outline_width_combo)
+        ortho_layout.addLayout(outline_width_row)
+
+        self.export_individual = QCheckBox("各面を個別ファイルでも出力")
+        self.export_individual.setChecked(False)
+        ortho_layout.addWidget(self.export_individual)
+        left_layout.addWidget(self.ortho_group)
+
+        self.pottery_curve_group = QGroupBox("6B. 土器 曲面展開")
+        curve_layout = QVBoxLayout(self.pottery_curve_group)
+
+        curve_layout.addWidget(QLabel(
+            "共通座標: Z=器軸 / X-Y=水平面 / Back側を展開シームとします。"
+        ))
+        curve_render_form = QFormLayout()
+        self.pottery_curve_render_combo = QComboBox()
+        self.pottery_curve_render_combo.addItems([
+            "テクスチャ / 頂点カラー",
+            "テクスチャ / 頂点カラー + Normal",
+            "Normalのみ（シェード）",
+        ])
+        curve_render_form.addRow("表現", self.pottery_curve_render_combo)
+
+        surface_widget = QWidget()
+        surface_layout = QHBoxLayout(surface_widget)
+        surface_layout.setContentsMargins(0, 0, 0, 0)
+        self.pottery_curve_surface_outer = QCheckBox("外面")
+        self.pottery_curve_surface_inner = QCheckBox("内面")
+        self.pottery_curve_surface_upper = QCheckBox("上面")
+        self.pottery_curve_surface_outer.setChecked(True)
+        self.pottery_curve_surface_inner.setChecked(False)
+        self.pottery_curve_surface_upper.setChecked(False)
+        for cb in (
+            self.pottery_curve_surface_outer,
+            self.pottery_curve_surface_inner,
+            self.pottery_curve_surface_upper,
+        ):
+            cb.stateChanged.connect(self._schedule_pottery_curve_size_update)
+            surface_layout.addWidget(cb)
+        surface_layout.addStretch(1)
+        curve_render_form.addRow("展開面", surface_widget)
+        curve_layout.addLayout(curve_render_form)
+
+        self.pottery_curve_z_group = QGroupBox("Z位置 / 区分点指定")
+        z_layout = QVBoxLayout(self.pottery_curve_z_group)
+        z_form = QFormLayout()
+        self.pottery_curve_z_cursor_spin = QDoubleSpinBox()
+        self.pottery_curve_z_cursor_spin.setRange(-1.0e9, 1.0e9)
+        self.pottery_curve_z_cursor_spin.setDecimals(3)
+        self.pottery_curve_z_cursor_spin.setSuffix(" mm")
+        self.pottery_curve_z_cursor_spin.valueChanged.connect(
+            self._pottery_curve_z_cursor_spin_changed
+        )
+        z_form.addRow("現在Z", self.pottery_curve_z_cursor_spin)
+        z_layout.addLayout(z_form)
+
+        self.pottery_curve_z_slider = QSlider(Qt.Orientation.Horizontal)
+        self.pottery_curve_z_slider.setRange(0, 10000)
+        self.pottery_curve_z_slider.setSingleStep(10)
+        self.pottery_curve_z_slider.setPageStep(250)
+        self.pottery_curve_z_slider.valueChanged.connect(
+            self._pottery_curve_z_slider_changed
+        )
+        z_layout.addWidget(self.pottery_curve_z_slider)
+
+        self.pottery_curve_pick_z_btn = QPushButton("3D画面をクリックしてZを指定")
+        self.pottery_curve_pick_z_btn.clicked.connect(
+            self._start_pottery_curve_z_pick
+        )
+        z_layout.addWidget(self.pottery_curve_pick_z_btn)
+        self.pottery_curve_z_hint = QLabel(
+            "スライダー、数値入力、または3D画面上の1点クリックでZ位置を指定します。"
+            "赤線=現在Z、青線=現在の区分点です。"
+        )
+        self.pottery_curve_z_hint.setWordWrap(True)
+        z_layout.addWidget(self.pottery_curve_z_hint)
+        curve_layout.addWidget(self.pottery_curve_z_group)
+
+        self.pottery_cylinder_group = QGroupBox("円筒展開: Z区分 / 基準外径")
+        cylinder_layout = QVBoxLayout(self.pottery_cylinder_group)
+        cylinder_layout.addWidget(QLabel(
+            "底部〜口縁を1区間とするのが初期状態です。"
+            "現在Zを区分点として追加すると、各区間を別々の基準外径で円筒展開します。"
+        ))
+        self.pottery_cylinder_break_table = QTableWidget(0, 1)
+        self.pottery_cylinder_break_table.setHorizontalHeaderLabels(["区分Z (mm)"])
+        self.pottery_cylinder_break_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch
+        )
+        cylinder_layout.addWidget(self.pottery_cylinder_break_table)
+
+        cylinder_break_buttons = QHBoxLayout()
+        self.pottery_cylinder_add_break_btn = QPushButton("現在Zを区分点追加")
+        self.pottery_cylinder_add_break_btn.clicked.connect(
+            self._pottery_add_cylinder_breakpoint
+        )
+        self.pottery_cylinder_delete_break_btn = QPushButton("選択区分点削除")
+        self.pottery_cylinder_delete_break_btn.clicked.connect(
+            self._pottery_delete_cylinder_breakpoint
+        )
+        cylinder_break_buttons.addWidget(self.pottery_cylinder_add_break_btn)
+        cylinder_break_buttons.addWidget(self.pottery_cylinder_delete_break_btn)
+        cylinder_layout.addLayout(cylinder_break_buttons)
+
+        self.pottery_cylinder_segment_table = QTableWidget(0, 4)
+        self.pottery_cylinder_segment_table.setHorizontalHeaderLabels([
+            "Z下端 (mm)", "Z上端 (mm)", "基準Z (mm)", "外径D (mm)"
+        ])
+        self.pottery_cylinder_segment_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch
+        )
+        self.pottery_cylinder_segment_table.itemChanged.connect(
+            self._pottery_cylinder_segment_table_changed
+        )
+        cylinder_layout.addWidget(self.pottery_cylinder_segment_table)
+
+        cylinder_segment_buttons = QHBoxLayout()
+        self.pottery_cylinder_set_ref_btn = QPushButton("選択区間の基準Z=現在Z")
+        self.pottery_cylinder_set_ref_btn.clicked.connect(
+            self._pottery_set_cylinder_reference_from_cursor
+        )
+        self.pottery_cylinder_measure_btn = QPushButton("全外径を再計測")
+        self.pottery_cylinder_measure_btn.clicked.connect(
+            self._pottery_remeasure_cylinder_diameters
+        )
+        cylinder_segment_buttons.addWidget(self.pottery_cylinder_set_ref_btn)
+        cylinder_segment_buttons.addWidget(self.pottery_cylinder_measure_btn)
+        cylinder_layout.addLayout(cylinder_segment_buttons)
+        curve_layout.addWidget(self.pottery_cylinder_group)
+
+        self.pottery_fan_group = QGroupBox("扇形展開: Z区分点 / 外径")
+        fan_layout = QVBoxLayout(self.pottery_fan_group)
+        fan_layout.addWidget(QLabel(
+            "基本は底部と口縁の2点です。途中で傾斜が変わる場合は、"
+            "スライダーまたは3Dクリックで現在Zを指定して区分点を追加します。"
+        ))
+        self.pottery_fan_table = QTableWidget(0, 2)
+        self.pottery_fan_table.setHorizontalHeaderLabels(["Z (mm)", "外径D (mm)"])
+        self.pottery_fan_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch
+        )
+        self.pottery_fan_table.itemChanged.connect(
+            self._pottery_fan_table_changed
+        )
+        fan_layout.addWidget(self.pottery_fan_table)
+        fan_buttons = QHBoxLayout()
+        self.pottery_fan_add_btn = QPushButton("現在Zを区分点追加")
+        self.pottery_fan_add_btn.clicked.connect(self._pottery_add_fan_breakpoint)
+        self.pottery_fan_delete_btn = QPushButton("選択区分点削除")
+        self.pottery_fan_delete_btn.clicked.connect(self._pottery_delete_fan_breakpoint)
+        self.pottery_fan_measure_btn = QPushButton("全外径を再計測")
+        self.pottery_fan_measure_btn.clicked.connect(self._pottery_remeasure_fan_diameters)
+        fan_buttons.addWidget(self.pottery_fan_add_btn)
+        fan_buttons.addWidget(self.pottery_fan_delete_btn)
+        fan_layout.addLayout(fan_buttons)
+        fan_layout.addWidget(self.pottery_fan_measure_btn)
+        curve_layout.addWidget(self.pottery_fan_group)
+
+        self.pottery_curve_info_label = QLabel(
+            "円筒展開は各Z区間ごとに基準Z・外径を指定します。扇形展開は隣接するZ区分点間を独立した円錐台として展開します。"
+        )
+        self.pottery_curve_info_label.setWordWrap(True)
+        curve_layout.addWidget(self.pottery_curve_info_label)
+        left_layout.addWidget(self.pottery_curve_group)
+
+        self.export_group = QGroupBox("7. 出力 / 次のファイル")
+        export_layout = QVBoxLayout(self.export_group)
+        self.preview_btn = QPushButton("オルソ画像プレビューを開く")
+        self.preview_btn.clicked.connect(self.open_pottery_output_preview)
+
+        self.pottery_measurement_export_btn = QPushButton("計測データ出力")
+        self.pottery_measurement_export_btn.clicked.connect(
+            self._export_pottery_measurements
+        )
+        self.pottery_layout_export_btn = QPushButton("オルソ展開図を出力")
+        self.pottery_layout_export_btn.clicked.connect(
+            self._export_pottery_current_layout
+        )
+        self.pottery_ply_export_btn = QPushButton("PLY / Transform出力")
+        self.pottery_ply_export_btn.clicked.connect(
+            self._export_pottery_ply_files
+        )
+        self.pottery_next_btn = QPushButton("次のファイルへ")
+        self.pottery_next_btn.clicked.connect(self._finish_pottery_and_next)
+
+        self.export_stage_label = QLabel("待機")
+        self.export_progress = QProgressBar()
+        self.export_progress.setRange(0, 100)
+        self.export_progress.setValue(0)
+
+        export_layout.addWidget(self.preview_btn)
+        export_layout.addWidget(QLabel("個別出力"))
+        export_layout.addWidget(self.pottery_measurement_export_btn)
+        export_layout.addWidget(self.pottery_layout_export_btn)
+        export_layout.addWidget(self.pottery_ply_export_btn)
+        export_layout.addWidget(QLabel(
+            "出力方式を切り替えて、オルソ・円筒・扇形を同じ資料について連続して書き出せます。"
+            "展開図 / PLY は計測データ未保存でも確認後に出力できます。"
+        ))
+        export_layout.addWidget(self.pottery_next_btn)
+        export_layout.addWidget(self.export_stage_label)
+        export_layout.addWidget(self.export_progress)
+        left_layout.addWidget(self.export_group)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(controls)
+        scroll.setMinimumWidth(390)
+        splitter.addWidget(scroll)
+
+        self.viewer_stack = QStackedWidget()
+
+        # Pottery viewer: the proven single interactive view from v0.1.x.
+        view_widget = QWidget()
+        view_layout = QVBoxLayout(view_widget)
+        self.plotter = QtInteractor(view_widget, auto_update=False, multi_samples=0)
+        self.plotter.set_background("white")
+        self.plotter.add_axes()
+
+        # GUI shading fix retained from the pottery implementation.
+        try:
+            self.plotter.renderer.AutomaticLightCreationOn()
+            self.plotter.renderer.LightFollowCameraOn()
+        except AttributeError:
+            pass
+
+        self.plotter.installEventFilter(self)
+        self._vtk_widget = self.plotter.interactor
+        try:
+            self._vtk_widget.installEventFilter(self)
+        except Exception:
+            pass
+        view_layout.addWidget(self._vtk_widget)
+        self.viewer_stack.addWidget(view_widget)
+
+        # Lithic provisional viewer: three synchronized orthographic views.
+        self.lithic_view_widget = QWidget()
+        lithic_view_layout = QGridLayout(self.lithic_view_widget)
+        self.lithic_plotters = {}
+        self.lithic_vtk_widgets = {}
+
+        lithic_specs = [
+            ("front", "Front (X-Y)", 0, 0, 2, 1),
+            ("right", "Right (Y-Z)", 0, 1, 1, 1),
+            ("bottom", "Bottom (X-Z)", 1, 1, 1, 1),
+        ]
+        for key, title, row, col, rowspan, colspan in lithic_specs:
+            panel = QGroupBox(title)
+            panel_layout = QVBoxLayout(panel)
+            plotter = QtInteractor(panel, auto_update=False, multi_samples=0)
+            plotter.set_background("white")
+            plotter.add_axes()
+            try:
+                plotter.renderer.AutomaticLightCreationOn()
+                plotter.renderer.LightFollowCameraOn()
+            except AttributeError:
+                pass
+            vtk_widget = plotter.interactor
+            panel_layout.addWidget(vtk_widget)
+            self.lithic_plotters[key] = plotter
+            self.lithic_vtk_widgets[key] = vtk_widget
+            lithic_view_layout.addWidget(panel, row, col, rowspan, colspan)
+
+        lithic_view_layout.setColumnStretch(0, 2)
+        lithic_view_layout.setColumnStretch(1, 1)
+        lithic_view_layout.setRowStretch(0, 1)
+        lithic_view_layout.setRowStretch(1, 1)
+        self.viewer_stack.addWidget(self.lithic_view_widget)
+
+        # Lithic unfolded-layout preview.  Unlike the pottery preview this is
+        # embedded in the right-hand main area, not a separate window.
+        self.lithic_preview_widget = QWidget()
+        lithic_preview_layout = QVBoxLayout(self.lithic_preview_widget)
+        self.lithic_preview_info = QLabel(
+            "「プレビュー確認」で6面展開・断面を生成します。"
+        )
+        self.lithic_preview_info.setWordWrap(True)
+        lithic_preview_layout.addWidget(self.lithic_preview_info)
+        self.lithic_preview_view = LithicPreviewGraphicsView(self)
+        self.lithic_preview_scene = QGraphicsScene(self.lithic_preview_view)
+        self.lithic_preview_view.setScene(self.lithic_preview_scene)
+        lithic_preview_layout.addWidget(self.lithic_preview_view)
+        self.viewer_stack.addWidget(self.lithic_preview_widget)
+
+        splitter.addWidget(self.viewer_stack)
+        splitter.setStretchFactor(1, 1)
+
+        self._update_zoom_label()
+        self._set_enabled(False)
+        self._connect_preview_refresh_signals()
+        self._update_artifact_type_ui()
+
+    def _build_menu(self):
+        file_menu = self.menuBar().addMenu("File")
+        reload_action = QAction("Reload input queue", self)
+        reload_action.triggered.connect(self.scan_queue_and_load)
+        file_menu.addAction(reload_action)
+        quit_action = QAction("Quit", self)
+        quit_action.triggered.connect(self.close)
+        file_menu.addAction(quit_action)
+
+    def _set_enabled(self, loaded: bool):
+        widgets = [
+            self.show_appearance, self.smooth_shading, self.method_combo,
+            self.estimate_btn, self.flip_z_btn, self.manual_pick_btn,
+            self.front_drag_check, self.front_dial, self.angle_spin,
+            self.mode_texture, self.mode_texture_normal, self.mode_shade,
+            self.mode_section, self.mode_half_section, self.mode_quarter_half,
+            self.view_spacing, self.scale_bar_combo, self.outline_width_combo,
+            self.output_png, self.output_svg, self.outline_overlay, self.export_individual,
+            self.view_mode_combo, self.viewer_scale_combo,
+            self.zoom_out_btn, self.zoom_reset_btn, self.zoom_in_btn, self.zoom_slider,
+            self.preview_btn,
+            self.pottery_measurement_export_btn,
+            self.pottery_layout_export_btn,
+            self.pottery_ply_export_btn,
+            self.pottery_next_btn,
+            self.pottery_output_branch_combo,
+            self.pottery_curve_render_combo,
+            self.pottery_curve_surface_outer,
+            self.pottery_curve_surface_inner,
+            self.pottery_curve_surface_upper,
+            self.pottery_curve_z_cursor_spin, self.pottery_curve_z_slider,
+            self.pottery_curve_pick_z_btn,
+            self.pottery_cylinder_break_table,
+            self.pottery_cylinder_segment_table,
+            self.pottery_cylinder_add_break_btn,
+            self.pottery_cylinder_delete_break_btn,
+            self.pottery_cylinder_set_ref_btn,
+            self.pottery_cylinder_measure_btn,
+            self.pottery_fan_table, self.pottery_fan_add_btn,
+            self.pottery_fan_delete_btn, self.pottery_fan_measure_btn,
+            self.pottery_curve_image_size_mode_combo,
+            self.pottery_curve_print_dpi_combo,
+            self.pottery_curve_print_scale_combo,
+            self.pottery_curve_file_size_combo,
+            self.lithic_auto_pose_btn, self.lithic_input_pose_btn,
+            self.lithic_reset_btn, self.lithic_confirm_btn,
+            self.lithic_return_pose_btn, self.lithic_preview_btn,
+            self.lithic_measurement_export_btn,
+            self.lithic_ortho_export_btn,
+            self.lithic_ply_export_btn,
+            self.lithic_next_btn,
+            self.lithic_view_spacing, self.lithic_scale_bar_combo,
+            self.lithic_image_size_mode_combo, self.lithic_print_dpi_combo,
+            self.lithic_print_scale_combo, self.lithic_file_size_combo,
+            self.lithic_outline_width_combo,
+            self.lithic_output_png, self.lithic_output_svg,
+            self.lithic_outline_overlay, self.lithic_export_individual,
+            self.lithic_mode_texture, self.lithic_mode_texture_normal,
+            self.lithic_mode_shade,
+            self.lithic_add_section_x_btn, self.lithic_add_section_y_btn,
+            self.lithic_delete_section_btn,
+        ] + list(self.view_checks.values()) + list(self.lithic_view_checks.values())
+        for controls in self.lithic_rotation_controls.values():
+            widgets.extend(controls.values())
+        for w in widgets:
+            w.setEnabled(loaded)
+        if loaded:
+            self._update_artifact_type_ui()
+            if hasattr(self, "pottery_output_branch_group") and not self._is_lithic():
+                self.pottery_output_branch_group.setEnabled(bool(self.posture_done))
+                self.pottery_image_size_group.setEnabled(bool(self.posture_done))
+            if hasattr(self, "lithic_image_size_mode_combo"):
+                self._lithic_image_output_setting_changed()
+            if hasattr(self, "pottery_curve_image_size_mode_combo"):
+                self._pottery_curve_output_setting_changed()
+
+
+    def _connect_preview_refresh_signals(self):
+        for cb in [
+            self.mode_texture,
+            self.mode_texture_normal,
+            self.mode_shade,
+            self.mode_section,
+            self.mode_half_section,
+            self.mode_quarter_half,
+            self.output_png,
+            self.output_svg,
+            self.outline_overlay,
+            self.export_individual,
+            *self.view_checks.values(),
+        ]:
+            cb.stateChanged.connect(self._schedule_preview_refresh)
+            cb.stateChanged.connect(self._schedule_pottery_curve_size_update)
+
+        self.view_spacing.valueChanged.connect(self._schedule_preview_refresh)
+        self.view_spacing.valueChanged.connect(self._schedule_pottery_curve_size_update)
+        self.scale_bar_combo.currentTextChanged.connect(self._schedule_preview_refresh)
+        self.scale_bar_combo.currentTextChanged.connect(self._schedule_pottery_curve_size_update)
+        self.outline_width_combo.currentTextChanged.connect(self._schedule_preview_refresh)
+        self.outline_width_combo.currentTextChanged.connect(self._schedule_pottery_curve_size_update)
+        self.view_mode_combo.currentTextChanged.connect(self._schedule_preview_refresh)
+        self.viewer_scale_combo.currentTextChanged.connect(self._schedule_preview_refresh)
+
+    @staticmethod
+    def _preview_mode_title(mode: str) -> str:
+        return {
+            "texture": "テクスチャ / 頂点カラー",
+            "texture_normal": "テクスチャ / 頂点カラー + Normal",
+            "shade": "Normalのみ（シェード）",
+        }.get(mode, mode)
+
+    def _pottery_output_branch_key(self) -> str:
+        if not hasattr(self, "pottery_output_branch_combo"):
+            return "ortho"
+        text = self.pottery_output_branch_combo.currentText()
+        if text == "円筒展開図":
+            return "cylindrical"
+        if text == "扇形展開図":
+            return "fan"
+        return "ortho"
+
+    def _pottery_output_branch_changed(self, *_args):
+        if self._is_lithic():
+            return
+        branch = self._pottery_output_branch_key()
+        if branch == "ortho" and (
+            self.pottery_curve_z_pick_mode
+            or self._pottery_curve_z_click_consuming
+        ):
+            self.pottery_curve_z_pick_mode = False
+            self._pottery_curve_z_click_consuming = False
+            try:
+                self._vtk_widget.unsetCursor()
+            except Exception:
+                pass
+        self.ortho_group.setVisible(branch == "ortho")
+        self.pottery_curve_group.setVisible(branch != "ortho")
+        self.pottery_cylinder_group.setVisible(branch == "cylindrical")
+        self.pottery_fan_group.setVisible(branch == "fan")
+        self.preview_btn.setText(
+            "オルソ画像プレビューを開く"
+            if branch == "ortho"
+            else "曲面展開プレビューを開く"
+        )
+        if hasattr(self, "pottery_layout_export_btn"):
+            self.pottery_layout_export_btn.setText({
+                "ortho": "オルソ展開図を出力",
+                "cylindrical": "円筒展開図を出力",
+                "fan": "扇形展開図を出力",
+            }[branch])
+        self._schedule_pottery_curve_size_update()
+        self._refresh_pottery_curve_z_guides()
+
+    def open_pottery_output_preview(self):
+        if self._pottery_output_branch_key() == "ortho":
+            self.open_ortho_preview()
+            return
+        self._open_pottery_curve_preview()
+
+    def _open_pottery_curve_preview(self):
+        if self._ortho_preview_window is None:
+            self._ortho_preview_window = OrthoPreviewWindow(self)
+        self._ortho_preview_window.show()
+        self._ortho_preview_window.raise_()
+        self._ortho_preview_window.activateWindow()
+        if not self.asset or not self.posture_done:
+            self._ortho_preview_window.set_message(
+                "姿勢決定後に曲面展開プレビューを表示します。"
+            )
+            return
+        try:
+            self._ortho_preview_window.set_message("曲面展開プレビュー生成中…")
+            QApplication.processEvents()
+            self._clear_preview_temp_dir()
+            self._preview_temp_dir = Path(
+                tempfile.mkdtemp(prefix="pottery_curve_preview_")
+            )
+            kind = self._pottery_output_branch_key()
+            result = self.export_pottery_curved_unwrap(
+                self._preview_temp_dir,
+                kind=kind,
+                preview_long_edge_px=1600,
+                preflight=False,
+            )
+            pngs = [p for p in result if p.suffix.lower() == ".png"]
+            if not pngs:
+                self._ortho_preview_window.set_message(
+                    "曲面展開プレビューを生成できませんでした。"
+                )
+                return
+
+            kind_title = "円筒展開" if kind == "cylindrical" else "扇形展開"
+            images = []
+            for p in pngs:
+                surface_title = next(
+                    (
+                        POTTERY_CURVE_SURFACE_LABELS[key]
+                        for key in POTTERY_CURVE_SURFACE_LABELS
+                        if f"_{key}_" in p.name
+                    ),
+                    "展開",
+                )
+                images.append((f"{kind_title} / {surface_title}", str(p)))
+
+            self._ortho_preview_window.set_images(
+                images,
+                summary=(
+                    f"{self.asset.source_path.name} / {kind_title} / Z=器軸 / "
+                    "Back側シーム"
+                ),
+            )
+        except Exception as e:
+            self._ortho_preview_window.set_message(
+                f"曲面展開プレビュー生成エラー: {e}"
+            )
+
+    def open_ortho_preview(self):
+        if self._ortho_preview_window is None:
+            self._ortho_preview_window = OrthoPreviewWindow(self)
+        self._ortho_preview_window.show()
+        self._ortho_preview_window.raise_()
+        self._ortho_preview_window.activateWindow()
+        self._refresh_ortho_preview()
+
+    def _schedule_preview_refresh(self, *_args):
+        if self._ortho_preview_window is None or not self._ortho_preview_window.isVisible():
+            return
+        if self._preview_refresh_pending:
+            return
+        self._preview_refresh_pending = True
+        QTimer.singleShot(120, self._refresh_ortho_preview)
+
+    def _clear_preview_temp_dir(self):
+        try:
+            if self._preview_temp_dir is not None and self._preview_temp_dir.exists():
+                shutil.rmtree(self._preview_temp_dir)
+        except Exception:
+            pass
+        self._preview_temp_dir = None
+
+    def _refresh_ortho_preview(self):
+        self._preview_refresh_pending = False
+        if self._ortho_preview_window is None or not self._ortho_preview_window.isVisible():
+            return
+        if not self.asset:
+            self._ortho_preview_window.set_message("モデル未読込です。")
+            return
+        if not self.posture_done:
+            self._ortho_preview_window.set_message("姿勢決定後にオルソ画像プレビューを表示します。")
+            return
+
+        views = [k for k, cb in self.view_checks.items() if cb.isChecked()]
+        if not views:
+            self._ortho_preview_window.set_message("少なくとも1つのオルソ面を選択してください。")
+            return
+
+        modes = self._selected_render_modes()
+        base_modes = [m for m in modes if m in ("texture", "texture_normal", "shade")]
+        export_png_plain = self.output_png.isChecked()
+        export_png_outline = self.outline_overlay.isChecked()
+
+        if not export_png_plain and not export_png_outline:
+            self._ortho_preview_window.set_message(
+                "プレビューはPNG系のみ対応です。"
+                "「PNGのみ」または「PNG+輪郭」をONにしてください。"
+            )
+            return
+        if not base_modes:
+            self._ortho_preview_window.set_message(
+                "プレビュー対象の基本表現がありません。"
+                "テクスチャ / テクスチャ+Normal / シェードの少なくとも1つをONにしてください。"
+            )
+            return
+
+        try:
+            self._ortho_preview_window.set_message("プレビュー生成中…")
+            QApplication.processEvents()
+
+            self._clear_preview_temp_dir()
+            self._preview_temp_dir = Path(tempfile.mkdtemp(prefix="artifact_pose_preview_"))
+
+            written = self.export_orthos(
+                self._preview_temp_dir,
+                views=views,
+                modes=modes,
+                spacing_mm=float(self.view_spacing.value()),
+                scale_bar_mm=self._selected_scale_bar_mm(),
+                outline_width_px=self._selected_outline_width_px(),
+                individual=False,
+                export_png_plain=export_png_plain,
+                export_svg=False,
+                export_png_outline=export_png_outline,
+                progress_callback=None,
+            )
+
+            items: list[tuple[str, str]] = []
+            stem = self.asset.source_path.stem
+            for mode in base_modes:
+                title = self._preview_mode_title(mode)
+                if export_png_plain:
+                    p = self._preview_temp_dir / f"{stem}_ortho_{mode}.png"
+                    if p.exists():
+                        items.append((f"{title} / PNG", str(p)))
+                if export_png_outline:
+                    p = self._preview_temp_dir / f"{stem}_ortho_{mode}_outline.png"
+                    if p.exists():
+                        items.append((f"{title} / PNG+輪郭", str(p)))
+
+            if not items:
+                self._ortho_preview_window.set_message("表示できるプレビュー画像が生成されませんでした。")
+                return
+
+            summary = (
+                f"プレビュー対象: {self.asset.source_path.name} / "
+                f"面: {', '.join(views)} / "
+                f"表現数: {len(items)}"
+            )
+            self._ortho_preview_window.set_images(items, summary=summary)
+        except Exception as e:
+            self._ortho_preview_window.set_message(f"プレビュー生成エラー: {e}")
+
+    # ---------- Artifact type / Lithic initial pose ----------
+    def _is_lithic(self) -> bool:
+        return self.artifact_type_combo.currentText() == "石器"
+
+    def _update_artifact_type_ui(self):
+        lithic = self._is_lithic()
+
+        self.pottery_posture_group.setVisible(not lithic)
+        self.pottery_front_group.setVisible(not lithic)
+        self.pottery_output_branch_group.setVisible(not lithic)
+        self.pottery_image_size_group.setVisible(not lithic)
+        self.export_group.setVisible(not lithic)
+        if not lithic:
+            self._pottery_output_branch_changed()
+        else:
+            self.ortho_group.setVisible(False)
+            self.pottery_curve_group.setVisible(False)
+
+        if lithic:
+            self.lithic_pose_group.setVisible(not self.lithic_pose_confirmed)
+            self.lithic_output_group.setVisible(self.lithic_pose_confirmed)
+            if hasattr(self, "viewer_stack"):
+                # Preserve preview page while confirmed; otherwise show pose.
+                if not self.lithic_pose_confirmed:
+                    self.viewer_stack.setCurrentIndex(1)
+                elif self.viewer_stack.currentIndex() not in (1, 2):
+                    self.viewer_stack.setCurrentIndex(1)
+        else:
+            self.lithic_pose_group.setVisible(False)
+            self.lithic_output_group.setVisible(False)
+            if hasattr(self, "viewer_stack"):
+                self.viewer_stack.setCurrentIndex(0)
+
+        # The single-view camera controls belong to the pottery viewer.
+        for w in (
+            self.view_mode_combo,
+            self.viewer_scale_combo,
+            self.zoom_out_btn,
+            self.zoom_reset_btn,
+            self.zoom_in_btn,
+            self.zoom_slider,
+        ):
+            w.setEnabled(bool(self.asset) and not lithic)
+
+        if self.asset is not None:
+            has_appearance = self.asset.appearance_kind != "none"
+            self.show_appearance.setEnabled(has_appearance)
+            self.smooth_shading.setEnabled(True)
+
+    def _artifact_type_changed(self, *_args):
+        self._update_artifact_type_ui()
+        if not self.asset:
+            return
+
+        # Changing artifact type resets all pose state; the mesh itself is
+        # retained and does not need to be reloaded.
+        self.initial_axis = None
+        self.reference_plane = None
+        self.pose_matrix = np.eye(4)
+        self.front_angle_deg = 0.0
+        self.center_axis_after_pose = None
+        self.pose_info = {}
+        self.posture_done = False
+        self.lithic_section_level_angle_deg = 0.0
+        self.lithic_section_level_residual_deg = None
+        self.lithic_section_left_point = None
+        self.lithic_section_right_point = None
+        self.lithic_section_point_count = 0
+        self.lithic_raw_to_obb_centered_matrix = np.eye(4)
+        self.lithic_original_to_obb_matrix = np.eye(4)
+        self.lithic_auto_rotation_matrix = np.eye(4)
+        self.lithic_confirmed_final_matrix = None
+        self.lithic_obb_to_result_matrix = np.eye(4)
+        self.lithic_pose_confirmed = False
+        self._reset_lithic_section_definitions()
+        self.manual_points = []
+        self.manual_pick_label.setText("選択点: 0 / 3")
+
+        self._configure_appearance_options()
+        if self._is_lithic():
+            self._use_lithic_input_pose()
+        else:
+            self.pose_label.setText("姿勢未確定")
+            self.pottery_output_branch_group.setEnabled(False)
+            self.pottery_image_size_group.setEnabled(False)
+            self.refresh_view(reset_camera=True)
+
+    @staticmethod
+    def _axis_rotation_matrix(axis: str, deg: float) -> np.ndarray:
+        a = math.radians(float(deg))
+        c = math.cos(a)
+        s = math.sin(a)
+        R = np.eye(4)
+        if axis == "x":
+            R[:3, :3] = np.array([
+                [1.0, 0.0, 0.0],
+                [0.0, c, -s],
+                [0.0, s, c],
+            ])
+        elif axis == "y":
+            R[:3, :3] = np.array([
+                [c, 0.0, s],
+                [0.0, 1.0, 0.0],
+                [-s, 0.0, c],
+            ])
+        elif axis == "z":
+            R[:3, :3] = np.array([
+                [c, -s, 0.0],
+                [s, c, 0.0],
+                [0.0, 0.0, 1.0],
+            ])
+        else:
+            raise ValueError(axis)
+        return R
+
+    @staticmethod
+    def _translation_matrix_xyz(x: float, y: float, z: float) -> np.ndarray:
+        T = np.eye(4)
+        T[:3, 3] = [float(x), float(y), float(z)]
+        return T
+
+    def _lithic_adjustment_matrix(self) -> np.ndarray:
+        # GUI/control order is Y (length), X (width), Z (thickness).
+        # Column-vector application order: Y -> X -> Z.
+        Ry = self._axis_rotation_matrix("y", self.lithic_angles_deg["y"])
+        Rx = self._axis_rotation_matrix("x", self.lithic_angles_deg["x"])
+        Rz = self._axis_rotation_matrix("z", self.lithic_angles_deg["z"])
+        return Rz @ Rx @ Ry
+
+    def _current_lithic_unorigin_matrix(self) -> np.ndarray:
+        """Raw -> current orientation before final bbox-origin translation.
+
+        In input-pose mode the base matrices are identity. In automatic mode
+        the base is the centered OBB plus the central X-Z leveling correction.
+        """
+        return (
+            self._lithic_adjustment_matrix()
+            @ self.lithic_auto_rotation_matrix
+            @ self.lithic_raw_to_obb_centered_matrix
+        )
+
+    def _current_lithic_matrix(self) -> np.ndarray:
+        if self.lithic_pose_confirmed and self.lithic_confirmed_final_matrix is not None:
+            return np.asarray(self.lithic_confirmed_final_matrix, dtype=float)
+        return self._current_lithic_unorigin_matrix()
+
+    def _compute_lithic_confirmed_transform(self) -> tuple[np.ndarray, np.ndarray]:
+        """Set result origin to the final AABB min corner.
+
+        Returns:
+            final raw->result matrix,
+            OBB->result matrix.
+        """
+        if not self.asset:
+            raise RuntimeError("No mesh loaded")
+
+        unorigin = self._current_lithic_unorigin_matrix()
+        vertices = trimesh.transform_points(
+            np.asarray(self.asset.mesh.vertices, dtype=float),
+            unorigin,
+        )
+        if len(vertices) == 0:
+            raise RuntimeError("石器の座標原点を計算できません。")
+        corner = np.min(vertices, axis=0)
+        origin_shift = self._translation_matrix_xyz(
+            -corner[0], -corner[1], -corner[2]
+        )
+        final_matrix = origin_shift @ unorigin
+        obb_to_result = (
+            final_matrix @ np.linalg.inv(self.lithic_original_to_obb_matrix)
+        )
+        return final_matrix, obb_to_result
+
+    def _lithic_mid_xz_section_points(
+        self,
+        raw_to_obb: np.ndarray,
+        face_chunk_size: int = 200_000,
+    ) -> np.ndarray:
+        """Return exact central X-Z triangle/plane intersections.
+
+        The automatic OBB pose is centered, so the section plane is y=0.
+        For large archaeological scans, trimesh.section() can spend substantial
+        time constructing Path topology.  Here only the section geometry needed
+        for leveling is required, so triangle edges are intersected with y=0
+        directly in chunks.
+
+        This preserves the actual mesh section while keeping peak memory and
+        runtime practical for multi-million-face models.
+        """
+        if not self.asset:
+            raise RuntimeError("No mesh loaded")
+
+        T = np.asarray(raw_to_obb, dtype=float)
+        vertices_raw = np.asarray(self.asset.mesh.vertices, dtype=float)
+        faces = np.asarray(self.asset.mesh.faces, dtype=np.int64)
+
+        if len(vertices_raw) == 0 or len(faces) == 0:
+            raise RuntimeError("中央X-Z断面を計算できるメッシュがありません。")
+
+        # Transform vertices once.  For the sample 1.28M-vertex lithic this is
+        # much cheaper than building a transformed mesh copy and section Path.
+        vertices = trimesh.transform_points(vertices_raw, T)
+
+        y_span = float(np.ptp(vertices[:, 1]))
+        eps = max(y_span * 1.0e-12, 1.0e-12)
+        intersections: list[np.ndarray] = []
+
+        edges = ((0, 1), (1, 2), (2, 0))
+        chunk = max(10_000, int(face_chunk_size))
+
+        for start_face in range(0, len(faces), chunk):
+            face_ids = faces[start_face:start_face + chunk]
+            tri = vertices[face_ids]
+
+            for a, b in edges:
+                p0 = tri[:, a, :]
+                p1 = tri[:, b, :]
+                y0 = p0[:, 1]
+                y1 = p1[:, 1]
+                denom = y0 - y1
+
+                crosses = (
+                    (
+                        ((y0 <= eps) & (y1 >= -eps))
+                        | ((y1 <= eps) & (y0 >= -eps))
+                    )
+                    & (np.abs(denom) > eps)
+                )
+
+                if not np.any(crosses):
+                    continue
+
+                t = y0[crosses] / denom[crosses]
+                pts = (
+                    p0[crosses]
+                    + t[:, None] * (p1[crosses] - p0[crosses])
+                )
+                intersections.append(pts)
+
+            # Rare coplanar vertices/edges: add vertices lying almost exactly
+            # on y=0.  Duplicates are harmless for robust percentile statistics.
+            near_plane = np.abs(tri[:, :, 1]) <= eps
+            if np.any(near_plane):
+                coplanar_pts = tri[near_plane]
+                if len(coplanar_pts):
+                    intersections.append(coplanar_pts)
+
+        if not intersections:
+            raise RuntimeError("中央X-Z断面 (y=0) がモデルと交差しません。")
+
+        points = np.vstack(intersections)
+        finite = np.isfinite(points).all(axis=1)
+        points = points[finite]
+
+        if len(points) < 4:
+            raise RuntimeError("中央X-Z断面に有効な点が不足しています。")
+
+        # Force the numerical plane coordinate to zero; only X/Z are used.
+        points[:, 1] = 0.0
+        return points
+
+    @staticmethod
+    def _lithic_robust_section_endpoints(
+        points_obb: np.ndarray,
+        tail_fraction: float = 0.02,
+    ) -> tuple[np.ndarray, np.ndarray, dict]:
+        """Estimate robust left/right endpoints of the central X-Z section.
+
+        A literal single min/max vertex is unstable on scanned lithics.
+        Therefore:
+          * X location = global left/right extreme
+          * Z location = median Z of the outer 2% tails
+        """
+        pts = np.asarray(points_obb, dtype=float)
+        x = pts[:, 0]
+        z = pts[:, 2]
+
+        if len(pts) < 4:
+            raise RuntimeError("断面端点推定に十分な点がありません。")
+
+        q = float(max(0.001, min(0.20, tail_fraction)))
+        q_left = float(np.quantile(x, q))
+        q_right = float(np.quantile(x, 1.0 - q))
+
+        left_mask = x <= q_left
+        right_mask = x >= q_right
+        left_count = int(np.count_nonzero(left_mask))
+        right_count = int(np.count_nonzero(right_mask))
+
+        if left_count == 0 or right_count == 0:
+            raise RuntimeError("断面左右端の候補点を取得できません。")
+
+        left = np.array(
+            [float(np.min(x)), 0.0, float(np.median(z[left_mask]))],
+            dtype=float,
+        )
+        right = np.array(
+            [float(np.max(x)), 0.0, float(np.median(z[right_mask]))],
+            dtype=float,
+        )
+
+        dx = float(right[0] - left[0])
+        if abs(dx) <= 1e-12:
+            raise RuntimeError("断面左右端のX距離がゼロです。")
+
+        angle_deg = math.degrees(
+            math.atan2(
+                float(right[2] - left[2]),
+                dx,
+            )
+        )
+
+        diagnostics = {
+            "tail_fraction": q,
+            "left_tail_count": left_count,
+            "right_tail_count": right_count,
+            "left_quantile_x": q_left,
+            "right_quantile_x": q_right,
+            "angle_before_deg": float(angle_deg),
+        }
+        return left, right, diagnostics
+
+    def _lithic_section_level_correction(
+        self,
+        raw_to_obb: np.ndarray,
+    ) -> tuple[np.ndarray, dict]:
+        """Level the central X-Z section by a rotation about the Y long axis."""
+        points_obb = self._lithic_mid_xz_section_points(raw_to_obb)
+        left, right, diag = self._lithic_robust_section_endpoints(
+            points_obb,
+            tail_fraction=0.02,
+        )
+
+        angle_before = float(diag["angle_before_deg"])
+
+        # With this application's Ry convention:
+        #   x' = cos(a)x + sin(a)z
+        #   z' = -sin(a)x + cos(a)z
+        # a line at angle theta in X-Z becomes theta-a, hence a=theta.
+        correction = self._axis_rotation_matrix("y", angle_before)
+
+        left_after = trimesh.transform_points(left.reshape(1, 3), correction)[0]
+        right_after = trimesh.transform_points(right.reshape(1, 3), correction)[0]
+        residual = math.degrees(
+            math.atan2(
+                float(right_after[2] - left_after[2]),
+                float(right_after[0] - left_after[0]),
+            )
+        )
+
+        diag.update(
+            {
+                "section_point_count": int(len(points_obb)),
+                "left_point_obb": left.tolist(),
+                "right_point_obb": right.tolist(),
+                "correction_axis": "Y",
+                "correction_angle_deg": angle_before,
+                "residual_angle_deg": float(residual),
+                "endpoint_method": (
+                    "global X extremes with median Z of outer 2% X tails"
+                ),
+                "section_plane": "OBB-centered y=0 (X-Z plane); exact triangle-edge intersections",
+            }
+        )
+        return correction, diag
+
+    def _update_lithic_pose_status_label(self):
+        """Refresh the lithic pose label for the current base-pose mode."""
+        if not self.asset:
+            return
+
+        unit = self.asset.input_unit
+        scale = float(self.asset.unit_to_mm)
+
+        if (
+            self.lithic_pose_base_mode == "automatic"
+            and self.lithic_obb_extents is not None
+        ):
+            ex = np.asarray(self.lithic_obb_extents, dtype=float)
+            elapsed = self.lithic_obb_elapsed_sec or 0.0
+            residual = (
+                self.lithic_section_level_residual_deg
+                if self.lithic_section_level_residual_deg is not None
+                else 0.0
+            )
+            self.lithic_obb_label.setText(
+                "自動姿勢推定済み<br>"
+                "① minimum-volume OBB<br>"
+                f"X = 幅: {ex[0]:.3f} {unit} ({ex[0] * scale:.2f} mm)<br>"
+                f"Y = 長さ: {ex[1]:.3f} {unit} ({ex[1] * scale:.2f} mm)<br>"
+                f"Z = 厚さ: {ex[2]:.3f} {unit} ({ex[2] * scale:.2f} mm)<br>"
+                "② 中央X-Z断面水平化<br>"
+                f"Y軸自動補正: {self.lithic_section_level_angle_deg:+.3f}°<br>"
+                f"補正後残差: {residual:+.4f}°<br>"
+                f"断面点数: {self.lithic_section_point_count:,}<br>"
+                f"oriented_bounds: {elapsed:.3f} s"
+            )
+            return
+
+        bounds = np.asarray(self.asset.mesh.bounds, dtype=float)
+        extents = bounds[1] - bounds[0]
+        self.lithic_obb_label.setText(
+            "読込姿勢を使用中（自動姿勢推定は未適用）<br>"
+            "入力PLYのX/Y/Z方向をそのまま保持します。<br>"
+            f"X extent: {extents[0]:.3f} {unit} "
+            f"({extents[0] * scale:.2f} mm)<br>"
+            f"Y extent: {extents[1]:.3f} {unit} "
+            f"({extents[1] * scale:.2f} mm)<br>"
+            f"Z extent: {extents[2]:.3f} {unit} "
+            f"({extents[2] * scale:.2f} mm)"
+        )
+
+    def _use_lithic_input_pose(self):
+        """Use the PLY coordinates/orientation exactly as loaded.
+
+        This is the default lithic base pose. It is especially important for
+        *_rev.ply files that were already normalized by ArtefactsOrthoMaker:
+        re-running OBB estimation can otherwise change their established axes.
+        """
+        if not self.asset:
+            return
+
+        self.lithic_pose_base_mode = "input"
+        self.lithic_raw_to_obb_centered_matrix = np.eye(4)
+        self.lithic_original_to_obb_matrix = np.eye(4)
+        self.lithic_auto_rotation_matrix = np.eye(4)
+        self.lithic_confirmed_final_matrix = None
+        self.lithic_obb_to_result_matrix = np.eye(4)
+        self.lithic_pose_confirmed = False
+
+        self.lithic_obb_native_extents = None
+        self.lithic_obb_extents = None
+        self.lithic_obb_elapsed_sec = None
+        self.lithic_section_level_angle_deg = 0.0
+        self.lithic_section_level_residual_deg = None
+        self.lithic_section_left_point = None
+        self.lithic_section_right_point = None
+        self.lithic_section_point_count = 0
+
+        self.lithic_angles_deg = {"x": 0.0, "y": 0.0, "z": 0.0}
+        self._sync_lithic_rotation_controls()
+        self.pose_matrix = np.eye(4)
+        self.center_axis_after_pose = None
+        self.front_angle_deg = 0.0
+        self.posture_done = True
+        self.pose_info = {
+            "artifact_type": "lithic",
+            "method": "input_pose_preserved",
+            "automatic_pose_steps": [],
+            "input_pose_preserved": True,
+        }
+        self._reset_lithic_section_definitions()
+        self._update_lithic_pose_status_label()
+        self._update_artifact_type_ui()
+        self.refresh_view(reset_camera=True)
+        self.statusBar().showMessage(
+            "石器: 読込時の姿勢を保持しています。"
+            "必要な場合だけ「自動姿勢推定」を実行してください。"
+        )
+
+    def _apply_lithic_oriented_bounds(self):
+        if not self.asset:
+            return
+        try:
+            # trimesh.bounds.oriented_bounds() needs SciPy for the 3D convex
+            # hull (scipy.spatial.ConvexHull).  Check explicitly here because
+            # Trimesh may otherwise fall through to its coplanar fallback and
+            # surface the misleading "Points must be coplanar" error.
+            try:
+                import scipy  # noqa: F401
+            except ModuleNotFoundError as e:
+                raise RuntimeError(
+                    "石器の oriented_bounds() には SciPy が必要です。\n"
+                    "現在の仮想環境で次を実行してください:\n\n"
+                    "python -m pip install scipy==1.18.0\n\n"
+                    "インストール後にアプリを再起動してください。"
+                ) from e
+
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            self.statusBar().showMessage(
+                "石器: minimum-volume oriented_bounds() を計算中…"
+            )
+            QApplication.processEvents()
+
+            import time
+            t0 = time.perf_counter()
+            to_origin, native_extents = trimesh.bounds.oriented_bounds(
+                self.asset.mesh,
+                angle_digits=1,
+                ordered=False,
+            )
+            elapsed = time.perf_counter() - t0
+            native_extents = np.asarray(native_extents, dtype=float)
+
+            i_long = int(np.argmax(native_extents))
+            i_thickness = int(np.argmin(native_extents))
+            remaining = [i for i in range(3) if i not in (i_long, i_thickness)]
+            if len(remaining) != 1:
+                raise RuntimeError("OBB軸の割当てに失敗しました。")
+            i_short = remaining[0]
+
+            # Reorder the OBB axes:
+            # X <- short, Y <- long, Z <- thickness.
+            P = np.zeros((4, 4), dtype=float)
+            P[0, i_short] = 1.0
+            P[1, i_long] = 1.0
+            P[2, i_thickness] = 1.0
+            P[3, 3] = 1.0
+
+            # Keep a right-handed coordinate system.
+            if np.linalg.det(P[:3, :3]) < 0:
+                P[2, :3] *= -1.0
+
+            raw_to_obb_centered = P @ np.asarray(to_origin, dtype=float)
+
+            # Saved original->OBB transform uses the OBB AABB min corner as
+            # coordinate origin.  The centered version is retained internally
+            # because automatic and manual rotations are most stable about the
+            # OBB center.
+            obb_centered_vertices = trimesh.transform_points(
+                np.asarray(self.asset.mesh.vertices, dtype=float),
+                raw_to_obb_centered,
+            )
+            obb_min = np.min(obb_centered_vertices, axis=0)
+            obb_origin_shift = self._translation_matrix_xyz(
+                -obb_min[0], -obb_min[1], -obb_min[2]
+            )
+            original_to_obb = obb_origin_shift @ raw_to_obb_centered
+
+            self.statusBar().showMessage(
+                "石器: 中央X-Z断面の左右端を水平化中…"
+            )
+            QApplication.processEvents()
+            section_correction, section_diag = (
+                self._lithic_section_level_correction(raw_to_obb_centered)
+            )
+
+            # Automatic lithic initial pose:
+            #   Step 1: minimum-volume OBB
+            #   Step 2: rotate about Y so the robust left/right line of the
+            #           central X-Z section is parallel to X.
+            self.lithic_pose_base_mode = "automatic"
+            self.lithic_raw_to_obb_centered_matrix = raw_to_obb_centered
+            self.lithic_original_to_obb_matrix = original_to_obb
+            self.lithic_auto_rotation_matrix = section_correction
+            self.pose_matrix = raw_to_obb_centered
+
+            self.lithic_confirmed_final_matrix = None
+            self.lithic_obb_to_result_matrix = np.eye(4)
+            self.lithic_pose_confirmed = False
+
+            self.lithic_obb_native_extents = native_extents
+            self.lithic_obb_extents = np.array(
+                [
+                    native_extents[i_short],
+                    native_extents[i_long],
+                    native_extents[i_thickness],
+                ],
+                dtype=float,
+            )
+            self.lithic_obb_elapsed_sec = float(elapsed)
+
+            self.lithic_section_level_angle_deg = float(
+                section_diag["correction_angle_deg"]
+            )
+            self.lithic_section_level_residual_deg = float(
+                section_diag["residual_angle_deg"]
+            )
+            self.lithic_section_left_point = np.asarray(
+                section_diag["left_point_obb"], dtype=float
+            )
+            self.lithic_section_right_point = np.asarray(
+                section_diag["right_point_obb"], dtype=float
+            )
+            self.lithic_section_point_count = int(
+                section_diag["section_point_count"]
+            )
+
+            # Manual X/Y/Z controls are additional rotations after the full
+            # automatic pose, therefore they start from 0°.
+            self.lithic_angles_deg = {"x": 0.0, "y": 0.0, "z": 0.0}
+            self._sync_lithic_rotation_controls()
+            self._reset_lithic_section_definitions()
+
+            self.center_axis_after_pose = None
+            self.front_angle_deg = 0.0
+            self.posture_done = True
+            self.pose_info = {
+                "artifact_type": "lithic",
+                "method": "obb_plus_mid_xz_section_leveling",
+                "automatic_pose_steps": [
+                    "trimesh.bounds.oriented_bounds",
+                    "central_xz_section_y_axis_leveling",
+                ],
+                "obb": {
+                    "angle_digits": 1,
+                    "ordered": False,
+                    "axis_assignment": {
+                        "X": "width",
+                        "Y": "length",
+                        "Z": "thickness",
+                    },
+                    "native_extents": native_extents.tolist(),
+                    "assigned_extents_xyz": self.lithic_obb_extents.tolist(),
+                    "elapsed_seconds": float(elapsed),
+                },
+                "section_leveling": section_diag,
+            }
+
+            self._update_lithic_pose_status_label()
+
+            self.refresh_view(reset_camera=True)
+            self.statusBar().showMessage(
+                "石器の自動姿勢推定（OBB＋中央X-Z断面水平化）を適用しました。"
+                "必要に応じてX/Y/Z軸回転で微調整してください。"
+            )
+        except Exception as e:
+            # Do not invalidate the loaded/input pose merely because optional
+            # automatic estimation failed.
+            self.lithic_obb_label.setText(
+                f"石器自動姿勢推定エラー: {e}<br>"
+                "「読込姿勢に戻す」で入力PLYの姿勢を使用できます。"
+            )
+            self._show_error("石器 自動姿勢推定エラー", e)
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def _sync_lithic_rotation_controls(self):
+        self._setting_lithic_rotation = True
+        try:
+            for axis, controls in self.lithic_rotation_controls.items():
+                deg = float(self.lithic_angles_deg[axis])
+                controls["dial"].setValue(int(round(deg * 10.0)))
+                controls["spin"].setValue(deg)
+        finally:
+            self._setting_lithic_rotation = False
+
+    def _set_lithic_axis_angle(self, axis: str, deg: float, source: str = "other"):
+        if axis not in self.lithic_angles_deg:
+            return
+        deg = self._wrap_angle(deg)
+        self.lithic_angles_deg[axis] = deg
+
+        self._setting_lithic_rotation = True
+        try:
+            controls = self.lithic_rotation_controls[axis]
+            if source != "dial":
+                controls["dial"].setValue(int(round(deg * 10.0)))
+            if source != "spin":
+                controls["spin"].setValue(deg)
+        finally:
+            self._setting_lithic_rotation = False
+
+        if self.asset and self._is_lithic() and self.posture_done:
+            self.lithic_pose_confirmed = False
+            self.lithic_confirmed_final_matrix = None
+            self.lithic_obb_to_result_matrix = np.eye(4)
+            self._update_artifact_type_ui()
+            self.refresh_view(reset_camera=True)
+
+    def _increment_lithic_axis(self, axis: str, delta_deg: float):
+        self._set_lithic_axis_angle(
+            axis,
+            self.lithic_angles_deg.get(axis, 0.0) + float(delta_deg),
+        )
+
+    def _lithic_dial_changed(self, axis: str, value: int):
+        if self._setting_lithic_rotation:
+            return
+        self._set_lithic_axis_angle(axis, float(value) / 10.0, source="dial")
+
+    def _lithic_spin_changed(self, axis: str, value: float):
+        if self._setting_lithic_rotation:
+            return
+        self._set_lithic_axis_angle(axis, float(value), source="spin")
+
+    def _reset_lithic_rotations(self):
+        self.lithic_angles_deg = {"x": 0.0, "y": 0.0, "z": 0.0}
+        self._sync_lithic_rotation_controls()
+        self.lithic_pose_confirmed = False
+        self.lithic_confirmed_final_matrix = None
+        self.lithic_obb_to_result_matrix = np.eye(4)
+        self._update_artifact_type_ui()
+        if self.asset and self._is_lithic() and self.posture_done:
+            self.refresh_view(reset_camera=True)
+
+    def _set_lithic_camera(self, plotter, bounds: np.ndarray, view: str):
+        center = np.array([
+            (bounds[0] + bounds[1]) * 0.5,
+            (bounds[2] + bounds[3]) * 0.5,
+            (bounds[4] + bounds[5]) * 0.5,
+        ], dtype=float)
+        extent = max(
+            float(bounds[1] - bounds[0]),
+            float(bounds[3] - bounds[2]),
+            float(bounds[5] - bounds[4]),
+            1e-9,
+        )
+        dist = extent * 3.0
+
+        if view == "front":
+            # X-Y plane, Y (long axis) is vertical on screen.
+            pos = center + np.array([0.0, 0.0, dist])
+            up = np.array([0.0, 1.0, 0.0])
+        elif view == "right":
+            # Y-Z plane, Y (long axis) is vertical on screen.
+            pos = center + np.array([dist, 0.0, 0.0])
+            up = np.array([0.0, 1.0, 0.0])
+        elif view == "bottom":
+            # X-Z plane.
+            pos = center + np.array([0.0, -dist, 0.0])
+            up = np.array([0.0, 0.0, 1.0])
+        else:
+            raise ValueError(view)
+
+        plotter.camera_position = [pos.tolist(), center.tolist(), up.tolist()]
+        plotter.enable_parallel_projection()
+        plotter.reset_camera()
+
+    def _refresh_lithic_views(self):
+        if not self.asset or not self.posture_done:
+            return
+
+        poly = self._make_polydata(self._current_lithic_matrix(), preview=True)
+        bounds = np.asarray(poly.bounds, dtype=float)
+        appearance = self.show_appearance.isChecked()
+        lighting = self.smooth_shading.isChecked()
+
+        # Pose-adjustment preview: show the current axis-aligned bounding box
+        # in every Front / Right / Bottom viewport.  This is display-only;
+        # it is not included in orthographic image output.
+        bbox_outline = poly.outline()
+
+        for view, plotter in self.lithic_plotters.items():
+            plotter.renderer.clear_actors()
+            plotter.set_background("white")
+            plotter.add_axes()
+            actor = self._add_mesh_actor(
+                plotter,
+                poly,
+                appearance=appearance,
+                lighting=lighting,
+            )
+            self._configure_gui_actor_shading(actor, lighting)
+            plotter.add_mesh(
+                bbox_outline,
+                color="gray",
+                line_width=2.0,
+                opacity=0.75,
+                lighting=False,
+                show_scalar_bar=False,
+                pickable=False,
+            )
+            self._set_lithic_camera(plotter, bounds, view)
+            plotter.render()
+
+    # ---------- Lithic pose confirmation / section settings ----------
+    def _reset_lithic_section_definitions(self):
+        self.lithic_sections = []
+        self.lithic_section_counter = {"X": 0, "Y": 0}
+        self.lithic_active_section_id = None
+
+        # Default:
+        #   Y-section line at X = 1/2 on Front/Back (vertical linked line)
+        #   X-section line at Y = 1/2 on all Y-bearing views (horizontal line)
+        self._add_lithic_section("Y", position=0.5, refresh_overlay=False)
+        self._add_lithic_section("X", position=0.5, refresh_overlay=False)
+        self._update_lithic_section_status()
+
+    def _confirm_lithic_pose(self):
+        if not self.asset or not self.posture_done:
+            QMessageBox.warning(
+                self, "未確定", "石器の基準姿勢を準備できていません。"
+            )
+            return
+        try:
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            self.statusBar().showMessage(
+                "石器姿勢を確定し、bbox左下隅へ座標原点を設定中…"
+            )
+            QApplication.processEvents()
+
+            final_matrix, obb_to_result = self._compute_lithic_confirmed_transform()
+            self.lithic_confirmed_final_matrix = final_matrix
+            self.lithic_obb_to_result_matrix = obb_to_result
+            self.lithic_pose_confirmed = True
+            current_label = self.lithic_obb_label.text()
+            if "座標原点:" not in current_label:
+                self.lithic_obb_label.setText(
+                    current_label
+                    + "<br>座標原点: final bbox 左下隅 "
+                    "(Xmin, Ymin, Zmin) = (0, 0, 0)"
+                )
+
+            if not self.lithic_sections:
+                self._reset_lithic_section_definitions()
+
+            self._update_artifact_type_ui()
+            self.viewer_stack.setCurrentIndex(1)
+            self.refresh_view(reset_camera=True)
+            self._schedule_lithic_output_size_update()
+            self.statusBar().showMessage(
+                "石器姿勢を決定しました。出力設定またはプレビュー確認へ進んでください。"
+            )
+        except Exception as e:
+            self._show_error("石器 姿勢決定エラー", e)
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def _return_to_lithic_pose(self):
+        if not self._is_lithic():
+            return
+        self.lithic_pose_confirmed = False
+        self.lithic_confirmed_final_matrix = None
+        self.lithic_obb_to_result_matrix = np.eye(4)
+        self._update_artifact_type_ui()
+        self.viewer_stack.setCurrentIndex(1)
+        self.refresh_view(reset_camera=True)
+        self._schedule_lithic_output_size_update()
+        self.statusBar().showMessage(
+            "石器姿勢調整へ戻りました。再度「姿勢決定」で確定できます。"
+        )
+
+    def _redistribute_lithic_sections(self, axis: str) -> None:
+        """Reset all sections on one axis to equal bbox intervals.
+
+        For N sections, positions are k/(N+1), k=1..N.
+        Therefore:
+          N=1 -> 1/2
+          N=2 -> 1/3, 2/3
+          N=3 -> 1/4, 2/4, 3/4
+          N=4 -> 1/5, 2/5, 3/5, 4/5
+
+        This is intentionally called whenever the section count changes.
+        Manual drag positions are preserved only until the next add/delete.
+        """
+        axis = str(axis).upper()
+        group = sorted(
+            [s for s in self.lithic_sections if s["axis"] == axis],
+            key=lambda s: str(s.get("id", "")),
+        )
+        count = len(group)
+        if count == 0:
+            return
+        denominator = float(count + 1)
+        for index, section in enumerate(group, start=1):
+            section["position"] = float(index / denominator)
+
+    def _add_lithic_section(
+        self,
+        axis: str,
+        position: float | None = None,
+        refresh_overlay: bool = True,
+    ):
+        axis = str(axis).upper()
+        if axis not in ("X", "Y"):
+            return
+
+        self.lithic_section_counter[axis] = (
+            int(self.lithic_section_counter.get(axis, 0)) + 1
+        )
+        section_id = f"{axis}{self.lithic_section_counter[axis]:02d}"
+        self.lithic_sections.append(
+            {
+                "id": section_id,
+                "axis": axis,
+                "position": float(0.5 if position is None else position),
+            }
+        )
+
+        # User-added sections always reset every section on that axis to
+        # equal intervals across the full model bbox.  Explicit positions are
+        # used only by initialization/restoration code.
+        if position is None:
+            self._redistribute_lithic_sections(axis)
+
+        self.lithic_active_section_id = section_id
+        in_preview = bool(
+            refresh_overlay and self.viewer_stack.currentIndex() == 2
+        )
+        self._update_lithic_section_status(dirty=in_preview)
+        self._schedule_lithic_output_size_update()
+        if in_preview:
+            # Update all guide lines immediately.  The actual section panels
+            # are regenerated when the user presses Preview again, preserving
+            # the established workflow for section edits.
+            self._rebuild_lithic_preview_lines()
+
+    def _delete_selected_lithic_section(self):
+        sid = self.lithic_active_section_id
+        if not sid:
+            QMessageBox.information(
+                self, "断面未選択", "削除する青線をプレビュー上で選択してください。"
+            )
+            return
+        before = len(self.lithic_sections)
+        self.lithic_sections = [
+            s for s in self.lithic_sections if s["id"] != sid
+        ]
+        if len(self.lithic_sections) == before:
+            return
+        self.lithic_active_section_id = None
+
+        # Any change in section count resets the remaining sections on the
+        # same axis to equal intervals across the full bbox.
+        self._redistribute_lithic_sections(str(sid)[0].upper())
+        self._update_lithic_section_status()
+        self._schedule_lithic_output_size_update()
+
+        # Regenerate the preview so both section geometry and guide-line
+        # positions reflect the new equal-interval distribution.
+        if self.viewer_stack.currentIndex() == 2:
+            self._show_lithic_output_preview()
+
+    def _find_lithic_section(self, section_id: str) -> dict | None:
+        for section in self.lithic_sections:
+            if section["id"] == section_id:
+                return section
+        return None
+
+    def _select_lithic_section(self, section_id: str):
+        if self._find_lithic_section(section_id) is None:
+            return
+        self.lithic_active_section_id = section_id
+        self._update_lithic_section_status()
+        self._update_lithic_preview_line_geometries()
+
+    def _update_lithic_section_status(self, dirty: bool = False):
+        if self.lithic_active_section_id:
+            s = self._find_lithic_section(self.lithic_active_section_id)
+        else:
+            s = None
+        counts = {
+            "X": sum(1 for x in self.lithic_sections if x["axis"] == "X"),
+            "Y": sum(1 for x in self.lithic_sections if x["axis"] == "Y"),
+        }
+        selected = (
+            "未選択"
+            if s is None
+            else f'{s["id"]}: {s["position"] * 100.0:.1f}%'
+        )
+        suffix = (
+            " / 位置変更後は「プレビュー確認」で断面を再生成"
+            if dirty else ""
+        )
+        self.lithic_section_status_label.setText(
+            f'断面 X={counts["X"]} / Y={counts["Y"]} / 選択: {selected}{suffix}'
+        )
+
+    def _drag_lithic_section_line(
+        self,
+        section_id: str,
+        axis: str,
+        panel_key: str,
+        scene_pos,
+    ):
+        section = self._find_lithic_section(section_id)
+        rect = self.lithic_preview_panel_rects.get(panel_key)
+        if section is None or rect is None:
+            return
+
+        x0, y0, x1, y1 = rect
+        w = max(float(x1 - x0), 1e-9)
+        h = max(float(y1 - y0), 1e-9)
+
+        if axis == "Y":
+            # Vertical linked X-position line.  Back is horizontally mirrored.
+            frac = (float(scene_pos.x()) - x0) / w
+            if panel_key == "back":
+                frac = 1.0 - frac
+            section["position"] = float(max(0.0, min(1.0, frac)))
+        elif axis == "X":
+            # Horizontal Y-position line; +Y is upward in all four long views.
+            frac_down = (float(scene_pos.y()) - y0) / h
+            section["position"] = float(
+                max(0.0, min(1.0, 1.0 - frac_down))
+            )
+        else:
+            return
+
+        self.lithic_active_section_id = section_id
+        self._update_lithic_preview_line_geometries()
+        self._update_lithic_section_status(dirty=True)
+
+    def _lithic_section_line_released(self, section_id: str):
+        self.lithic_active_section_id = section_id
+        self._update_lithic_section_status(dirty=True)
+        self._schedule_lithic_output_size_update()
+
+    def _clear_lithic_preview_line_items(self):
+        if self.lithic_preview_scene is None:
+            return
+        for items in self.lithic_preview_line_items.values():
+            for item in items:
+                try:
+                    self.lithic_preview_scene.removeItem(item)
+                except Exception:
+                    pass
+        self.lithic_preview_line_items = {}
+
+    def _line_geometry_for_lithic_section(
+        self,
+        section: dict,
+        panel_key: str,
+    ):
+        rect = self.lithic_preview_panel_rects.get(panel_key)
+        if rect is None or self.lithic_preview_scene is None:
+            return None
+
+        x0, y0, x1, y1 = [float(v) for v in rect]
+        pos = float(section["position"])
+        axis = section["axis"]
+        scene = self.lithic_preview_scene.sceneRect()
+        scene_left = float(scene.left())
+        scene_right = float(scene.right())
+        scene_top = float(scene.top())
+        scene_bottom = float(scene.bottom())
+
+        if axis == "Y":
+            # Two linked vertical section markers: Front and Back.
+            # Extend continuously over the entire preview canvas.
+            if panel_key not in ("front", "back"):
+                return None
+            frac = pos if panel_key == "front" else (1.0 - pos)
+            x = x0 + frac * (x1 - x0)
+            return (x, scene_top, x, scene_bottom)
+
+        if axis == "X":
+            # One horizontal marker across the entire preview canvas.
+            # Its Y coordinate is derived from the Front panel.
+            if panel_key != "front":
+                return None
+            y = y0 + (1.0 - pos) * (y1 - y0)
+            return (scene_left, y, scene_right, y)
+
+        return None
+
+    @staticmethod
+    def _distance_point_to_line_segment(
+        px: float,
+        py: float,
+        x1: float,
+        y1: float,
+        x2: float,
+        y2: float,
+    ) -> float:
+        vx = x2 - x1
+        vy = y2 - y1
+        wx = px - x1
+        wy = py - y1
+        denom = vx * vx + vy * vy
+        if denom <= 1e-18:
+            return math.hypot(px - x1, py - y1)
+        t = max(0.0, min(1.0, (wx * vx + wy * vy) / denom))
+        qx = x1 + t * vx
+        qy = y1 + t * vy
+        return math.hypot(px - qx, py - qy)
+
+    def _pick_lithic_section_line(self, scene_pos):
+        """Pick the nearest blue line independent of paint/add order.
+
+        Interaction is handled at QGraphicsView level instead of by each
+        QGraphicsLineItem, avoiding the previous behavior where the last
+        painted/overlapping item could capture mouse interaction.
+        """
+        if not self.lithic_preview_line_items:
+            return None
+
+        try:
+            view_scale = abs(
+                float(self.lithic_preview_view.transform().m11())
+            )
+        except Exception:
+            view_scale = 1.0
+        if view_scale <= 1e-9:
+            view_scale = 1.0
+
+        # Approximately 10 screen pixels regardless of preview zoom.
+        tolerance_scene = 10.0 / view_scale
+        px = float(scene_pos.x())
+        py = float(scene_pos.y())
+
+        candidates = []
+        for section_id, items in self.lithic_preview_line_items.items():
+            for item in items:
+                line = item.line()
+                d = self._distance_point_to_line_segment(
+                    px,
+                    py,
+                    float(line.x1()),
+                    float(line.y1()),
+                    float(line.x2()),
+                    float(line.y2()),
+                )
+                if d <= tolerance_scene:
+                    candidates.append(
+                        (
+                            d,
+                            section_id,
+                            item.axis,
+                            item.panel_key,
+                        )
+                    )
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda x: x[0])
+        best_distance = candidates[0][0]
+        close = [
+            candidate
+            for candidate in candidates
+            if abs(candidate[0] - best_distance)
+            <= tolerance_scene * 0.20
+        ]
+
+        # If several lines truly overlap, prefer the already-selected line
+        # for stable dragging; otherwise use the nearest one.
+        if self.lithic_active_section_id is not None:
+            for _d, sid, axis, panel_key in close:
+                if sid == self.lithic_active_section_id:
+                    return (sid, axis, panel_key)
+
+        _d, sid, axis, panel_key = close[0]
+        return (sid, axis, panel_key)
+
+    def _rebuild_lithic_preview_lines(self):
+        if self.lithic_preview_scene is None:
+            return
+        self._clear_lithic_preview_line_items()
+
+        for section in self.lithic_sections:
+            axis = section["axis"]
+            panels = (
+                ("front", "back")
+                if axis == "Y"
+                else ("front",)
+            )
+            items: list[LithicSectionLineItem] = []
+            for panel_key in panels:
+                geom = self._line_geometry_for_lithic_section(
+                    section, panel_key
+                )
+                if geom is None:
+                    continue
+                item = LithicSectionLineItem(
+                    self,
+                    section["id"],
+                    axis,
+                    panel_key,
+                    selected=(
+                        section["id"] == self.lithic_active_section_id
+                    ),
+                )
+                item.setLine(*geom)
+                self.lithic_preview_scene.addItem(item)
+                items.append(item)
+            self.lithic_preview_line_items[section["id"]] = items
+
+    def _update_lithic_preview_line_geometries(self):
+        for section in self.lithic_sections:
+            items = self.lithic_preview_line_items.get(section["id"], [])
+            for item in items:
+                geom = self._line_geometry_for_lithic_section(
+                    section, item.panel_key
+                )
+                if geom is not None:
+                    item.setLine(*geom)
+                item._set_pen(
+                    section["id"] == self.lithic_active_section_id
+                )
+
+    def _selected_lithic_views(self) -> list[str]:
+        return [
+            key for key, cb in self.lithic_view_checks.items()
+            if cb.isChecked()
+        ]
+
+    def _selected_lithic_modes(self) -> list[str]:
+        modes = []
+        if (
+            self.lithic_mode_texture.isChecked()
+            and self.lithic_mode_texture.isEnabled()
+        ):
+            modes.append("texture")
+        if (
+            self.lithic_mode_texture_normal.isChecked()
+            and self.lithic_mode_texture_normal.isEnabled()
+        ):
+            modes.append("texture_normal")
+        if self.lithic_mode_shade.isChecked():
+            modes.append("shade")
+        return modes
+
+    def _selected_lithic_scale_bar_mm(self) -> float:
+        return float(
+            self.lithic_scale_bar_combo.currentText().split()[0]
+        )
+
+    def _selected_lithic_outline_width_px(self) -> int:
+        return int(
+            self.lithic_outline_width_combo.currentText().split()[0]
+        )
+
+    def _selected_lithic_print_dpi(self) -> int:
+        return int(self.lithic_print_dpi_combo.currentText().split()[0])
+
+    def _selected_lithic_print_scale(self) -> float:
+        text = self.lithic_print_scale_combo.currentText().split()[0]
+        return float(text) / 100.0
+
+    def _selected_lithic_file_size_target_mb(self) -> float | None:
+        text = self.lithic_file_size_combo.currentText().strip()
+        if text.startswith("S"):
+            return PNG_TARGET_MB["S"]
+        if text.startswith("M"):
+            return PNG_TARGET_MB["M"]
+        if text.startswith("L"):
+            return PNG_TARGET_MB["L"]
+        return None
+
+    def _lithic_image_output_setting_changed(self, *_args):
+        if not hasattr(self, "lithic_image_size_mode_combo"):
+            return
+        print_mode = (
+            self.lithic_image_size_mode_combo.currentText()
+            == "印刷スケール指定"
+        )
+        self.lithic_print_dpi_combo.setEnabled(print_mode)
+        self.lithic_print_scale_combo.setEnabled(print_mode)
+        self.lithic_file_size_combo.setEnabled(not print_mode)
+        self._schedule_lithic_output_size_update()
+
+    def _schedule_lithic_output_size_update(self, *_args):
+        if not hasattr(self, "lithic_output_size_label"):
+            return
+        if self._lithic_output_size_refresh_pending:
+            return
+        self._lithic_output_size_refresh_pending = True
+        QTimer.singleShot(100, self._update_lithic_output_size_label)
+
+    def _lithic_approximate_layout(
+        self,
+        views: list[str],
+    ) -> tuple[
+        np.ndarray,
+        float,
+        dict[str, tuple[float, float, float, float]],
+        dict[str, tuple[float, float, float, float]],
+    ]:
+        """Fast conservative layout used only for live size display.
+
+        Section panels use the full model X-Z or Y-Z extents, so the live
+        estimate is intentionally conservative. Final export preflight uses
+        exact section contour bounds.
+        """
+        if not self.asset or self.lithic_confirmed_final_matrix is None:
+            raise RuntimeError("石器姿勢が未決定です。")
+
+        bmin, bmax, _ext = self._measurement_model_bbox(
+            np.asarray(self.lithic_confirmed_final_matrix, dtype=float)
+        )
+        bounds = np.array([
+            bmin[0], bmax[0],
+            bmin[1], bmax[1],
+            bmin[2], bmax[2],
+        ], dtype=float)
+        spacing_model = (
+            float(self.lithic_view_spacing.value())
+            / float(self.asset.unit_to_mm)
+        )
+        main = self._lithic_main_layout_rects(bounds, spacing_model)
+        section_rects: dict[str, tuple[float, float, float, float]] = {}
+
+        dx = float(bounds[1] - bounds[0])
+        dy = float(bounds[3] - bounds[2])
+        dz = float(bounds[5] - bounds[4])
+        s = float(spacing_model)
+        x_sections, y_sections = self._ordered_lithic_sections_for_output(
+            self.lithic_sections
+        )
+
+        current_top = (
+            float(main["bottom"][1]) - s
+            if "bottom" in views
+            else float(main["front"][1]) - s
+        )
+        for section in x_sections:
+            key = f'section_{section["id"]}'
+            y1 = current_top
+            y0 = y1 - dz
+            section_rects[key] = (0.0, y0, dx, y1)
+            current_top = y0 - s
+
+        selected = [main[v] for v in views]
+        current_left = max(r[2] for r in selected) + s
+        for section in y_sections:
+            key = f'section_{section["id"]}'
+            x0 = current_left
+            x1 = x0 + dz
+            section_rects[key] = (x0, 0.0, x1, dy)
+            current_left = x1 + s
+
+        return bounds, spacing_model, main, section_rects
+
+    def _lithic_canvas_metrics(
+        self,
+        views: list[str],
+        main_rects: dict[str, tuple[float, float, float, float]],
+        section_rects: dict[str, tuple[float, float, float, float]],
+        ppu: float,
+        scale_bar_mm: float,
+        spacing_model: float,
+    ) -> dict:
+        """Return the exact PNG canvas geometry for a known panel layout."""
+        all_rects = [main_rects[v] for v in views]
+        all_rects.extend(section_rects.values())
+        if not all_rects:
+            raise RuntimeError("出力レイアウトが空です。")
+
+        min_x = min(r[0] for r in all_rects)
+        min_y = min(r[1] for r in all_rects)
+        max_x = max(r[2] for r in all_rects)
+        max_y = max(r[3] for r in all_rects)
+
+        tick_extent = max(0.0, float(spacing_model) * 0.75)
+        has_x_section = any(
+            str(item.get("axis", "")).upper() == "X"
+            for item in self.lithic_sections
+        )
+        has_y_section = any(
+            str(item.get("axis", "")).upper() == "Y"
+            for item in self.lithic_sections
+        )
+        if has_x_section:
+            for view in ("front", "back", "left", "right"):
+                if view in views and view in main_rects:
+                    rect = main_rects[view]
+                    min_x = min(min_x, rect[0] - tick_extent)
+                    max_x = max(max_x, rect[2] + tick_extent)
+        if has_y_section:
+            for view in ("front", "back"):
+                if view in views and view in main_rects:
+                    rect = main_rects[view]
+                    min_y = min(min_y, rect[1] - tick_extent)
+                    max_y = max(max_y, rect[3] + tick_extent)
+
+        ppu = max(float(ppu), 1.0e-12)
+        content_w = max(1, int(round((max_x - min_x) * ppu)))
+        content_h = max(1, int(round((max_y - min_y) * ppu)))
+        margin = 36
+        scale_block_h = 120
+        bar_px = int(
+            round((float(scale_bar_mm) / self.asset.unit_to_mm) * ppu)
+        )
+        canvas_w = max(content_w + 2 * margin, bar_px + 2 * margin)
+        canvas_h = content_h + 2 * margin + scale_block_h
+        pixels = int(canvas_w) * int(canvas_h)
+        return {
+            "min_x": float(min_x),
+            "min_y": float(min_y),
+            "max_x": float(max_x),
+            "max_y": float(max_y),
+            "content_w_px": int(content_w),
+            "content_h_px": int(content_h),
+            "margin_px": int(margin),
+            "scale_block_h_px": int(scale_block_h),
+            "canvas_w_px": int(canvas_w),
+            "canvas_h_px": int(canvas_h),
+            "pixels": int(pixels),
+        }
+
+    def _lithic_default_png_bpp_estimate(self) -> float:
+        if self.lithic_png_bpp_estimate is not None:
+            return float(max(0.02, min(4.0, self.lithic_png_bpp_estimate)))
+        modes = self._selected_lithic_modes()
+        if "texture" in modes or "texture_normal" in modes:
+            return 2.2
+        if "shade" in modes:
+            return 0.8
+        return 0.25
+
+    @staticmethod
+    def _format_decimal_mb(byte_count: float) -> str:
+        return f"{float(byte_count) / 1_000_000.0:.1f} MB"
+
+    def _update_lithic_output_size_label(self):
+        self._lithic_output_size_refresh_pending = False
+        if not hasattr(self, "lithic_output_size_label"):
+            return
+        if (
+            not self.asset
+            or not self._is_lithic()
+            or not self.lithic_pose_confirmed
+            or self.lithic_confirmed_final_matrix is None
+        ):
+            self.lithic_output_size_label.setText(
+                "姿勢決定後に画像サイズを概算します。"
+            )
+            return
+
+        views = self._selected_lithic_views()
+        if not views:
+            self.lithic_output_size_label.setText("出力面が未選択です。")
+            return
+
+        try:
+            _bounds, spacing_model, main, sections = (
+                self._lithic_approximate_layout(views)
+            )
+            unit_to_mm = float(self.asset.unit_to_mm)
+            scale_bar_mm = self._selected_lithic_scale_bar_mm()
+            mode = self.lithic_image_size_mode_combo.currentText()
+            bpp = self._lithic_default_png_bpp_estimate()
+
+            if mode == "印刷スケール指定":
+                dpi = self._selected_lithic_print_dpi()
+                scale = self._selected_lithic_print_scale()
+                px_per_mm_source = float(dpi) / 25.4 * scale
+                ppu = px_per_mm_source * unit_to_mm
+                metrics = self._lithic_canvas_metrics(
+                    views, main, sections, ppu, scale_bar_mm, spacing_model
+                )
+                estimated_bytes = (
+                    metrics["pixels"] * bpp * PNG_FILESIZE_SAFETY_FACTOR
+                )
+                print_w_mm = metrics["canvas_w_px"] / dpi * 25.4
+                print_h_mm = metrics["canvas_h_px"] / dpi * 25.4
+                raw_mb = metrics["pixels"] * 3.0 / 1_000_000.0
+                self.lithic_output_size_label.setText(
+                    f"概算: {metrics['canvas_w_px']:,} × "
+                    f"{metrics['canvas_h_px']:,} px / "
+                    f"{metrics['pixels'] / 1_000_000.0:.1f} MP<br>"
+                    f"印刷サイズ 約 {print_w_mm:.1f} × {print_h_mm:.1f} mm / "
+                    f"PNG推定 約 {self._format_decimal_mb(estimated_bytes)} / "
+                    f"RGB展開 約 {raw_mb:.0f} MB<br>"
+                    "※断面は最大外形で見積るため、実出力は小さくなる場合があります。"
+                )
+            else:
+                target_mb = self._selected_lithic_file_size_target_mb()
+                target_text = (
+                    "安全上限まで"
+                    if target_mb is None
+                    else f"1 PNGあたり ≤ {target_mb:g} MB"
+                )
+                all_rects = [main[v] for v in views] + list(sections.values())
+                context = {
+                    "main_rects": main,
+                    "section_rects": sections,
+                    "spacing_model": spacing_model,
+                    "sheet_w": max(r[2] for r in all_rects) - min(r[0] for r in all_rects),
+                    "sheet_h": max(r[3] for r in all_rects) - min(r[1] for r in all_rects),
+                }
+                ppu, metrics = self._find_lithic_ppu_for_limit(
+                    context, views, bpp, target_mb
+                )
+                estimated_bytes = (
+                    metrics["pixels"] * bpp * PNG_FILESIZE_SAFETY_FACTOR
+                )
+                px_per_mm = ppu / unit_to_mm
+                self.lithic_output_size_label.setText(
+                    f"概算: {metrics['canvas_w_px']:,} × "
+                    f"{metrics['canvas_h_px']:,} px / "
+                    f"{metrics['pixels'] / 1_000_000.0:.1f} MP<br>"
+                    f"容量優先: {target_text} / 約 {px_per_mm:.2f} px/mm / "
+                    f"PNG推定 約 {self._format_decimal_mb(estimated_bytes)}<br>"
+                    f"圧縮率見積: {bpp:.2f} byte/pixel。"
+                    "本出力前に低解像度PNGで再較正します。"
+                )
+        except Exception as e:
+            self.lithic_output_size_label.setText(
+                f"サイズ概算を計算できません: {e}"
+            )
+
+    # ---------- Input queue / Loading / QA ----------
+    def _scan_files(self) -> list[Path]:
+        INPUT_DIR.mkdir(parents=True, exist_ok=True)
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        files = sorted(
+            [p for p in INPUT_DIR.iterdir() if p.is_file() and p.suffix.lower() in SUPPORTED_SUFFIXES and not p.name.startswith(".")],
+            key=lambda p: p.name.casefold(),
+        )
+        stems: dict[str, list[Path]] = {}
+        for p in files:
+            stems.setdefault(p.stem.casefold(), []).append(p)
+        collisions = [items for items in stems.values() if len(items) > 1]
+        if collisions:
+            names = "\n".join(" / ".join(x.name for x in group) for group in collisions)
+            raise ValueError(
+                "同じファイル名（拡張子を除く）の入力が複数あります。出力フォルダが衝突するため名前を変更してください。\n\n" + names
+            )
+        return files
+
+    def _input_output_is_complete(self, path: Path) -> bool:
+        """Return True when the input should be treated as completed.
+
+        v0.4.7 split exports may create output/<stem>/ before the user has
+        finished all desired products. Such folders carry a temporary marker.
+        Legacy output folders without the marker remain backward-compatible
+        completion flags.
+        """
+        out_dir = OUTPUT_DIR / path.stem
+        if not out_dir.exists():
+            return False
+        return not (out_dir / SPLIT_EXPORT_IN_PROGRESS_MARKER).exists()
+
+    def scan_queue_and_load(self):
+        try:
+            self.queue_all = self._scan_files()
+            pending = [p for p in self.queue_all if not self._input_output_is_complete(p)]
+            done = len(self.queue_all) - len(pending)
+            self.queue_label.setText(
+                f"全 {len(self.queue_all)} / 完了 {done} / 未処理 {len(pending)}\n"
+                f"input: {INPUT_DIR}\noutput: {OUTPUT_DIR}"
+            )
+            if not pending:
+                self.asset = None
+                self.current_queue_path = None
+                self.file_label.setText("未処理ファイルなし")
+                self.qa_label.setText("—")
+                self._set_enabled(False)
+                self.plotter.clear()
+                self.plotter.add_axes()
+                self.plotter.render()
+                for plotter in getattr(self, "lithic_plotters", {}).values():
+                    try:
+                        plotter.clear()
+                        plotter.add_axes()
+                        plotter.render()
+                    except Exception:
+                        pass
+                if self.lithic_preview_scene is not None:
+                    self.lithic_preview_scene.clear()
+                if self.queue_all:
+                    self.statusBar().showMessage("すべての入力ファイルが処理済みです。")
+                else:
+                    self.statusBar().showMessage(f"{INPUT_DIR} に OBJ / PLY / GLB を入れてください。")
+                self._schedule_preview_refresh()
+                return
+            self._load_path(pending[0])
+        except Exception as e:
+            self._show_error("入力キューエラー", e)
+
+    def _confirm_large_input_file(self, path: Path) -> bool:
+        """Warn before loading an input file larger than 300 MB.
+
+        The warning is advisory.  Selecting "続行" loads the original
+        full-resolution model without automatic decimation or proxy conversion.
+        """
+        try:
+            size_bytes = int(path.stat().st_size)
+        except OSError:
+            return True
+
+        warning_threshold = 300_000_000  # 300 MB (decimal)
+        if size_bytes <= warning_threshold:
+            return True
+
+        size_mb = size_bytes / 1_000_000.0
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("大容量モデルの確認")
+        box.setText(
+            f"入力ファイルのサイズは {size_mb:,.1f} MB です。\n\n"
+            "300 MBを超えるモデルでは、読み込み・Normal検証・表示・"
+            "画像生成に時間がかかり、使用メモリが大きくなる場合があります。\n\n"
+            "ArtefactsOrthoMakerは自動的なメッシュ縮小を行いません。"
+            "続行する場合は元のフルメッシュをそのまま読み込みます。"
+        )
+        box.setInformativeText("このまま読み込みを続行しますか？")
+        continue_btn = box.addButton(
+            "続行",
+            QMessageBox.ButtonRole.AcceptRole,
+        )
+        cancel_btn = box.addButton(
+            "キャンセル",
+            QMessageBox.ButtonRole.RejectRole,
+        )
+        box.setDefaultButton(cancel_btn)
+        box.exec()
+        return box.clickedButton() is continue_btn
+
+    def _load_path(self, path: Path):
+        try:
+            if not self._confirm_large_input_file(path):
+                self.statusBar().showMessage(
+                    f"読み込みをキャンセルしました: {path.name}"
+                )
+                return
+
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            self.statusBar().showMessage(f"読み込み・Normal検証中: {path.name}")
+            QApplication.processEvents()
+            self.asset = load_mesh_asset(path, self.unit_combo.currentText())
+            self.current_queue_path = path
+            self.initial_axis = None
+            self.reference_plane = None
+            self.pose_matrix = np.eye(4)
+            self.front_angle_deg = 0.0
+            self.posture_done = False
+            self.center_axis_after_pose = None
+            self.pose_info = {}
+
+            self.lithic_raw_to_obb_centered_matrix = np.eye(4)
+            self.lithic_original_to_obb_matrix = np.eye(4)
+            self.lithic_auto_rotation_matrix = np.eye(4)
+            self.lithic_confirmed_final_matrix = None
+            self.lithic_obb_to_result_matrix = np.eye(4)
+            self.lithic_pose_confirmed = False
+            self.lithic_angles_deg = {"x": 0.0, "y": 0.0, "z": 0.0}
+            self.lithic_obb_native_extents = None
+            self.lithic_obb_extents = None
+            self.lithic_obb_elapsed_sec = None
+            self.lithic_png_bpp_estimate = None
+            self.pottery_curve_png_bpp_estimate = None
+            self.pottery_ortho_png_bpp_estimate = None
+            self.pottery_cylinder_breakpoints_mm = []
+            self.pottery_curve_z_pick_mode = False
+            self._pottery_curve_z_click_consuming = False
+            self.lithic_section_level_angle_deg = 0.0
+            self.lithic_section_level_residual_deg = None
+            self.lithic_section_left_point = None
+            self.lithic_section_right_point = None
+            self.lithic_section_point_count = 0
+            self._reset_lithic_section_definitions()
+
+            self.manual_points = []
+            self.manual_pick_label.setText("選択点: 0 / 3")
+            self.pose_label.setText("姿勢未確定")
+            self.file_label.setText(path.name)
+            self._update_qa()
+            self._set_enabled(True)
+            self._configure_appearance_options()
+            self.set_front_angle(0.0)
+            self._update_artifact_type_ui()
+            self.statusBar().showMessage(f"3D表示を更新中: {path.name}")
+            QApplication.processEvents()
+            if self._is_lithic():
+                self._use_lithic_input_pose()
+            else:
+                self.refresh_view(reset_camera=True)
+                self._schedule_preview_refresh()
+            pending = [p for p in self.queue_all if not self._input_output_is_complete(p)]
+            index = pending.index(path) + 1 if path in pending else 1
+            self.statusBar().showMessage(
+                f"未処理 {index}/{len(pending)}: {path.name} — 姿勢方式を選んでください。"
+            )
+        except Exception as e:
+            self._show_error("読み込みエラー", e)
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def _unit_changed(self, unit: str):
+        # Coordinate values are never rescaled; changing unit only changes the mm conversion.
+        if self.asset is not None and unit in UNIT_TO_MM:
+            old_scale = float(self.asset.unit_to_mm)
+            self.asset.input_unit = unit
+            self.asset.unit_to_mm = UNIT_TO_MM[unit]
+            self._update_qa()
+            if self._is_lithic():
+                self._update_lithic_pose_status_label()
+                self._schedule_lithic_output_size_update()
+            elif self.posture_done:
+                ratio = float(self.asset.unit_to_mm) / max(old_scale, 1.0e-12)
+                self._rescale_pottery_curve_ui(ratio)
+                self._schedule_pottery_curve_size_update()
+
+    def _update_qa(self):
+        if not self.asset:
+            self.qa_label.setText("—")
+            return
+        m = self.asset.mesh
+        appearance = {
+            "texture": "OBJ texture (UV + image / seam-safe)",
+            "vertex_color": "vertex color",
+            "none": "none",
+        }[self.asset.appearance_kind]
+        notes = "<br>".join(self.asset.notes) if self.asset.notes else "—"
+        self.qa_label.setText(
+            f"Vertices: {len(m.vertices):,}<br>"
+            f"Faces: {len(m.faces):,}<br>"
+            f"Input unit: {self.asset.input_unit}（座標値は変更しません）<br>"
+            f"Normals: {self.asset.normals_status}<br>"
+            f"Appearance: {appearance}<br>"
+            f"Watertight: {bool(m.is_watertight)}<br>"
+            f"Notes: {notes}"
+        )
+
+    def _configure_appearance_options(self):
+        has_appearance = bool(self.asset and self.asset.appearance_kind != "none")
+        self.show_appearance.setEnabled(has_appearance)
+        # Model-view default:
+        #   pottery -> appearance when available
+        #   lithic  -> shade-only
+        self.show_appearance.setChecked(
+            False if self._is_lithic() else has_appearance
+        )
+        self.smooth_shading.setChecked(True)
+        self.mode_texture.setEnabled(has_appearance)
+        self.mode_texture_normal.setEnabled(has_appearance)
+        self.mode_texture.setChecked(has_appearance)
+        self.mode_texture_normal.setChecked(has_appearance)
+        self.mode_shade.setEnabled(True)
+        self.mode_shade.setChecked(True)
+
+        self.lithic_mode_texture.setEnabled(has_appearance)
+        self.lithic_mode_texture_normal.setEnabled(has_appearance)
+        self.lithic_mode_texture.setChecked(has_appearance)
+        self.lithic_mode_texture_normal.setChecked(has_appearance)
+        self.lithic_mode_shade.setEnabled(True)
+        self.lithic_mode_shade.setChecked(True)
+
+        if hasattr(self, "pottery_curve_render_combo"):
+            self.pottery_curve_render_combo.setCurrentText(
+                "テクスチャ / 頂点カラー"
+                if has_appearance
+                else "Normalのみ（シェード）"
+            )
+        self.mode_section.setEnabled(True)
+        self.mode_half_section.setEnabled(True)
+        self.mode_quarter_half.setEnabled(True)
+        self.mode_section.setChecked(False)
+        self.mode_half_section.setChecked(False)
+        self.mode_quarter_half.setChecked(False)
+        if not has_appearance:
+            # Required behavior: OBJ without texture image and PLY without vertex color => shade only.
+            self.mode_texture.setChecked(False)
+            self.mode_texture_normal.setChecked(False)
+            self.lithic_mode_texture.setChecked(False)
+            self.lithic_mode_texture_normal.setChecked(False)
+
+    # ---------- PyVista construction / view ----------
+    def _current_base_matrix(self) -> np.ndarray:
+        if not self.posture_done:
+            return np.eye(4)
+        if self._is_lithic():
+            return self._current_lithic_matrix()
+        return self.pose_matrix
+
+    def _current_final_matrix(self) -> np.ndarray:
+        if not self.posture_done:
+            return np.eye(4)
+        if self._is_lithic():
+            return self._current_lithic_matrix()
+        return final_transform_matrix(self.pose_matrix, self.front_angle_deg)
+
+    def _make_polydata(
+        self,
+        matrix: np.ndarray | None = None,
+        preview: bool = False,
+    ) -> pv.PolyData:
+        """Build the full triangle mesh.
+
+        `preview` remains as a compatibility argument, but RC5 intentionally
+        performs no automatic large-model proxy/decimation.  Files over 300 MB
+        are handled only by an advisory warning at load time.
+        """
+        if not self.asset:
+            raise RuntimeError("No mesh loaded")
+        if matrix is None:
+            matrix = self._current_base_matrix()
+
+        vertices = transform_points(
+            np.asarray(self.asset.mesh.vertices),
+            matrix,
+        )
+        faces = np.asarray(self.asset.mesh.faces, dtype=np.int64)
+        vtk_faces = np.column_stack([
+            np.full(len(faces), 3, dtype=np.int64),
+            faces,
+        ]).ravel()
+        poly = pv.PolyData(vertices, vtk_faces)
+
+        normals = np.asarray(self.asset.vertex_normals, dtype=float)
+        if len(normals) == len(vertices):
+            rot = np.asarray(matrix, dtype=float)[:3, :3]
+            transformed_normals = normals @ rot.T
+            lengths = np.linalg.norm(transformed_normals, axis=1)
+            good = lengths > 1e-12
+            transformed_normals[good] /= lengths[good, None]
+            transformed_normals[~good] = np.array([0.0, 0.0, 1.0])
+            poly.point_data.set_array(
+                transformed_normals.astype(np.float32),
+                "Normals",
+            )
+            poly.point_data.active_normals_name = "Normals"
+
+        if (
+            self.asset.appearance_kind == "vertex_color"
+            and self.asset.vertex_colors is not None
+        ):
+            colors = np.asarray(self.asset.vertex_colors, dtype=np.uint8)
+            if colors.shape[1] == 4:
+                colors = colors[:, :3]
+            poly.point_data["RGB"] = colors
+        elif (
+            self.asset.appearance_kind == "texture"
+            and self.asset.uv is not None
+        ):
+            uv = np.asarray(self.asset.uv, dtype=float).copy()
+            # Keep OBJ/Trimesh UV coordinates unchanged.
+            poly.active_texture_coordinates = uv
+
+        return poly
+
+    def _add_mesh_actor(
+        self,
+        plotter,
+        poly: pv.PolyData,
+        appearance: bool,
+        lighting: bool,
+    ):
+        kwargs = dict(
+            smooth_shading=bool(lighting),
+            lighting=bool(lighting),
+            show_edges=False,
+        )
+        if (
+            appearance
+            and self.asset
+            and self.asset.appearance_kind == "texture"
+            and self.asset.texture_image is not None
+        ):
+            tex = pv.Texture(self.asset.texture_image)
+            return plotter.add_mesh(
+                poly,
+                texture=tex,
+                **kwargs,
+            )
+        if (
+            appearance
+            and self.asset
+            and self.asset.appearance_kind == "vertex_color"
+            and "RGB" in poly.point_data
+        ):
+            return plotter.add_mesh(
+                poly,
+                scalars="RGB",
+                rgb=True,
+                **kwargs,
+            )
+        color = "white" if (not appearance and not lighting) else "lightgray"
+        return plotter.add_mesh(
+            poly,
+            color=color,
+            **kwargs,
+        )
+
+    def _configure_gui_actor_shading(self, actor, lighting: bool):
+        """Apply deterministic VTK shading only to the interactive GUI actor."""
+        if actor is None:
+            return
+        try:
+            prop = actor.GetProperty()
+        except (AttributeError, TypeError):
+            return
+
+        prop.SetLighting(bool(lighting))
+        if lighting:
+            prop.SetInterpolationToPhong()
+            prop.SetAmbient(0.12)
+            prop.SetDiffuse(0.88)
+            prop.SetSpecular(0.05)
+            prop.SetSpecularPower(12.0)
+
+    def _report_gui_shading_state(self, lighting: bool):
+        """Print a diagnostic line whenever the GUI shading state changes."""
+        try:
+            ren = self.plotter.renderer
+            prop = self.actor.GetProperty() if self.actor is not None else None
+            state = (
+                bool(lighting),
+                int(ren.GetAutomaticLightCreation()),
+                int(ren.GetLightFollowCamera()),
+                int(ren.GetLights().GetNumberOfItems()),
+                int(prop.GetLighting()) if prop is not None else -1,
+                int(prop.GetInterpolation()) if prop is not None else -1,
+            )
+            if state != getattr(self, "_last_gui_shading_state", None):
+                print(
+                    "GUI shading:",
+                    f"requested={state[0]}",
+                    f"auto_light={state[1]}",
+                    f"follow_camera={state[2]}",
+                    f"lights={state[3]}",
+                    f"actor_lighting={state[4]}",
+                    f"interpolation={state[5]}",
+                )
+                self._last_gui_shading_state = state
+        except (AttributeError, TypeError):
+            pass
+
+    def refresh_view(self, *_args, reset_camera=False):
+        if not self.asset:
+            return
+        if self._is_lithic():
+            try:
+                self._refresh_lithic_views()
+            except Exception as e:
+                self.statusBar().showMessage(f"石器3面表示更新エラー: {e}")
+            return
+        try:
+            angle = self.front_angle_deg if self.posture_done else 0.0
+            self.current_poly = self._make_polydata(self._current_base_matrix(), preview=True)
+            self.plotter.renderer.clear_actors()
+            self._viewer_scale_actor = None
+            self._viewer_scale_text_actor = None
+            self.plotter.set_background("white")
+            gui_lighting = self.smooth_shading.isChecked()
+            self.actor = self._add_mesh_actor(
+                self.plotter,
+                self.current_poly,
+                appearance=self.show_appearance.isChecked(),
+                lighting=gui_lighting,
+            )
+            self._configure_gui_actor_shading(self.actor, gui_lighting)
+
+            if self.actor is not None and self.posture_done:
+                try:
+                    self.actor.origin = (0.0, 0.0, 0.0)
+                    self.actor.orientation = (0.0, 0.0, angle)
+                except AttributeError:
+                    pass
+            if self.posture_done and self.center_axis_after_pose is not None:
+                self._draw_center_axis()
+            if self.manual_points:
+                pts = pv.PolyData(np.asarray(self.manual_points))
+                self.plotter.add_mesh(pts, render_points_as_spheres=True, point_size=12)
+
+            if reset_camera:
+                self._apply_view_mode_camera(reset=True)
+            else:
+                # Both viewer modes use parallel projection so the on-screen
+                # ruler has a stable physical scale.
+                self.plotter.enable_parallel_projection()
+                self._sync_zoom_ui_from_camera()
+
+            self._update_viewer_scale_overlay(render=False)
+            self.plotter.render()
+            if self.posture_done and self._pottery_output_branch_key() != "ortho":
+                self._refresh_pottery_curve_z_guides()
+            self._report_gui_shading_state(gui_lighting)
+        except Exception as e:
+            self.statusBar().showMessage(f"表示更新エラー: {e}")
+
+    def _view_mode_changed(self, *_args):
+        if not self.asset:
+            return
+        try:
+            self._apply_view_mode_camera(reset=True)
+            self._update_viewer_scale_overlay(render=False)
+            self.plotter.render()
+        except Exception as e:
+            self.statusBar().showMessage(f"表示方向変更エラー: {e}")
+
+
+    def _update_zoom_label(self):
+        self.zoom_label.setText(f"{int(round(self._zoom_percent))}%")
+
+    def _zoom_slider_changed(self, value: int):
+        if self._updating_zoom_ui:
+            return
+        self._zoom_percent = int(max(25, min(400, value)))
+        self._update_zoom_label()
+        self._apply_zoom_to_camera(render=True)
+
+    def _set_zoom_ui(self, percent: int):
+        percent = int(max(25, min(400, percent)))
+        self._updating_zoom_ui = True
+        try:
+            self.zoom_slider.setValue(percent)
+        finally:
+            self._updating_zoom_ui = False
+        self._zoom_percent = percent
+        self._update_zoom_label()
+
+    def _step_zoom(self, delta_percent: int):
+        self._set_zoom_ui(self._zoom_percent + delta_percent)
+        self._apply_zoom_to_camera(render=True)
+
+    def _reset_zoom(self):
+        self._set_zoom_ui(100)
+        self._apply_zoom_to_camera(render=True)
+
+    def _capture_zoom_base_from_camera(self):
+        try:
+            camera = self.plotter.camera
+            if camera is None or not bool(camera.GetParallelProjection()):
+                return
+            scale = float(camera.GetParallelScale())
+            if scale > 0:
+                self._zoom_base_parallel_scale = scale
+        except Exception:
+            pass
+
+    def _apply_zoom_to_camera(self, render: bool = True):
+        if not self.asset or not hasattr(self, "plotter"):
+            return
+        try:
+            camera = self.plotter.camera
+            if camera is None:
+                return
+            self.plotter.enable_parallel_projection()
+            if self._zoom_base_parallel_scale is None or self._zoom_base_parallel_scale <= 0:
+                self._capture_zoom_base_from_camera()
+            if self._zoom_base_parallel_scale is None or self._zoom_base_parallel_scale <= 0:
+                return
+            target = float(self._zoom_base_parallel_scale) * (100.0 / float(self._zoom_percent))
+            camera.SetParallelScale(target)
+            self._update_viewer_scale_overlay(render=False)
+            if render:
+                self.plotter.render()
+        except Exception as e:
+            self.statusBar().showMessage(f"Zoom更新エラー: {e}")
+
+    def _sync_zoom_ui_from_camera(self):
+        if not self.asset or not hasattr(self, "plotter"):
+            return
+        try:
+            camera = self.plotter.camera
+            if camera is None or not bool(camera.GetParallelProjection()):
+                return
+            current_scale = float(camera.GetParallelScale())
+            base = self._zoom_base_parallel_scale
+            if not base or base <= 0 or current_scale <= 0:
+                return
+            percent = int(round(100.0 * base / current_scale))
+            percent = max(25, min(400, percent))
+            self._set_zoom_ui(percent)
+        except Exception:
+            pass
+
+    def _sync_overlay_and_zoom(self):
+        self._sync_zoom_ui_from_camera()
+        self._update_viewer_scale_overlay(render=True)
+
+    def _viewer_scale_changed(self, *_args):
+        self._update_viewer_scale_overlay(render=True)
+
+    def _selected_viewer_scale_mm(self) -> float:
+        try:
+            return float(self.viewer_scale_combo.currentText().split()[0])
+        except Exception:
+            return 50.0
+
+    def _actor_bounds(self) -> np.ndarray:
+        if self.actor is not None:
+            try:
+                b = np.asarray(self.actor.GetBounds(), dtype=float)
+                if b.shape == (6,) and np.isfinite(b).all():
+                    return b
+            except Exception:
+                pass
+        if self.current_poly is not None:
+            return np.asarray(self.current_poly.bounds, dtype=float)
+        raise RuntimeError("No displayed mesh bounds")
+
+    def _apply_view_mode_camera(self, reset: bool = True):
+        if not self.asset or self.current_poly is None:
+            return
+        bounds = self._actor_bounds()
+        center = np.array([
+            (bounds[0] + bounds[1]) * 0.5,
+            (bounds[2] + bounds[3]) * 0.5,
+            (bounds[4] + bounds[5]) * 0.5,
+        ], dtype=float)
+        max_extent = max(
+            float(bounds[1] - bounds[0]),
+            float(bounds[3] - bounds[2]),
+            float(bounds[5] - bounds[4]),
+            1e-9,
+        )
+        dist = max_extent * 3.0
+        mode = self.view_mode_combo.currentText()
+        if mode == "Ortho Front":
+            pos = center + np.array([0.0, -dist, 0.0])
+            up = np.array([0.0, 0.0, 1.0])
+        else:
+            # Fixed three-quarter oblique view. It remains an orthographic
+            # projection so the display ruler is metrically meaningful.
+            direction = np.array([1.25, -1.55, 0.95], dtype=float)
+            direction /= np.linalg.norm(direction)
+            pos = center + direction * dist
+            up = np.array([0.0, 0.0, 1.0])
+
+        self.plotter.camera_position = [pos.tolist(), center.tolist(), up.tolist()]
+        self.plotter.enable_parallel_projection()
+        if reset:
+            self.plotter.reset_camera()
+        self._capture_zoom_base_from_camera()
+        self._apply_zoom_to_camera(render=False)
+
+    def _remove_viewer_scale_overlay(self):
+        renderer = getattr(self.plotter, "renderer", None)
+        if renderer is None:
+            return
+        for actor in (self._viewer_scale_actor, self._viewer_scale_text_actor):
+            if actor is not None:
+                try:
+                    renderer.RemoveViewProp(actor)
+                except Exception:
+                    try:
+                        renderer.RemoveActor(actor)
+                    except Exception:
+                        pass
+        self._viewer_scale_actor = None
+        self._viewer_scale_text_actor = None
+
+    def _update_viewer_scale_overlay(self, render: bool = True):
+        """Draw a true-scale 2D ruler for the current parallel-projection camera."""
+        if not self.asset or not hasattr(self, "plotter"):
+            return
+        try:
+            self._remove_viewer_scale_overlay()
+            camera = self.plotter.camera
+            if not bool(camera.GetParallelProjection()):
+                return
+
+            window_size = self.plotter.window_size
+            width_px = max(int(window_size[0]), 1)
+            height_px = max(int(window_size[1]), 1)
+            parallel_scale = float(camera.GetParallelScale())
+            if parallel_scale <= 0:
+                return
+            world_per_px = (2.0 * parallel_scale) / float(height_px)
+            model_length = self._selected_viewer_scale_mm() / float(self.asset.unit_to_mm)
+            bar_px = max(1.0, model_length / world_per_px)
+
+            x0 = 30.0
+            y0 = 32.0
+            x1 = x0 + bar_px
+            tick = 7.0
+
+            from vtkmodules.vtkCommonCore import vtkPoints
+            from vtkmodules.vtkCommonDataModel import vtkCellArray, vtkPolyData
+            from vtkmodules.vtkRenderingCore import vtkActor2D, vtkPolyDataMapper2D, vtkTextActor
+
+            points = vtkPoints()
+            coords = [
+                (x0, y0, 0.0), (x1, y0, 0.0),
+                (x0, y0 - tick, 0.0), (x0, y0 + tick, 0.0),
+                (x1, y0 - tick, 0.0), (x1, y0 + tick, 0.0),
+            ]
+            for c in coords:
+                points.InsertNextPoint(*c)
+            lines = vtkCellArray()
+            for a, b in ((0, 1), (2, 3), (4, 5)):
+                lines.InsertNextCell(2)
+                lines.InsertCellPoint(a)
+                lines.InsertCellPoint(b)
+            poly = vtkPolyData()
+            poly.SetPoints(points)
+            poly.SetLines(lines)
+            mapper = vtkPolyDataMapper2D()
+            mapper.SetInputData(poly)
+            actor = vtkActor2D()
+            actor.SetMapper(mapper)
+            actor.GetProperty().SetColor(0.0, 0.0, 0.0)
+            actor.GetProperty().SetLineWidth(2.0)
+
+            text_actor = vtkTextActor()
+            text_actor.SetInput(f"{self._selected_viewer_scale_mm():g} mm")
+            text_actor.SetPosition((x0 + x1) * 0.5, y0 + 12.0)
+            prop = text_actor.GetTextProperty()
+            prop.SetColor(0.0, 0.0, 0.0)
+            prop.SetFontSize(14)
+            prop.SetJustificationToCentered()
+            prop.SetVerticalJustificationToBottom()
+
+            renderer = self.plotter.renderer
+            renderer.AddViewProp(actor)
+            renderer.AddViewProp(text_actor)
+            self._viewer_scale_actor = actor
+            self._viewer_scale_text_actor = text_actor
+            if render:
+                self.plotter.render()
+        except Exception as e:
+            self.statusBar().showMessage(f"表示スケール更新エラー: {e}")
+
+    def _draw_center_axis(self):
+        axis = self.center_axis_after_pose
+        if axis is None or self.current_poly is None:
+            return
+        b = self.current_poly.bounds
+        extent = max(b[1] - b[0], b[3] - b[2], b[5] - b[4])
+        p0 = axis.point - axis.direction * extent
+        p1 = axis.point + axis.direction * extent
+        line = pv.Line(p0, p1)
+        self.plotter.add_mesh(
+            line,
+            color="purple",
+            line_width=2,
+            show_scalar_bar=False,
+            lighting=False,
+        )
+
+    # ---------- Pose estimation ----------
+    def _ensure_initial_axis(self):
+        if self.initial_axis is not None:
+            return
+        if not self.asset:
+            raise RuntimeError("No mesh loaded")
+        self.statusBar().showMessage("Slice中心軸候補を推定中…")
+        QApplication.processEvents()
+        self.initial_axis = estimate_slice_axis(np.asarray(self.asset.mesh.vertices))
+
+    def estimate_and_apply_posture(self):
+        if not self.asset:
+            return
+        try:
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            self._ensure_initial_axis()
+            method_text = self.method_combo.currentText()
+            method = method_text.split()[0].lower()
+            self.reference_plane = None
+            ref_normal = None
+
+            if method == "rim":
+                self.statusBar().showMessage("口縁を放射セクタ抽出し、robust planeを最適化中…")
+                QApplication.processEvents()
+                self.reference_plane = estimate_rim_plane(np.asarray(self.asset.mesh.vertices), self.initial_axis)
+                ref_normal = self.reference_plane.normal
+            elif method == "base":
+                self.statusBar().showMessage("底面支持点を放射セクタ抽出し、robust planeを最適化中…")
+                QApplication.processEvents()
+                self.reference_plane = estimate_base_plane(np.asarray(self.asset.mesh.vertices), self.initial_axis)
+                ref_normal = self.reference_plane.normal
+            elif method == "manual":
+                if len(self.manual_points) != 3:
+                    raise ValueError("Manualでは先に「手動水平：3点を選択」で3点を指定してください。")
+                self.reference_plane = plane_from_three_points(np.asarray(self.manual_points), preferred_up=self.initial_axis.direction)
+                ref_normal = self.reference_plane.normal
+            elif method != "slice":
+                raise ValueError(f"Unknown method: {method_text}")
+
+            self.pose_matrix, self.center_axis_after_pose, origin, info = build_pose_transform(
+                np.asarray(self.asset.mesh.vertices),
+                method,
+                self.initial_axis,
+                reference_normal=ref_normal,
+            )
+            self.pose_info = info
+            self.posture_done = True
+            self.set_front_angle(0.0)
+            self._initialize_pottery_curve_controls()
+            self.pottery_output_branch_group.setEnabled(True)
+            self.pottery_image_size_group.setEnabled(True)
+
+            axis_angle = angle_between_deg(self.center_axis_after_pose.direction, np.array([0.0, 0.0, 1.0]))
+            ref_text = ""
+            if self.reference_plane is not None:
+                ref_text = (
+                    f"<br>Reference plane RMS: {self.reference_plane.residual_rms:.4g} input-unit"
+                    f" / confidence: {self.reference_plane.confidence:.2f}"
+                )
+            self.pose_label.setText(
+                f"Method: {method_text}<br>"
+                f"Center-axis confidence: {self.center_axis_after_pose.confidence:.2f}<br>"
+                f"Center axis ↔ Z: {axis_angle:.3f}°<br>"
+                f"Origin: center axis × posture BBox lower plane{ref_text}"
+            )
+            self.refresh_view(reset_camera=True)
+            self._schedule_preview_refresh()
+            self.statusBar().showMessage("姿勢と原点を確定しました。次にZ軸回転で正面を決めてください。")
+        except Exception as e:
+            self._show_error("姿勢推定エラー", e)
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def flip_z_and_reapply(self):
+        if not self.asset:
+            return
+        try:
+            self._ensure_initial_axis()
+            self.initial_axis.direction *= -1.0
+            self.initial_axis.diagnostics["manual_flip_z"] = not self.initial_axis.diagnostics.get("manual_flip_z", False)
+            self.estimate_and_apply_posture()
+        except Exception as e:
+            self._show_error("Z反転エラー", e)
+
+    # ---------- Manual plane picking ----------
+    def start_manual_pick(self):
+        if not self.asset:
+            return
+        # Manual plane points must be picked in raw coordinates. Return the view to raw pose first.
+        self.posture_done = False
+        self.pose_matrix = np.eye(4)
+        self.front_angle_deg = 0.0
+        self.center_axis_after_pose = None
+        self.manual_points = []
+        self.manual_pick_label.setText("選択点: 0 / 3")
+        self.method_combo.setCurrentText("Manual (3 points)")
+        self.refresh_view(reset_camera=True)
+        self._schedule_preview_refresh()
+        self.pick_mode = True
+        try:
+            self.plotter.disable_picking()
+        except Exception:
+            pass
+        self.plotter.enable_surface_point_picking(
+            callback=self._picked_point,
+            left_clicking=True,
+            show_message=True,
+            show_point=True,
+            pickable_window=False,
+        )
+        self.statusBar().showMessage("水平にしたい面上の3点を順にクリックしてください。")
+
+    def _picked_point(self, point):
+        if not self.pick_mode:
+            return
+        p = np.asarray(point, dtype=float)
+        if p.shape != (3,) or not np.isfinite(p).all():
+            return
+        self.manual_points.append(p)
+        self.manual_pick_label.setText(f"選択点: {len(self.manual_points)} / 3")
+        if len(self.manual_points) >= 3:
+            self.pick_mode = False
+            try:
+                self.plotter.disable_picking()
+            except Exception:
+                pass
+            self.statusBar().showMessage("3点を取得しました。「推定 / 適用」を押してください。")
+
+    # ---------- Front rotation ----------
+    def _front_drag_changed(self):
+        self.front_drag_enabled = self.front_drag_check.isChecked()
+
+    def eventFilter(self, watched, event):
+        """Handle only relevant mouse events for front Z rotation.
+
+        eventFilter also receives paint/timer/focus events. Those events do not
+        implement mouse-specific methods such as modifiers(), button(), or position().
+        """
+        is_view = watched in (self.plotter, getattr(self, "_vtk_widget", None))
+        etype = event.type()
+
+        # Pottery curve breakpoint picking has priority over all camera/front
+        # interactions. Consume press/move/release so VTK never enters rotate.
+        if is_view and (
+            self.pottery_curve_z_pick_mode
+            or self._pottery_curve_z_click_consuming
+        ):
+            if (
+                etype == QEvent.Type.MouseButtonPress
+                and event.button() == Qt.MouseButton.LeftButton
+                and self.pottery_curve_z_pick_mode
+            ):
+                self._pottery_curve_z_click_consuming = True
+                self._pick_pottery_curve_z_from_view_event(watched, event)
+                return True
+            if (
+                etype == QEvent.Type.MouseMove
+                and self._pottery_curve_z_click_consuming
+            ):
+                return True
+            if (
+                etype == QEvent.Type.MouseButtonRelease
+                and event.button() == Qt.MouseButton.LeftButton
+                and self._pottery_curve_z_click_consuming
+            ):
+                self._pottery_curve_z_click_consuming = False
+                return True
+
+        if is_view and etype in (QEvent.Type.Wheel, QEvent.Type.MouseButtonRelease):
+            # Camera interaction changes the world-units-per-pixel ratio.
+            QTimer.singleShot(0, self._sync_overlay_and_zoom)
+
+        if is_view and self.front_drag_check.isChecked() and self.posture_done:
+            mouse_types = (
+                QEvent.Type.MouseButtonPress,
+                QEvent.Type.MouseMove,
+                QEvent.Type.MouseButtonRelease,
+            )
+            if etype not in mouse_types:
+                return super().eventFilter(watched, event)
+
+            if QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier:
+                if etype == QEvent.Type.MouseButtonRelease:
+                    QTimer.singleShot(0, self._sync_overlay_and_zoom)
+                return super().eventFilter(watched, event)
+
+            if etype == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+                self.dragging_front = True
+                self.last_mouse_x = float(event.position().x())
+                return True
+            if etype == QEvent.Type.MouseMove and self.dragging_front:
+                x = float(event.position().x())
+                dx = x - self.last_mouse_x
+                self.last_mouse_x = x
+                self.set_front_angle(self.front_angle_deg + dx * 0.35)
+                return True
+            if etype == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:
+                self.dragging_front = False
+                QTimer.singleShot(0, self._sync_overlay_and_zoom)
+                return True
+        return super().eventFilter(watched, event)
+
+    def _dial_changed(self, value: int):
+        if self._setting_dial:
+            return
+        self.set_front_angle(value / 10.0, source="dial")
+
+    def _spin_changed(self, value: float):
+        if self._setting_dial:
+            return
+        self.set_front_angle(value, source="spin")
+
+    @staticmethod
+    def _wrap_angle(deg: float) -> float:
+        d = ((float(deg) + 180.0) % 360.0) - 180.0
+        if d == -180.0:
+            d = 180.0
+        return d
+
+    def set_front_angle(self, deg: float, source="other"):
+        self.front_angle_deg = self._wrap_angle(deg)
+        self._setting_dial = True
+        try:
+            if source != "dial":
+                self.front_dial.setValue(int(round(self.front_angle_deg * 10)))
+            if source != "spin":
+                self.angle_spin.setValue(self.front_angle_deg)
+        finally:
+            self._setting_dial = False
+        if self.actor is not None and self.posture_done:
+            try:
+                self.actor.origin = (0.0, 0.0, 0.0)
+                self.actor.orientation = (0.0, 0.0, self.front_angle_deg)
+                self.plotter.render()
+            except Exception:
+                self.refresh_view()
+        self._schedule_preview_refresh()
+
+    # ---------- Measurement CSV / inventory ----------
+    def _measurement_final_matrix(self) -> np.ndarray:
+        if not self.asset:
+            raise RuntimeError("モデルが読み込まれていません。")
+
+        if self._is_lithic():
+            if (
+                not self.lithic_pose_confirmed
+                or self.lithic_confirmed_final_matrix is None
+            ):
+                raise RuntimeError(
+                    "石器は先に「姿勢決定」を押してください。"
+                )
+            return np.asarray(
+                self.lithic_confirmed_final_matrix,
+                dtype=float,
+            )
+
+        if not self.posture_done:
+            raise RuntimeError(
+                "土器は先に姿勢と正面を確定してください。"
+            )
+        return np.asarray(self._current_final_matrix(), dtype=float)
+
+    def _measurement_model_bbox(
+        self,
+        final_matrix: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        if not self.asset:
+            raise RuntimeError("モデルが読み込まれていません。")
+
+        vertices = trimesh.transform_points(
+            np.asarray(self.asset.mesh.vertices, dtype=float),
+            np.asarray(final_matrix, dtype=float),
+        )
+        if len(vertices) == 0:
+            raise RuntimeError("bboxを計測できる頂点がありません。")
+
+        bmin = np.min(vertices, axis=0)
+        bmax = np.max(vertices, axis=0)
+        extents = bmax - bmin
+        return bmin, bmax, extents
+
+    def _measurement_section_rows(
+        self,
+        final_matrix: np.ndarray,
+    ) -> list[dict]:
+        """Return lithic section bbox rows.
+
+        Current lithic section geometry is:
+          axis X -> X-Z section (y = constant)
+          axis Y -> Y-Z section (x = constant)
+
+        Therefore the section bbox reports X/Z or Y/Z dimensions.
+        The axis normal to the section plane is left blank in the CSV.
+        """
+        if not self.asset or not self._is_lithic():
+            return []
+
+        poly = self._make_polydata(final_matrix)
+        bounds = np.asarray(poly.bounds, dtype=float)
+
+        x_sections, y_sections = self._ordered_lithic_sections_for_output(
+            self.lithic_sections
+        )
+        ordered = [*x_sections, *y_sections]
+        rows: list[dict] = []
+
+        for section in ordered:
+            coord = self._lithic_section_coordinate(section, bounds)
+            paths = self._lithic_section_paths_3d(
+                poly,
+                section["axis"],
+                coord,
+            )
+
+            row = {
+                "record_type": "section_bbox",
+                "record_id": section["id"],
+                "section_axis": section["axis"],
+                "section_plane": (
+                    "X-Z" if section["axis"] == "X" else "Y-Z"
+                ),
+                "section_position": float(section["position"]),
+                "section_position_percent": float(section["position"] * 100.0),
+                "section_coordinate": float(coord),
+                "section_coordinate_mm": float(coord * self.asset.unit_to_mm),
+                "bbox_x": "",
+                "bbox_y": "",
+                "bbox_z": "",
+                "bbox_x_mm": "",
+                "bbox_y_mm": "",
+                "bbox_z_mm": "",
+                "status": "ok",
+            }
+
+            if not paths:
+                row["status"] = "no_intersection"
+                rows.append(row)
+                continue
+
+            points = np.vstack(
+                [
+                    np.asarray(path, dtype=float)
+                    for path in paths
+                    if len(path) >= 2
+                ]
+            )
+            if len(points) == 0:
+                row["status"] = "no_intersection"
+                rows.append(row)
+                continue
+
+            ext = np.max(points, axis=0) - np.min(points, axis=0)
+            unit_to_mm = float(self.asset.unit_to_mm)
+
+            if section["axis"] == "X":
+                # X-Z section: width along X, thickness along Z.
+                row["bbox_x"] = float(ext[0])
+                row["bbox_z"] = float(ext[2])
+                row["bbox_x_mm"] = float(ext[0] * unit_to_mm)
+                row["bbox_z_mm"] = float(ext[2] * unit_to_mm)
+            else:
+                # Y-Z section: length along Y, thickness along Z.
+                row["bbox_y"] = float(ext[1])
+                row["bbox_z"] = float(ext[2])
+                row["bbox_y_mm"] = float(ext[1] * unit_to_mm)
+                row["bbox_z_mm"] = float(ext[2] * unit_to_mm)
+
+            rows.append(row)
+
+        return rows
+
+    def _measurement_rows(
+        self,
+        final_matrix: np.ndarray,
+    ) -> list[dict]:
+        if not self.asset:
+            raise RuntimeError("モデルが読み込まれていません。")
+
+        _bmin, _bmax, ext = self._measurement_model_bbox(final_matrix)
+        unit_to_mm = float(self.asset.unit_to_mm)
+
+        rows = [
+            {
+                "record_type": "model_bbox",
+                "record_id": "model",
+                "section_axis": "",
+                "section_plane": "",
+                "section_position": "",
+                "section_position_percent": "",
+                "section_coordinate": "",
+                "section_coordinate_mm": "",
+                "bbox_x": float(ext[0]),
+                "bbox_y": float(ext[1]),
+                "bbox_z": float(ext[2]),
+                "bbox_x_mm": float(ext[0] * unit_to_mm),
+                "bbox_y_mm": float(ext[1] * unit_to_mm),
+                "bbox_z_mm": float(ext[2] * unit_to_mm),
+                "status": "ok",
+            }
+        ]
+
+        if self._is_lithic():
+            rows.extend(self._measurement_section_rows(final_matrix))
+
+        return rows
+
+    @staticmethod
+    def _measurement_csv_fieldnames() -> list[str]:
+        return [
+            "artifact_type",
+            "source_file",
+            "source_stem",
+            "source_sha256",
+            "input_unit",
+            "record_type",
+            "record_id",
+            "section_axis",
+            "section_plane",
+            "section_position",
+            "section_position_percent",
+            "section_coordinate",
+            "section_coordinate_mm",
+            "bbox_x",
+            "bbox_y",
+            "bbox_z",
+            "bbox_x_mm",
+            "bbox_y_mm",
+            "bbox_z_mm",
+            "status",
+        ]
+
+    def _write_individual_measurement_csv(
+        self,
+        out_dir: Path,
+        final_matrix: np.ndarray,
+    ) -> Path:
+        if not self.asset:
+            raise RuntimeError("モデルが読み込まれていません。")
+
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / f"{self.asset.source_path.stem}_measurements.csv"
+        artifact_type = "lithic" if self._is_lithic() else "pottery"
+
+        rows = self._measurement_rows(final_matrix)
+        fieldnames = self._measurement_csv_fieldnames()
+
+        with path.open(
+            "w",
+            encoding="utf-8-sig",
+            newline="",
+        ) as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in rows:
+                common = {
+                    "artifact_type": artifact_type,
+                    "source_file": self.asset.source_path.name,
+                    "source_stem": self.asset.source_path.stem,
+                    "source_sha256": self.asset.source_sha256,
+                    "input_unit": self.asset.input_unit,
+                }
+                writer.writerow({**common, **row})
+
+        if self._is_lithic():
+            self._write_lithic_section_bbox_csv(
+                out_dir,
+                rows=[r for r in rows if r.get("record_type") == "section_bbox"],
+            )
+
+        return path
+
+    def _write_lithic_section_bbox_csv(
+        self,
+        out_dir: Path,
+        rows: list[dict],
+    ) -> Path:
+        """Write one per-artifact CSV containing one bbox row per section.
+
+        Unlike output/inventory-lithic.csv, this file is never merged across
+        multiple input artifacts.  It lives beside images and transforms in
+        output/<stem>/.
+        """
+        if not self.asset:
+            raise RuntimeError("モデルが読み込まれていません。")
+
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / f"{self.asset.source_path.stem}_section_bboxes.csv"
+        fieldnames = [
+            "source_file",
+            "source_stem",
+            "source_sha256",
+            "input_unit",
+            "section_id",
+            "section_axis",
+            "section_plane",
+            "section_position",
+            "section_position_percent",
+            "section_coordinate",
+            "section_coordinate_mm",
+            "bbox_x",
+            "bbox_y",
+            "bbox_z",
+            "bbox_x_mm",
+            "bbox_y_mm",
+            "bbox_z_mm",
+            "status",
+        ]
+        with path.open("w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({
+                    "source_file": self.asset.source_path.name,
+                    "source_stem": self.asset.source_path.stem,
+                    "source_sha256": self.asset.source_sha256,
+                    "input_unit": self.asset.input_unit,
+                    "section_id": row.get("record_id", ""),
+                    "section_axis": row.get("section_axis", ""),
+                    "section_plane": row.get("section_plane", ""),
+                    "section_position": row.get("section_position", ""),
+                    "section_position_percent": row.get("section_position_percent", ""),
+                    "section_coordinate": row.get("section_coordinate", ""),
+                    "section_coordinate_mm": row.get("section_coordinate_mm", ""),
+                    "bbox_x": row.get("bbox_x", ""),
+                    "bbox_y": row.get("bbox_y", ""),
+                    "bbox_z": row.get("bbox_z", ""),
+                    "bbox_x_mm": row.get("bbox_x_mm", ""),
+                    "bbox_y_mm": row.get("bbox_y_mm", ""),
+                    "bbox_z_mm": row.get("bbox_z_mm", ""),
+                    "status": row.get("status", ""),
+                })
+        return path
+
+    @staticmethod
+    def _geometry_inventory_fieldnames() -> list[str]:
+        """Representative geometry inventory: requested minimal four columns."""
+        return [
+            "source_stem",
+            "bbox_x_mm",
+            "bbox_y_mm",
+            "bbox_z_mm",
+        ]
+
+    @staticmethod
+    def _model_inventory_fieldnames() -> list[str]:
+        """3D model / source-data inventory."""
+        return [
+            "source_file",
+            "source_stem",
+            "source_sha256",
+            "mesh_count",
+            "file_size_bytes",
+            "file_size_mb",
+            "surface_area_mm2",
+            "volume_mm3",
+            "is_watertight",
+            "volume_status",
+        ]
+
+    def _current_geometry_inventory_row(
+        self,
+        final_matrix: np.ndarray,
+    ) -> dict:
+        if not self.asset:
+            raise RuntimeError("モデルが読み込まれていません。")
+
+        _bmin, _bmax, ext = self._measurement_model_bbox(final_matrix)
+        unit_to_mm = float(self.asset.unit_to_mm)
+
+        return {
+            "source_stem": self.asset.source_path.stem,
+            "bbox_x_mm": float(ext[0] * unit_to_mm),
+            "bbox_y_mm": float(ext[1] * unit_to_mm),
+            "bbox_z_mm": float(ext[2] * unit_to_mm),
+        }
+
+    def _current_model_inventory_row(self) -> dict:
+        """Return source 3D-model metadata and geometry invariants.
+
+        mesh_count is the number of triangle faces after Trimesh loading.
+        source_path.stat() measures only the source mesh file.  Therefore an
+        OBJ entry counts the OBJ file itself and intentionally excludes MTL /
+        texture files, as requested.
+
+        Surface area and volume are converted from the input coordinate unit
+        to mm^2 / mm^3.  Trimesh can return a volume for a non-watertight
+        mesh, but that value is not guaranteed to represent a closed physical
+        volume, so the inventory also records watertight/status.
+        """
+        if not self.asset:
+            raise RuntimeError("モデルが読み込まれていません。")
+
+        mesh = self.asset.mesh
+        unit_to_mm = float(self.asset.unit_to_mm)
+        file_size_bytes = int(self.asset.source_path.stat().st_size)
+
+        area_native = float(mesh.area)
+        raw_volume_native = float(mesh.volume)
+        volume_native = abs(raw_volume_native)
+        watertight = bool(mesh.is_watertight)
+
+        return {
+            "source_file": self.asset.source_path.name,
+            "source_stem": self.asset.source_path.stem,
+            "source_sha256": self.asset.source_sha256,
+            "mesh_count": int(len(mesh.faces)),
+            "file_size_bytes": file_size_bytes,
+            "file_size_mb": float(file_size_bytes / (1024.0 ** 2)),
+            "surface_area_mm2": float(
+                area_native * (unit_to_mm ** 2)
+            ),
+            "volume_mm3": float(
+                volume_native * (unit_to_mm ** 3)
+            ),
+            "is_watertight": watertight,
+            "volume_status": (
+                "closed_mesh"
+                if watertight
+                else "non_watertight_estimate"
+            ),
+        }
+
+    @staticmethod
+    def _upsert_csv_row(
+        path: Path,
+        fieldnames: list[str],
+        row: dict,
+        key_field: str,
+    ) -> str:
+        """Create or update one CSV row; return '追加' or '更新'."""
+        existing: list[dict] = []
+        if path.exists():
+            with path.open(
+                "r",
+                encoding="utf-8-sig",
+                newline="",
+            ) as f:
+                existing = list(csv.DictReader(f))
+
+        key = str(row.get(key_field, ""))
+        replaced = False
+        updated: list[dict] = []
+
+        for existing_row in existing:
+            if (
+                key
+                and str(existing_row.get(key_field, "")) == key
+            ):
+                if not replaced:
+                    updated.append(row)
+                    replaced = True
+                continue
+            updated.append(existing_row)
+
+        if not replaced:
+            updated.append(row)
+
+        with path.open(
+            "w",
+            encoding="utf-8-sig",
+            newline="",
+        ) as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=fieldnames,
+                extrasaction="ignore",
+            )
+            writer.writeheader()
+            for current in updated:
+                writer.writerow(
+                    {
+                        name: current.get(name, "")
+                        for name in fieldnames
+                    }
+                )
+
+        return "更新" if replaced else "追加"
+
+    def _inventory_paths(self) -> tuple[Path, Path]:
+        """Return geometry inventory path and model-data inventory path."""
+        lithic = self._is_lithic()
+        geometry_path = OUTPUT_DIR / (
+            "inventory-lithic.csv"
+            if lithic
+            else "inventory-pottery.csv"
+        )
+        model_path = OUTPUT_DIR / (
+            "inventory-model-lithic.csv"
+            if lithic
+            else "inventory-model-pottery.csv"
+        )
+        return geometry_path, model_path
+
+    def _inventory_is_current(
+        self,
+        final_matrix: np.ndarray,
+    ) -> bool:
+        """Check that both inventories already contain the current values.
+
+        Used by split lithic export to decide whether a warning is needed
+        before orthographic or PLY output. Missing measurements no longer block
+        those exports.
+        """
+        if not self.asset:
+            return False
+
+        geometry_path, model_path = self._inventory_paths()
+        if not geometry_path.exists() or not model_path.exists():
+            return False
+
+        geometry_row = self._current_geometry_inventory_row(final_matrix)
+        model_row = self._current_model_inventory_row()
+
+        try:
+            with geometry_path.open(
+                "r",
+                encoding="utf-8-sig",
+                newline="",
+            ) as f:
+                geometry_rows = list(csv.DictReader(f))
+            with model_path.open(
+                "r",
+                encoding="utf-8-sig",
+                newline="",
+            ) as f:
+                model_rows = list(csv.DictReader(f))
+        except Exception:
+            return False
+
+        stem = str(geometry_row["source_stem"])
+        geometry_existing = next(
+            (
+                row for row in geometry_rows
+                if str(row.get("source_stem", "")) == stem
+            ),
+            None,
+        )
+        if geometry_existing is None:
+            return False
+
+        def close_number(csv_value, expected) -> bool:
+            try:
+                return bool(
+                    np.isclose(
+                        float(csv_value),
+                        float(expected),
+                        rtol=1e-9,
+                        atol=1e-6,
+                    )
+                )
+            except Exception:
+                return False
+
+        for field in ("bbox_x_mm", "bbox_y_mm", "bbox_z_mm"):
+            if not close_number(
+                geometry_existing.get(field, ""),
+                geometry_row[field],
+            ):
+                return False
+
+        sha = str(model_row["source_sha256"])
+        model_existing = next(
+            (
+                row for row in model_rows
+                if str(row.get("source_sha256", "")) == sha
+            ),
+            None,
+        )
+        if model_existing is None:
+            return False
+
+        if str(model_existing.get("source_file", "")) != str(
+            model_row["source_file"]
+        ):
+            return False
+        if str(model_existing.get("source_stem", "")) != str(
+            model_row["source_stem"]
+        ):
+            return False
+
+        numeric_fields = (
+            "mesh_count",
+            "file_size_bytes",
+            "surface_area_mm2",
+            "volume_mm3",
+        )
+        for field in numeric_fields:
+            if not close_number(
+                model_existing.get(field, ""),
+                model_row[field],
+            ):
+                return False
+
+        return True
+
+    def export_measurement_inventory(self, *_args, show_message: bool = True) -> bool:
+        """Write both inventory types for the current specimen.
+
+        Geometry representative values:
+            output/inventory-(pottery|lithic).csv
+
+        3D model/source-data values:
+            output/inventory-model-(pottery|lithic).csv
+        """
+        try:
+            if not self.asset:
+                raise RuntimeError("モデルが読み込まれていません。")
+
+            final_matrix = self._measurement_final_matrix()
+            geometry_row = self._current_geometry_inventory_row(
+                final_matrix
+            )
+            model_row = self._current_model_inventory_row()
+
+            OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+            geometry_path, model_path = self._inventory_paths()
+
+            geometry_action = self._upsert_csv_row(
+                geometry_path,
+                self._geometry_inventory_fieldnames(),
+                geometry_row,
+                key_field="source_stem",
+            )
+            model_action = self._upsert_csv_row(
+                model_path,
+                self._model_inventory_fieldnames(),
+                model_row,
+                key_field="source_sha256",
+            )
+
+            self.statusBar().showMessage(
+                "計測一覧出力完了: "
+                f"{geometry_path.name} / {model_path.name}"
+            )
+
+            volume_note = (
+                ""
+                if model_row["is_watertight"]
+                else (
+                    "\n\n注意: このモデルは watertight ではありません。"
+                    "volume_mm3 は Trimesh の非閉合メッシュ推定値として"
+                    "記録されています。"
+                )
+            )
+            if show_message:
+                QMessageBox.information(
+                    self,
+                    "計測一覧出力",
+                    f"Geometry inventory: {geometry_path.name} "
+                    f"({geometry_action})\n"
+                    f"3D model inventory: {model_path.name} "
+                    f"({model_action})"
+                    f"{volume_note}",
+                )
+            return True
+        except Exception as e:
+            self._show_error("計測一覧出力エラー", e)
+            return False
+
+
+    # ---------- Lithic orthographic rendering / preview / export ----------
+    @staticmethod
+    def _lithic_camera_for_view(bounds: np.ndarray, view: str):
+        center = np.array([
+            (bounds[0] + bounds[1]) * 0.5,
+            (bounds[2] + bounds[3]) * 0.5,
+            (bounds[4] + bounds[5]) * 0.5,
+        ], dtype=float)
+        extent = max(
+            float(bounds[1] - bounds[0]),
+            float(bounds[3] - bounds[2]),
+            float(bounds[5] - bounds[4]),
+            1e-9,
+        )
+        dist = extent * 3.0
+
+        # Lithic coordinate semantics:
+        #   X = width, Y = length, Z = thickness
+        if view == "front":
+            pos = center + np.array([0.0, 0.0, dist])
+            up = np.array([0.0, 1.0, 0.0])
+        elif view == "back":
+            pos = center + np.array([0.0, 0.0, -dist])
+            up = np.array([0.0, 1.0, 0.0])
+        elif view == "right":
+            pos = center + np.array([dist, 0.0, 0.0])
+            up = np.array([0.0, 1.0, 0.0])
+        elif view == "left":
+            pos = center + np.array([-dist, 0.0, 0.0])
+            up = np.array([0.0, 1.0, 0.0])
+        elif view == "top":
+            # Rectangular-prism net convention:
+            # Top is unfolded above Front, so the Front-facing (+Z) edge
+            # must appear at the bottom of the Top panel and the Back-facing
+            # (-Z) edge at the top. Using up=-Z also keeps screen-right=+X,
+            # aligned with Front.
+            pos = center + np.array([0.0, dist, 0.0])
+            up = np.array([0.0, 0.0, -1.0])
+        elif view == "bottom":
+            # Bottom is unfolded below Front; Front-facing (+Z) therefore
+            # appears at the top of the Bottom panel.
+            pos = center + np.array([0.0, -dist, 0.0])
+            up = np.array([0.0, 0.0, 1.0])
+        else:
+            raise ValueError(view)
+        return pos, center, up
+
+    @staticmethod
+    def _lithic_view_size(bounds: np.ndarray, view: str) -> tuple[float, float]:
+        dx = float(bounds[1] - bounds[0])
+        dy = float(bounds[3] - bounds[2])
+        dz = float(bounds[5] - bounds[4])
+        if view in ("front", "back"):
+            return dx, dy
+        if view in ("left", "right"):
+            return dz, dy
+        if view in ("top", "bottom"):
+            return dx, dz
+        raise ValueError(view)
+
+    def _render_lithic_poly_views(
+        self,
+        poly: pv.PolyData,
+        bounds: np.ndarray,
+        views: list[str],
+        pixels_per_model_unit: float,
+        use_appearance: bool,
+        lighting: bool,
+        progress_callback=None,
+        progress_base: int = 0,
+        progress_total: int = 1,
+        progress_mode_label: str = "render",
+    ) -> dict[str, np.ndarray]:
+        rendered: dict[str, np.ndarray] = {}
+        pl = None
+        try:
+            pl = pv.Plotter(off_screen=True, window_size=(512, 512))
+            try:
+                pl.disable_anti_aliasing()
+            except (AttributeError, TypeError):
+                try:
+                    pl.ren_win.SetMultiSamples(0)
+                except Exception:
+                    pass
+            pl.set_background("white")
+            self._add_mesh_actor(
+                pl,
+                poly,
+                appearance=use_appearance,
+                lighting=lighting,
+            )
+            pl.enable_parallel_projection()
+
+            for i, view in enumerate(views):
+                world_w, world_h = self._lithic_view_size(bounds, view)
+                world_w = max(world_w, 1e-9)
+                world_h = max(world_h, 1e-9)
+                width = max(64, int(round(world_w * pixels_per_model_unit)))
+                height = max(64, int(round(world_h * pixels_per_model_unit)))
+                pl.window_size = [width, height]
+
+                pos, center, up = self._lithic_camera_for_view(bounds, view)
+                pl.camera_position = [
+                    pos.tolist(),
+                    center.tolist(),
+                    up.tolist(),
+                ]
+                pl.enable_parallel_projection()
+                pl.camera.parallel_scale = world_h / 2.0
+                pl.reset_camera_clipping_range()
+                rendered[view] = pl.screenshot(
+                    return_img=True,
+                    transparent_background=True,
+                    window_size=[width, height],
+                )
+
+                if progress_callback is not None:
+                    done = progress_base + i + 1
+                    progress_callback(
+                        done / max(progress_total, 1),
+                        f"石器オルソ生成中: {progress_mode_label} / "
+                        f"{view} ({done}/{progress_total})",
+                    )
+        finally:
+            if pl is not None:
+                try:
+                    pl.close()
+                except Exception:
+                    pass
+        return rendered
+
+    def _render_lithic_views_for_mode(
+        self,
+        poly: pv.PolyData,
+        bounds: np.ndarray,
+        views: list[str],
+        mode: str,
+        pixels_per_model_unit: float,
+        progress_callback=None,
+        progress_base: int = 0,
+        progress_total: int = 1,
+    ) -> dict[str, np.ndarray]:
+        if mode == "texture":
+            appearance, lighting = True, False
+        elif mode == "texture_normal":
+            appearance, lighting = True, True
+        elif mode == "shade":
+            appearance, lighting = False, True
+        elif mode == "outline_mask":
+            appearance, lighting = False, False
+        else:
+            raise ValueError(mode)
+
+        return self._render_lithic_poly_views(
+            poly,
+            bounds,
+            views,
+            pixels_per_model_unit,
+            use_appearance=appearance,
+            lighting=lighting,
+            progress_callback=progress_callback,
+            progress_base=progress_base,
+            progress_total=progress_total,
+            progress_mode_label=mode,
+        )
+
+    @staticmethod
+    def _lithic_main_layout_rects(
+        bounds: np.ndarray,
+        spacing_model: float,
+    ) -> dict[str, tuple[float, float, float, float]]:
+        dx = float(bounds[1] - bounds[0])
+        dy = float(bounds[3] - bounds[2])
+        dz = float(bounds[5] - bounds[4])
+        s = float(spacing_model)
+        return {
+            "front": (0.0, 0.0, dx, dy),
+            "left": (-(s + dz), 0.0, -s, dy),
+            "right": (dx + s, 0.0, dx + s + dz, dy),
+            "back": (
+                dx + 2.0 * s + dz,
+                0.0,
+                2.0 * dx + 2.0 * s + dz,
+                dy,
+            ),
+            "top": (0.0, dy + s, dx, dy + s + dz),
+            "bottom": (0.0, -(s + dz), dx, -s),
+        }
+
+    @staticmethod
+    def _ordered_lithic_sections_for_output(
+        sections: list[dict],
+    ) -> tuple[list[dict], list[dict]]:
+        """Order section drawings by position, never by creation/paint order.
+
+        Y-Z longitudinal sections (axis == "Y"):
+            Back view, left -> right.
+            Back is horizontally mirrored, so position is sorted descending.
+
+        X-Z transverse sections (axis == "X"):
+            Front view, top -> bottom.
+            +Y is screen-up in Front, so position is sorted descending.
+        """
+        x_sections = sorted(
+            [
+                sdef for sdef in sections
+                if str(sdef.get("axis", "")).upper() == "X"
+            ],
+            key=lambda sdef: float(sdef.get("position", 0.5)),
+            reverse=True,
+        )
+        y_sections = sorted(
+            [
+                sdef for sdef in sections
+                if str(sdef.get("axis", "")).upper() == "Y"
+            ],
+            key=lambda sdef: float(sdef.get("position", 0.5)),
+            reverse=True,
+        )
+        return x_sections, y_sections
+
+    @staticmethod
+    def _lithic_section_display_bbox(
+        paths_3d: list[np.ndarray],
+        axis: str,
+    ) -> tuple[float, float, float, float] | None:
+        """Return the tight section contour bbox in displayed plane axes.
+
+        Returns (u_min, v_min, u_max, v_max) in model units.
+          axis X (X-Z section): u=X, v=Z
+          axis Y (Y-Z section): u=-Z (screen right), v=Y
+        """
+        usable = [
+            np.asarray(path, dtype=float)
+            for path in paths_3d
+            if len(path) >= 2
+        ]
+        if not usable:
+            return None
+        points = np.vstack(usable)
+        axis = str(axis).upper()
+        if axis == "X":
+            u = points[:, 0]
+            v = points[:, 2]
+        elif axis == "Y":
+            u = -points[:, 2]
+            v = points[:, 1]
+        else:
+            raise ValueError(axis)
+        return (
+            float(np.min(u)),
+            float(np.min(v)),
+            float(np.max(u)),
+            float(np.max(v)),
+        )
+
+    def _build_lithic_section_geometry(
+        self,
+        poly: pv.PolyData,
+        bounds: np.ndarray,
+        sections: list[dict],
+    ) -> dict[str, dict]:
+        """Cut sections once and retain tight contour bounds for layout."""
+        geometry: dict[str, dict] = {}
+        x_sections, y_sections = self._ordered_lithic_sections_for_output(
+            sections
+        )
+        for section in [*x_sections, *y_sections]:
+            coord = self._lithic_section_coordinate(section, bounds)
+            paths = self._lithic_section_paths_3d(
+                poly, section["axis"], coord
+            )
+            display_bbox = self._lithic_section_display_bbox(
+                paths, section["axis"]
+            )
+            key = f'section_{section["id"]}'
+            geometry[key] = {
+                "section": section,
+                "coordinate": float(coord),
+                "paths_3d": paths,
+                "display_bbox": display_bbox,
+            }
+        return geometry
+
+    def _lithic_layout_rects(
+        self,
+        bounds: np.ndarray,
+        spacing_model: float,
+        views: list[str],
+        sections: list[dict],
+        section_geometry: dict[str, dict],
+    ) -> tuple[
+        dict[str, tuple[float, float, float, float]],
+        dict[str, tuple[float, float, float, float]],
+    ]:
+        """Lay out section contours using their tight bboxes.
+
+        `spacing_model` is the requested visible gap between neighboring
+        section contour bboxes, not between full-model-sized section panels.
+        """
+        main = self._lithic_main_layout_rects(bounds, spacing_model)
+        s = float(spacing_model)
+        section_rects: dict[str, tuple[float, float, float, float]] = {}
+
+        x_sections, y_sections = self._ordered_lithic_sections_for_output(
+            sections
+        )
+
+        # X-Z sections are stacked downward.  Their X coordinate remains
+        # registered to the model's global X axis, while vertical stacking
+        # uses each section contour's own Z extent.
+        if "bottom" in views:
+            current_top = float(main["bottom"][1]) - s
+        else:
+            current_top = float(main["front"][1]) - s
+
+        for section in x_sections:
+            key = f'section_{section["id"]}'
+            item = section_geometry.get(key, {})
+            bbox = item.get("display_bbox")
+            if bbox is None:
+                continue
+            u0, _v0, u1, _v1 = bbox
+            width = max(0.0, float(u1 - u0))
+            height = max(0.0, float(_v1 - _v0))
+            if width <= 0.0 or height <= 0.0:
+                continue
+            # Main Front/Bottom x=0 corresponds to bounds[0].
+            x0 = float(u0 - bounds[0])
+            x1 = x0 + width
+            y1 = current_top
+            y0 = y1 - height
+            section_rects[key] = (x0, y0, x1, y1)
+            current_top = y0 - s
+
+        selected = [main[v] for v in views]
+        current_left = max(r[2] for r in selected) + s
+
+        # Y-Z sections are stacked to the right.  Their vertical location is
+        # registered to global Y, and each new contour starts exactly s model
+        # units after the previous contour's tight right edge.
+        for section in y_sections:
+            key = f'section_{section["id"]}'
+            item = section_geometry.get(key, {})
+            bbox = item.get("display_bbox")
+            if bbox is None:
+                continue
+            _u0, v0, _u1, v1 = bbox
+            width = max(0.0, float(_u1 - _u0))
+            height = max(0.0, float(v1 - v0))
+            if width <= 0.0 or height <= 0.0:
+                continue
+            x0 = current_left
+            x1 = x0 + width
+            y0 = float(v0 - bounds[2])
+            y1 = y0 + height
+            section_rects[key] = (x0, y0, x1, y1)
+            current_left = x1 + s
+
+        return main, section_rects
+
+    @staticmethod
+    def _lithic_section_paths_3d(
+        poly: pv.PolyData,
+        axis: str,
+        coordinate: float,
+    ) -> list[np.ndarray]:
+        from vtkmodules.vtkCommonDataModel import vtkPlane
+        from vtkmodules.vtkFiltersCore import (
+            vtkCleanPolyData,
+            vtkCutter,
+            vtkStripper,
+        )
+
+        axis = axis.upper()
+        plane = vtkPlane()
+        if axis == "X":
+            # X-axis section = X-Z plane, normal Y.
+            plane.SetOrigin(0.0, float(coordinate), 0.0)
+            plane.SetNormal(0.0, 1.0, 0.0)
+        elif axis == "Y":
+            # Y-axis section = Y-Z plane, normal X.
+            plane.SetOrigin(float(coordinate), 0.0, 0.0)
+            plane.SetNormal(1.0, 0.0, 0.0)
+        else:
+            raise ValueError(axis)
+
+        cutter = vtkCutter()
+        cutter.SetCutFunction(plane)
+        cutter.SetInputData(poly)
+        cutter.Update()
+
+        clean = vtkCleanPolyData()
+        clean.SetInputConnection(cutter.GetOutputPort())
+        clean.PointMergingOn()
+
+        stripper = vtkStripper()
+        stripper.SetInputConnection(clean.GetOutputPort())
+        stripper.JoinContiguousSegmentsOn()
+        stripper.Update()
+
+        wrapped = pv.wrap(stripper.GetOutput())
+        if wrapped.n_points == 0 or wrapped.n_lines == 0:
+            return []
+
+        pts = np.asarray(wrapped.points, dtype=float)
+        lines = np.asarray(wrapped.lines, dtype=np.int64)
+        paths: list[np.ndarray] = []
+        i = 0
+        while i < len(lines):
+            n = int(lines[i])
+            if n >= 2:
+                ids = lines[i + 1:i + 1 + n]
+                path = pts[ids]
+                if len(path) >= 2:
+                    paths.append(path)
+            i += n + 1
+        return paths
+
+    def _lithic_section_coordinate(
+        self,
+        section: dict,
+        bounds: np.ndarray,
+    ) -> float:
+        pos = float(section["position"])
+        if section["axis"] == "X":
+            return float(bounds[2] + pos * (bounds[3] - bounds[2]))
+        if section["axis"] == "Y":
+            return float(bounds[0] + pos * (bounds[1] - bounds[0]))
+        raise ValueError(section["axis"])
+
+    def _lithic_project_section_paths(
+        self,
+        paths: list[np.ndarray],
+        axis: str,
+        ppu: float,
+        display_bbox: tuple[float, float, float, float],
+    ) -> list[np.ndarray]:
+        """Project a section into a tight local image coordinate system."""
+        projected: list[np.ndarray] = []
+        axis = axis.upper()
+        u0, _v0, _u1, v1 = display_bbox
+
+        for path in paths:
+            p = np.asarray(path, dtype=float)
+            if len(p) < 2:
+                continue
+
+            if axis == "X":
+                # X-Z: screen right=+X, screen up=+Z.
+                u = p[:, 0]
+                v = p[:, 2]
+            elif axis == "Y":
+                # Y-Z: screen right=-Z, screen up=+Y.
+                u = -p[:, 2]
+                v = p[:, 1]
+            else:
+                raise ValueError(axis)
+
+            x = (u - u0) * ppu
+            y = (v1 - v) * ppu
+            projected.append(np.column_stack([x, y]))
+        return projected
+
+    def _lithic_section_panel_rgba(
+        self,
+        paths_3d: list[np.ndarray],
+        axis: str,
+        ppu: float,
+        width_px: int,
+        display_bbox: tuple[float, float, float, float],
+    ) -> tuple[np.ndarray, list[np.ndarray]]:
+        from PIL import Image, ImageDraw
+
+        u0, v0, u1, v1 = display_bbox
+        world_w = max(float(u1 - u0), 1e-12)
+        world_h = max(float(v1 - v0), 1e-12)
+        width = max(1, int(np.ceil(world_w * ppu)) + 1)
+        height = max(1, int(np.ceil(world_h * ppu)) + 1)
+        image = Image.new("RGBA", (width, height), (255, 255, 255, 0))
+        draw = ImageDraw.Draw(image)
+        projected = self._lithic_project_section_paths(
+            paths_3d, axis, ppu, display_bbox
+        )
+        self._draw_polyline_paths(draw, projected, width_px)
+        return np.asarray(image, dtype=np.uint8), projected
+
+    def _prepare_lithic_sections(
+        self,
+        section_geometry: dict[str, dict],
+        ppu: float,
+        width_px: int,
+    ) -> tuple[
+        dict[str, np.ndarray],
+        dict[str, list[np.ndarray]],
+    ]:
+        images: dict[str, np.ndarray] = {}
+        projected_paths: dict[str, list[np.ndarray]] = {}
+
+        for key, item in section_geometry.items():
+            paths3d = item.get("paths_3d") or []
+            display_bbox = item.get("display_bbox")
+            section = item.get("section")
+            if not paths3d or display_bbox is None or section is None:
+                continue
+            image, projected = self._lithic_section_panel_rgba(
+                paths3d,
+                section["axis"],
+                ppu,
+                width_px,
+                display_bbox,
+            )
+            images[key] = image
+            projected_paths[key] = projected
+
+        return images, projected_paths
+
+    @staticmethod
+    def _draw_lithic_section_ticks(
+        canvas,
+        main_rects: dict[str, tuple[float, float, float, float]],
+        views: list[str],
+        sections: list[dict],
+        ppu: float,
+        spacing_model: float,
+        margin_px: int,
+        min_x: float,
+        max_y: float,
+    ) -> None:
+        """Draw section-position ticks with the pottery tick specification.
+
+        For view spacing S:
+            model-edge gap = S/4
+            tick length    = S/2
+            remaining gap  = S/4
+        Stroke width is fixed at 5 px.
+
+        Y section (x=constant; Y-Z section):
+            vertical ticks above and below Front/Back.
+
+        X section (y=constant; X-Z section):
+            horizontal ticks left and right of Front/Back/Left/Right.
+        """
+        from PIL import ImageDraw
+
+        if spacing_model <= 0:
+            return
+
+        draw = ImageDraw.Draw(canvas)
+        gap = float(spacing_model) / 4.0
+        length = float(spacing_model) / 2.0
+        width_px = 5
+
+        def px_x(x_model: float) -> int:
+            return int(round(
+                margin_px + (x_model - min_x) * ppu
+            ))
+
+        def px_y(y_model: float) -> int:
+            return int(round(
+                margin_px + (max_y - y_model) * ppu
+            ))
+
+        for section in sections:
+            axis = str(section.get("axis", "")).upper()
+            pos = float(section.get("position", 0.5))
+            pos = max(0.0, min(1.0, pos))
+
+            if axis == "Y":
+                # Y-section is x=constant.  Mark the same section position
+                # on Front and Back. Back is horizontally mirrored.
+                for view in ("front", "back"):
+                    if view not in views or view not in main_rects:
+                        continue
+                    x0, y0, x1, y1 = main_rects[view]
+                    frac = pos if view == "front" else (1.0 - pos)
+                    x = x0 + frac * (x1 - x0)
+
+                    # Upper tick.
+                    draw.line(
+                        [
+                            (px_x(x), px_y(y1 + gap)),
+                            (px_x(x), px_y(y1 + gap + length)),
+                        ],
+                        fill="black",
+                        width=width_px,
+                    )
+                    # Lower tick.
+                    draw.line(
+                        [
+                            (px_x(x), px_y(y0 - gap)),
+                            (px_x(x), px_y(y0 - gap - length)),
+                        ],
+                        fill="black",
+                        width=width_px,
+                    )
+
+            elif axis == "X":
+                # X-section is y=constant.  Mark it on all selected views
+                # whose vertical display axis is Y.
+                for view in ("front", "back", "left", "right"):
+                    if view not in views or view not in main_rects:
+                        continue
+                    x0, y0, x1, y1 = main_rects[view]
+                    y = y0 + pos * (y1 - y0)
+
+                    # Left tick.
+                    draw.line(
+                        [
+                            (px_x(x0 - gap), px_y(y)),
+                            (px_x(x0 - gap - length), px_y(y)),
+                        ],
+                        fill="black",
+                        width=width_px,
+                    )
+                    # Right tick.
+                    draw.line(
+                        [
+                            (px_x(x1 + gap), px_y(y)),
+                            (px_x(x1 + gap + length), px_y(y)),
+                        ],
+                        fill="black",
+                        width=width_px,
+                    )
+
+    def _compose_lithic_mode(
+        self,
+        rendered: dict[str, np.ndarray],
+        views: list[str],
+        main_rects: dict[str, tuple[float, float, float, float]],
+        section_images: dict[str, np.ndarray],
+        section_rects: dict[str, tuple[float, float, float, float]],
+        ppu: float,
+        scale_bar_mm: float,
+        spacing_model: float,
+        outlines: dict[str, list[np.ndarray]] | None = None,
+        outline_width_px: int = OUTLINE_PNG_WIDTH_PX,
+    ):
+        from PIL import Image
+
+        metrics = self._lithic_canvas_metrics(
+            views,
+            main_rects,
+            {
+                key: section_rects[key]
+                for key in section_images
+                if key in section_rects
+            },
+            ppu,
+            scale_bar_mm,
+            spacing_model,
+        )
+        min_x = metrics["min_x"]
+        min_y = metrics["min_y"]
+        max_x = metrics["max_x"]
+        max_y = metrics["max_y"]
+        margin = metrics["margin_px"]
+        canvas_w = metrics["canvas_w_px"]
+        canvas_h = metrics["canvas_h_px"]
+        self._validate_png_dimensions(
+            canvas_w, canvas_h, scale_bar_mm
+        )
+        canvas = Image.new(
+            "RGBA",
+            (canvas_w, canvas_h),
+            (255, 255, 255, 255),
+        )
+
+        panel_px: dict[str, tuple[float, float, float, float]] = {}
+
+        for view in views:
+            x0, _y0, x1, y1 = main_rects[view]
+            px = margin + int(round((x0 - min_x) * ppu))
+            py = margin + int(round((max_y - y1) * ppu))
+            self._paste_rgba(canvas, rendered[view], (px, py))
+            arr = np.asarray(rendered[view])
+            h, w = arr.shape[:2]
+            panel_px[view] = (px, py, px + w, py + h)
+            if outlines is not None:
+                self._draw_outline_paths(
+                    canvas,
+                    outlines.get(view, []),
+                    offset=(px, py),
+                    width_px=outline_width_px,
+                )
+
+        for key, image in section_images.items():
+            if key not in section_rects:
+                continue
+            x0, _y0, _x1, y1 = section_rects[key]
+            px = margin + int(round((x0 - min_x) * ppu))
+            py = margin + int(round((max_y - y1) * ppu))
+            self._paste_rgba(canvas, image, (px, py))
+            arr = np.asarray(image)
+            h, w = arr.shape[:2]
+            panel_px[key] = (px, py, px + w, py + h)
+
+        self._draw_lithic_section_ticks(
+            canvas,
+            main_rects,
+            views,
+            self.lithic_sections,
+            ppu,
+            spacing_model,
+            margin,
+            min_x,
+            max_y,
+        )
+
+        self._draw_scale_bar(
+            canvas,
+            ppu,
+            scale_bar_mm,
+            margin,
+            canvas_h - 34,
+        )
+        return canvas, panel_px
+
+    def _write_lithic_section_svg(
+        self,
+        path: Path,
+        section: dict,
+        paths: list[np.ndarray],
+        display_bbox: tuple[float, float, float, float],
+        ppu: float,
+    ):
+        u0, v0, u1, v1 = display_bbox
+        world_w = float(u1 - u0)
+        world_h = float(v1 - v0)
+
+        unit_to_mm = float(self.asset.unit_to_mm)
+        width_mm = world_w * unit_to_mm
+        height_mm = world_h * unit_to_mm
+        pixel_to_mm = unit_to_mm / float(ppu)
+        body = []
+        for contour in paths:
+            d = self._svg_path_d(contour, pixel_to_mm)
+            if d:
+                body.append(
+                    f'  <path d="{d}" fill="none" stroke="black" '
+                    f'stroke-width="{OUTLINE_SVG_STROKE_MM:g}" '
+                    f'stroke-linejoin="round" stroke-linecap="round"/>'
+                )
+        svg = [
+            '<?xml version="1.0" encoding="UTF-8"?>',
+            f'<svg xmlns="http://www.w3.org/2000/svg" '
+            f'viewBox="0 0 {width_mm:.9g} {height_mm:.9g}" '
+            f'preserveAspectRatio="xMidYMid meet" '
+            f'data-coordinate-unit="mm">',
+            f'  <metadata>Lithic section {section["id"]}; '
+            f'coordinates are millimetres.</metadata>',
+            *body,
+            '</svg>',
+            '',
+        ]
+        path.write_text("\n".join(svg), encoding="utf-8")
+
+    def _build_lithic_output_layout_context(
+        self,
+        views: list[str],
+        spacing_mm: float,
+    ) -> dict:
+        """Build the exact reusable geometry/layout context for export."""
+        if not self.asset or self.lithic_confirmed_final_matrix is None:
+            raise RuntimeError("石器姿勢が未決定です。")
+        poly = self._make_polydata(self.lithic_confirmed_final_matrix)
+        bounds = np.asarray(poly.bounds, dtype=float)
+        spacing_model = float(spacing_mm) / float(self.asset.unit_to_mm)
+        section_geometry = self._build_lithic_section_geometry(
+            poly, bounds, self.lithic_sections
+        )
+        main_rects, section_rects = self._lithic_layout_rects(
+            bounds,
+            spacing_model,
+            views,
+            self.lithic_sections,
+            section_geometry,
+        )
+        all_rects = [main_rects[v] for v in views] + list(
+            section_rects.values()
+        )
+        sheet_w = max(r[2] for r in all_rects) - min(r[0] for r in all_rects)
+        sheet_h = max(r[3] for r in all_rects) - min(r[1] for r in all_rects)
+        return {
+            "poly": poly,
+            "bounds": bounds,
+            "spacing_model": float(spacing_model),
+            "section_geometry": section_geometry,
+            "main_rects": main_rects,
+            "section_rects": section_rects,
+            "sheet_w": float(sheet_w),
+            "sheet_h": float(sheet_h),
+        }
+
+    @staticmethod
+    def _save_png_image(image, path: Path, dpi: float | None = None) -> None:
+        kwargs = {"format": "PNG"}
+        if dpi is not None:
+            kwargs["dpi"] = (float(dpi), float(dpi))
+        image.convert("RGB").save(path, **kwargs)
+
+    def export_lithic_orthos(
+        self,
+        out_dir: Path,
+        views: list[str],
+        modes: list[str],
+        spacing_mm: float,
+        scale_bar_mm: float,
+        outline_width_px: int,
+        individual: bool,
+        export_png_plain: bool = True,
+        export_svg: bool = False,
+        export_png_outline: bool = False,
+        progress_callback=None,
+        pixels_per_model_unit: float | None = None,
+        png_dpi: float | None = None,
+        layout_context: dict | None = None,
+    ) -> list[Path]:
+        if not self.lithic_pose_confirmed:
+            raise RuntimeError("石器姿勢が未決定です。")
+        if self.lithic_confirmed_final_matrix is None:
+            raise RuntimeError("石器最終変換行列がありません。")
+
+        out_dir.mkdir(parents=True, exist_ok=True)
+        context = (
+            layout_context
+            if layout_context is not None
+            else self._build_lithic_output_layout_context(views, spacing_mm)
+        )
+        poly = context["poly"]
+        bounds = np.asarray(context["bounds"], dtype=float)
+        spacing_model = float(context["spacing_model"])
+        section_geometry = context["section_geometry"]
+        main_rects = context["main_rects"]
+        section_rects = context["section_rects"]
+        sheet_w = float(context["sheet_w"])
+        sheet_h = float(context["sheet_h"])
+        if pixels_per_model_unit is None:
+            ppu = ORTHO_COMPOSITE_LONG_EDGE_PX / max(
+                sheet_w, sheet_h, 1e-9
+            )
+        else:
+            ppu = float(pixels_per_model_unit)
+        if not math.isfinite(ppu) or ppu <= 0.0:
+            raise RuntimeError("画像解像度 (pixels/model-unit) が不正です。")
+
+        need_png = bool(export_png_plain or export_png_outline)
+        need_outline = bool(export_svg or export_png_outline)
+        written: list[Path] = []
+        stem = self.asset.source_path.stem
+
+        total_renders = (
+            (len(views) if need_outline else 0)
+            + (len(views) * len(modes) if need_png else 0)
+        )
+        total_renders = max(total_renders, 1)
+        completed = 0
+
+        outlines: dict[str, list[np.ndarray]] = {}
+        if need_outline:
+            masks = self._render_lithic_views_for_mode(
+                poly,
+                bounds,
+                views,
+                "outline_mask",
+                ppu,
+                progress_callback=progress_callback,
+                progress_base=completed,
+                progress_total=total_renders,
+            )
+            completed += len(views)
+            for view in views:
+                outlines[view] = self._outline_paths_from_rgba(masks[view])
+            del masks
+
+        section_images, section_paths = self._prepare_lithic_sections(
+            section_geometry,
+            ppu,
+            outline_width_px,
+        )
+
+        if export_svg:
+            svg_paths: dict[str, list[np.ndarray]] = {
+                view: outlines.get(view, [])
+                for view in views
+            }
+            svg_rects = dict(main_rects)
+            svg_keys = list(views)
+            for key, paths in section_paths.items():
+                svg_paths[key] = paths
+                svg_rects[key] = section_rects[key]
+                svg_keys.append(key)
+
+            svg_path = out_dir / f"{stem}_ortho_outline.svg"
+            self._write_composite_outline_svg(
+                svg_path,
+                svg_paths,
+                svg_keys,
+                svg_rects,
+                ppu,
+            )
+            written.append(svg_path)
+
+            if individual:
+                for view in views:
+                    p = out_dir / f"{stem}_{view}_outline.svg"
+                    # Lithic individual view dimensions differ from pottery.
+                    world_w, world_h = self._lithic_view_size(bounds, view)
+                    unit_to_mm = float(self.asset.unit_to_mm)
+                    pixel_to_mm = unit_to_mm / float(ppu)
+                    body = []
+                    for contour in outlines.get(view, []):
+                        d = self._svg_path_d(contour, pixel_to_mm)
+                        if d:
+                            body.append(
+                                f'  <path d="{d}" fill="none" stroke="black" '
+                                f'stroke-width="{OUTLINE_SVG_STROKE_MM:g}" '
+                                f'stroke-linejoin="round" stroke-linecap="round"/>'
+                            )
+                    svg = [
+                        '<?xml version="1.0" encoding="UTF-8"?>',
+                        f'<svg xmlns="http://www.w3.org/2000/svg" '
+                        f'viewBox="0 0 {world_w * unit_to_mm:.9g} '
+                        f'{world_h * unit_to_mm:.9g}" '
+                        f'preserveAspectRatio="xMidYMid meet" '
+                        f'data-coordinate-unit="mm">',
+                        *body,
+                        '</svg>',
+                        '',
+                    ]
+                    p.write_text("\n".join(svg), encoding="utf-8")
+                    written.append(p)
+
+                x_sections, y_sections = self._ordered_lithic_sections_for_output(
+                    self.lithic_sections
+                )
+                for section in [*x_sections, *y_sections]:
+                    key = f'section_{section["id"]}'
+                    if key not in section_paths:
+                        continue
+                    p = out_dir / f'{stem}_section_{section["id"]}.svg'
+                    display_bbox = section_geometry[key]["display_bbox"]
+                    self._write_lithic_section_svg(
+                        p,
+                        section,
+                        section_paths[key],
+                        display_bbox,
+                        ppu,
+                    )
+                    written.append(p)
+
+        if need_png:
+            for mode in modes:
+                rendered = self._render_lithic_views_for_mode(
+                    poly,
+                    bounds,
+                    views,
+                    mode,
+                    ppu,
+                    progress_callback=progress_callback,
+                    progress_base=completed,
+                    progress_total=total_renders,
+                )
+                completed += len(views)
+
+                if export_png_plain:
+                    canvas, _ = self._compose_lithic_mode(
+                        rendered,
+                        views,
+                        main_rects,
+                        section_images,
+                        section_rects,
+                        ppu,
+                        scale_bar_mm,
+                        spacing_model,
+                        outlines=None,
+                        outline_width_px=outline_width_px,
+                    )
+                    p = out_dir / f"{stem}_ortho_{mode}.png"
+                    self._save_png_image(canvas, p, dpi=png_dpi)
+                    written.append(p)
+
+                if export_png_outline:
+                    canvas, _ = self._compose_lithic_mode(
+                        rendered,
+                        views,
+                        main_rects,
+                        section_images,
+                        section_rects,
+                        ppu,
+                        scale_bar_mm,
+                        spacing_model,
+                        outlines=outlines,
+                        outline_width_px=outline_width_px,
+                    )
+                    p = out_dir / f"{stem}_ortho_{mode}_outline.png"
+                    self._save_png_image(canvas, p, dpi=png_dpi)
+                    written.append(p)
+
+                if individual:
+                    for view in views:
+                        if export_png_plain:
+                            p = out_dir / f"{stem}_{view}_{mode}.png"
+                            self._save_individual_view(
+                                rendered[view],
+                                ppu,
+                                p,
+                                scale_bar_mm,
+                                png_dpi=png_dpi,
+                            )
+                            written.append(p)
+                        if export_png_outline:
+                            p = out_dir / f"{stem}_{view}_{mode}_outline.png"
+                            self._save_individual_view(
+                                rendered[view],
+                                ppu,
+                                p,
+                                scale_bar_mm,
+                                outline_paths=outlines.get(view),
+                                outline_width_px=outline_width_px,
+                                png_dpi=png_dpi,
+                            )
+                            written.append(p)
+
+                    # Sections are geometry-only and do not vary by appearance;
+                    # output them once, on the first selected mode.
+                    if mode == modes[0]:
+                        x_sections, y_sections = self._ordered_lithic_sections_for_output(
+                            self.lithic_sections
+                        )
+                        for section in [*x_sections, *y_sections]:
+                            key = f'section_{section["id"]}'
+                            if key not in section_images:
+                                continue
+                            p = out_dir / f'{stem}_section_{section["id"]}.png'
+                            self._save_individual_view(
+                                section_images[key],
+                                ppu,
+                                p,
+                                scale_bar_mm,
+                                png_dpi=png_dpi,
+                            )
+                            written.append(p)
+
+                del rendered
+
+        if progress_callback is not None:
+            progress_callback(1.0, "石器オルソ / 輪郭 / 断面生成完了")
+        return written
+
+    def _show_lithic_output_preview(self):
+        if not self._is_lithic() or not self.lithic_pose_confirmed:
+            QMessageBox.warning(
+                self, "姿勢未決定", "先に「姿勢決定」を押してください。"
+            )
+            return
+
+        views = self._selected_lithic_views()
+        modes = self._selected_lithic_modes()
+        if not views:
+            QMessageBox.warning(
+                self, "未選択", "少なくとも1つの出力面を選択してください。"
+            )
+            return
+        if not modes:
+            QMessageBox.warning(
+                self, "未選択", "少なくとも1つの表現を選択してください。"
+            )
+            return
+
+        # Interactive preview defaults to shade.  If the user disables
+        # shade in the output panel, use the first remaining selected mode.
+        preview_mode = "shade" if "shade" in modes else modes[0]
+        outlined = self.lithic_outline_overlay.isChecked()
+
+        try:
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            self.statusBar().showMessage("石器展開図プレビューを生成中…")
+            QApplication.processEvents()
+
+            if self._lithic_preview_temp_dir is not None:
+                try:
+                    shutil.rmtree(self._lithic_preview_temp_dir)
+                except Exception:
+                    pass
+            self._lithic_preview_temp_dir = Path(
+                tempfile.mkdtemp(prefix="lithic_ortho_preview_")
+            )
+
+            poly = self._make_polydata(
+                self.lithic_confirmed_final_matrix
+            )
+            bounds = np.asarray(poly.bounds, dtype=float)
+            spacing_model = (
+                float(self.lithic_view_spacing.value())
+                / float(self.asset.unit_to_mm)
+            )
+            section_geometry = self._build_lithic_section_geometry(
+                poly, bounds, self.lithic_sections
+            )
+            main_rects, section_rects = self._lithic_layout_rects(
+                bounds,
+                spacing_model,
+                views,
+                self.lithic_sections,
+                section_geometry,
+            )
+            all_rects = [main_rects[v] for v in views] + list(
+                section_rects.values()
+            )
+            sheet_w = (
+                max(r[2] for r in all_rects)
+                - min(r[0] for r in all_rects)
+            )
+            sheet_h = (
+                max(r[3] for r in all_rects)
+                - min(r[1] for r in all_rects)
+            )
+            ppu = ORTHO_COMPOSITE_LONG_EDGE_PX / max(
+                float(sheet_w), float(sheet_h), 1e-9
+            )
+
+            rendered = self._render_lithic_views_for_mode(
+                poly,
+                bounds,
+                views,
+                preview_mode,
+                ppu,
+            )
+
+            outlines = None
+            if outlined:
+                masks = self._render_lithic_views_for_mode(
+                    poly,
+                    bounds,
+                    views,
+                    "outline_mask",
+                    ppu,
+                )
+                outlines = {
+                    view: self._outline_paths_from_rgba(masks[view])
+                    for view in views
+                }
+
+            section_images, _section_paths = self._prepare_lithic_sections(
+                section_geometry,
+                ppu,
+                self._selected_lithic_outline_width_px(),
+            )
+
+            canvas, panel_px = self._compose_lithic_mode(
+                rendered,
+                views,
+                main_rects,
+                section_images,
+                section_rects,
+                ppu,
+                self._selected_lithic_scale_bar_mm(),
+                spacing_model,
+                outlines=outlines,
+                outline_width_px=self._selected_lithic_outline_width_px(),
+            )
+
+            preview_path = (
+                self._lithic_preview_temp_dir / "lithic_preview.png"
+            )
+            canvas.convert("RGB").save(preview_path, format="PNG")
+            preview_pixels = max(1, int(canvas.width) * int(canvas.height))
+            self.lithic_png_bpp_estimate = float(
+                preview_path.stat().st_size
+            ) / float(preview_pixels)
+            self._schedule_lithic_output_size_update()
+            self.lithic_preview_pixmap_path = preview_path
+            self.lithic_preview_panel_rects = panel_px
+
+            pixmap = QPixmap(str(preview_path))
+            if pixmap.isNull():
+                raise RuntimeError("プレビュー画像を読み込めませんでした。")
+
+            self.lithic_preview_scene.clear()
+            self.lithic_preview_line_items = {}
+            self.lithic_preview_scene.addPixmap(pixmap)
+            self.lithic_preview_scene.setSceneRect(
+                0.0, 0.0, float(pixmap.width()), float(pixmap.height())
+            )
+            self._rebuild_lithic_preview_lines()
+
+            self.lithic_preview_info.setText(
+                f"石器展開図 / {preview_mode} / "
+                f"青線=画面全体に連続する断面位置 / X断面={sum(s['axis']=='X' for s in self.lithic_sections)} "
+                f"/ Y断面={sum(s['axis']=='Y' for s in self.lithic_sections)}"
+            )
+            self.viewer_stack.setCurrentIndex(2)
+            self.lithic_preview_view._fit_on_next_resize = True
+            self.lithic_preview_view.fit_scene()
+            self._update_lithic_section_status()
+            self.statusBar().showMessage(
+                "石器展開図プレビュー。青線をドラッグし、"
+                "「プレビュー確認」で断面を再生成できます。"
+            )
+        except Exception as e:
+            self._show_error("石器プレビューエラー", e)
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    # ---------- Pottery cylindrical / fan development ----------
+    def _selected_pottery_curve_surfaces(self) -> list[str]:
+        surfaces: list[str] = []
+        if self.pottery_curve_surface_outer.isChecked():
+            surfaces.append("outer")
+        if self.pottery_curve_surface_inner.isChecked():
+            surfaces.append("inner")
+        if self.pottery_curve_surface_upper.isChecked():
+            surfaces.append("upper")
+        if not surfaces:
+            raise ValueError(
+                "曲面展開の出力面を1つ以上選択してください（外面 / 内面 / 上面）。"
+            )
+        return surfaces
+
+    @staticmethod
+    def _pottery_curve_surface_title(surface: str) -> str:
+        try:
+            return POTTERY_CURVE_SURFACE_LABELS[surface]
+        except KeyError as exc:
+            raise ValueError(f"Unknown pottery curve surface: {surface}") from exc
+
+    def _pottery_curve_render_mode(self) -> str:
+        text = self.pottery_curve_render_combo.currentText()
+        if text == "Normalのみ（シェード）":
+            return "shade"
+        if text == "テクスチャ / 頂点カラー + Normal":
+            return "texture_normal"
+        if not self.asset or self.asset.appearance_kind == "none":
+            return "shade"
+        return "texture"
+
+    def _pottery_curve_final_vertices(self) -> np.ndarray:
+        if not self.asset or not self.posture_done:
+            raise RuntimeError("土器姿勢が未決定です。")
+        return trimesh.transform_points(
+            np.asarray(self.asset.mesh.vertices, dtype=float),
+            self._current_final_matrix(),
+        )
+
+    def _pottery_horizontal_section_points(
+        self,
+        z_model: float,
+        face_chunk_size: int = 200_000,
+    ) -> np.ndarray:
+        """Exact triangle-plane intersections for z=constant in normalized Z-up."""
+        if not self.asset:
+            raise RuntimeError("モデルが読み込まれていません。")
+        vertices = self._pottery_curve_final_vertices()
+        faces = np.asarray(self.asset.mesh.faces, dtype=np.int64)
+        if len(vertices) == 0 or len(faces) == 0:
+            raise RuntimeError("水平断面を計算できるメッシュがありません。")
+
+        z_span = float(np.ptp(vertices[:, 2]))
+        eps = max(z_span * 1.0e-12, 1.0e-12)
+        intersections: list[np.ndarray] = []
+        edges = ((0, 1), (1, 2), (2, 0))
+        chunk = max(10_000, int(face_chunk_size))
+
+        for start in range(0, len(faces), chunk):
+            tri = vertices[faces[start:start + chunk]]
+            for a, b in edges:
+                p0 = tri[:, a, :]
+                p1 = tri[:, b, :]
+                d0 = p0[:, 2] - float(z_model)
+                d1 = p1[:, 2] - float(z_model)
+                denom = d0 - d1
+                crosses = (
+                    (((d0 <= eps) & (d1 >= -eps)) |
+                     ((d1 <= eps) & (d0 >= -eps))) &
+                    (np.abs(denom) > eps)
+                )
+                if np.any(crosses):
+                    tt = d0[crosses] / denom[crosses]
+                    pts = p0[crosses] + tt[:, None] * (
+                        p1[crosses] - p0[crosses]
+                    )
+                    pts[:, 2] = float(z_model)
+                    intersections.append(pts)
+
+        if not intersections:
+            # Endpoint sections can coincide with only one or a few vertices.
+            # Use a narrow vertex band as a fallback for rim/base endpoints.
+            band = max(z_span * 0.0025, 1.0e-8)
+            near = vertices[np.abs(vertices[:, 2] - float(z_model)) <= band]
+            if len(near) < 4:
+                raise RuntimeError(
+                    f"Z={z_model:.6g} で有効な水平断面を取得できません。"
+                )
+            return near
+
+        points = np.vstack(intersections)
+        finite = np.isfinite(points).all(axis=1)
+        points = points[finite]
+        if len(points) < 4:
+            raise RuntimeError("水平断面点が不足しています。")
+        return points
+
+    def _pottery_outer_diameter_at_z_mm(self, z_mm: float) -> float:
+        if not self.asset:
+            raise RuntimeError("モデルが読み込まれていません。")
+        scale = float(self.asset.unit_to_mm)
+        z_model = float(z_mm) / max(scale, 1.0e-12)
+        points = self._pottery_horizontal_section_points(z_model)
+        radii = np.hypot(points[:, 0], points[:, 1])
+        radii = radii[np.isfinite(radii)]
+        if len(radii) < 4:
+            raise RuntimeError("外径を計算できません。")
+        # A robust outer envelope suppresses isolated scan spikes while still
+        # following the outer vessel surface rather than the inner wall.
+        radius = float(np.quantile(radii, 0.995))
+        return 2.0 * radius * scale
+
+    def _pottery_curve_z_range_mm(self) -> tuple[float, float]:
+        if not self.asset or not self.posture_done:
+            raise RuntimeError("姿勢決定後にZ範囲を取得できます。")
+        vertices = self._pottery_curve_final_vertices()
+        scale = float(self.asset.unit_to_mm)
+        zmin_mm = float(np.min(vertices[:, 2]) * scale)
+        zmax_mm = float(np.max(vertices[:, 2]) * scale)
+        if not math.isfinite(zmin_mm + zmax_mm) or zmax_mm <= zmin_mm:
+            raise RuntimeError("土器のZ範囲を取得できません。")
+        return zmin_mm, zmax_mm
+
+    def _set_pottery_curve_z_cursor(self, z_mm: float, refresh: bool = True):
+        if not hasattr(self, "pottery_curve_z_cursor_spin"):
+            return
+        try:
+            zmin, zmax = self._pottery_curve_z_range_mm()
+        except Exception:
+            return
+        z = float(max(zmin, min(zmax, float(z_mm))))
+        frac = (z - zmin) / max(zmax - zmin, 1.0e-12)
+        self._setting_pottery_z_cursor = True
+        try:
+            self.pottery_curve_z_cursor_spin.setRange(zmin, zmax)
+            self.pottery_curve_z_cursor_spin.setValue(z)
+            self.pottery_curve_z_slider.setValue(int(round(frac * 10000.0)))
+        finally:
+            self._setting_pottery_z_cursor = False
+        if refresh:
+            self._refresh_pottery_curve_z_guides()
+
+    def _pottery_curve_z_cursor_spin_changed(self, value: float):
+        if self._setting_pottery_z_cursor:
+            return
+        self._set_pottery_curve_z_cursor(float(value), refresh=True)
+
+    def _pottery_curve_z_slider_changed(self, value: int):
+        if self._setting_pottery_z_cursor:
+            return
+        try:
+            zmin, zmax = self._pottery_curve_z_range_mm()
+        except Exception:
+            return
+        frac = max(0.0, min(1.0, float(value) / 10000.0))
+        self._set_pottery_curve_z_cursor(
+            zmin + frac * (zmax - zmin), refresh=True
+        )
+
+    def _start_pottery_curve_z_pick(self):
+        if not self.asset or not self.posture_done or self._is_lithic():
+            return
+        self.pottery_curve_z_pick_mode = True
+        self._pottery_curve_z_click_consuming = False
+        try:
+            self._vtk_widget.setCursor(Qt.CursorShape.CrossCursor)
+        except Exception:
+            pass
+        self.statusBar().showMessage(
+            "土器表面をクリックしてください。クリックはZ位置指定専用となり、"
+            "この間はモデル/カメラを回転しません。"
+        )
+
+    def _pick_pottery_curve_z_from_view_event(self, watched, event) -> bool:
+        """Pick one Z position while consuming the Qt mouse event.
+
+        PyVista's normal left-click surface picking shares the same VTK event
+        stream as TrackballCamera rotation.  If picking is disabled inside the
+        press callback, the interactor can remain in a rotate state until a
+        later release/move.  This custom picker consumes the complete click
+        sequence at the Qt layer, so the click is used only for Z selection.
+        """
+        if not self.asset or not self.pottery_curve_z_pick_mode:
+            return False
+        try:
+            from vtkmodules.vtkRenderingCore import vtkCellPicker, vtkPointPicker
+
+            pos = event.position().toPoint()
+            if watched is not self._vtk_widget:
+                global_pos = watched.mapToGlobal(pos)
+                pos = self._vtk_widget.mapFromGlobal(global_pos)
+
+            x = float(pos.x())
+            y = float(self._vtk_widget.height() - 1 - pos.y())
+            renderer = self.plotter.renderer
+
+            picker = vtkCellPicker()
+            picker.SetTolerance(0.0025)
+            ok = bool(picker.Pick(x, y, 0.0, renderer))
+            point = np.asarray(picker.GetPickPosition(), dtype=float)
+
+            # Large-model preview is a point cloud and may not expose polygon
+            # cells. Fall back to a point picker in that case.
+            if not ok or point.shape != (3,) or not np.isfinite(point).all():
+                pp = vtkPointPicker()
+                pp.SetTolerance(0.01)
+                ok = bool(pp.Pick(x, y, 0.0, renderer))
+                point = np.asarray(pp.GetPickPosition(), dtype=float)
+
+            if not ok or point.shape != (3,) or not np.isfinite(point).all():
+                self.statusBar().showMessage(
+                    "モデル表面/点を取得できませんでした。もう一度クリックしてください。"
+                )
+                return True
+
+            self._pottery_curve_picked_z(point)
+            return True
+        except Exception as exc:
+            self.statusBar().showMessage(f"Z位置クリック取得エラー: {exc}")
+            return True
+
+    def _pottery_curve_picked_z(self, point):
+        if not self.pottery_curve_z_pick_mode or not self.asset:
+            return
+        p = np.asarray(point, dtype=float)
+        if p.shape != (3,) or not np.isfinite(p).all():
+            return
+        self.pottery_curve_z_pick_mode = False
+        try:
+            self._vtk_widget.unsetCursor()
+        except Exception:
+            pass
+        self._set_pottery_curve_z_cursor(
+            float(p[2]) * float(self.asset.unit_to_mm),
+            refresh=True,
+        )
+        self.statusBar().showMessage(
+            f"Z = {self.pottery_curve_z_cursor_spin.value():.3f} mm を選択しました。"
+        )
+
+    def _pottery_curve_breakpoint_zs_mm(self) -> list[float]:
+        branch = self._pottery_output_branch_key()
+        if branch == "cylindrical":
+            return list(self.pottery_cylinder_breakpoints_mm)
+        if branch == "fan":
+            try:
+                return [z for z, _d in self._pottery_fan_profile_mm()]
+            except Exception:
+                return []
+        return []
+
+    def _refresh_pottery_curve_z_guides(self):
+        if not hasattr(self, "plotter"):
+            return
+        try:
+            # Remove only our named guide actors; refresh_view may already have
+            # cleared the renderer, so failures are harmless.
+            self.plotter.remove_actor("pottery_curve_z_cursor", render=False)
+            for i in range(128):
+                self.plotter.remove_actor(
+                    f"pottery_curve_z_break_{i}", render=False
+                )
+        except Exception:
+            pass
+        if (
+            not self.asset
+            or not self.posture_done
+            or self._is_lithic()
+            or self._pottery_output_branch_key() == "ortho"
+        ):
+            try:
+                self.plotter.render()
+            except Exception:
+                pass
+            return
+        try:
+            vertices = self._pottery_curve_final_vertices()
+            scale = float(self.asset.unit_to_mm)
+            xmin = float(np.min(vertices[:, 0]))
+            xmax = float(np.max(vertices[:, 0]))
+            ymin = float(np.min(vertices[:, 1]))
+            ymax = float(np.max(vertices[:, 1]))
+            y = 0.5 * (ymin + ymax)
+            span = max(xmax - xmin, ymax - ymin, 1.0e-9)
+            xmin -= span * 0.04
+            xmax += span * 0.04
+
+            for i, zmm in enumerate(self._pottery_curve_breakpoint_zs_mm()):
+                z = float(zmm) / scale
+                self.plotter.add_mesh(
+                    pv.Line((xmin, y, z), (xmax, y, z)),
+                    color="dodgerblue",
+                    line_width=3.0,
+                    lighting=False,
+                    name=f"pottery_curve_z_break_{i}",
+                    render=False,
+                )
+
+            zcursor = float(self.pottery_curve_z_cursor_spin.value()) / scale
+            self.plotter.add_mesh(
+                pv.Line((xmin, y, zcursor), (xmax, y, zcursor)),
+                color="red",
+                line_width=5.0,
+                lighting=False,
+                name="pottery_curve_z_cursor",
+                render=False,
+            )
+            self.plotter.render()
+        except Exception as e:
+            self.statusBar().showMessage(f"Z区分線表示エラー: {e}")
+
+    @staticmethod
+    def _readonly_table_item(text: str) -> QTableWidgetItem:
+        item = QTableWidgetItem(text)
+        item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        return item
+
+    def _initialize_pottery_curve_controls(self):
+        if not self.asset or not self.posture_done or self._is_lithic():
+            return
+        vertices = self._pottery_curve_final_vertices()
+        scale = float(self.asset.unit_to_mm)
+        zmin_mm = float(np.min(vertices[:, 2]) * scale)
+        zmax_mm = float(np.max(vertices[:, 2]) * scale)
+        if zmax_mm <= zmin_mm:
+            return
+
+        self._setting_pottery_curve_controls = True
+        try:
+            self.pottery_curve_z_cursor_spin.setRange(zmin_mm, zmax_mm)
+            self.pottery_cylinder_breakpoints_mm = [zmin_mm, zmax_mm]
+            self._set_pottery_curve_z_cursor(
+                0.5 * (zmin_mm + zmax_mm), refresh=False
+            )
+
+            self.pottery_fan_table.setRowCount(0)
+            for zmm in (zmin_mm, zmax_mm):
+                try:
+                    dmm = self._pottery_outer_diameter_at_z_mm(zmm)
+                except Exception:
+                    nudge = max((zmax_mm - zmin_mm) * 0.005, 1.0e-6)
+                    probe = zmm + nudge if zmm == zmin_mm else zmm - nudge
+                    dmm = self._pottery_outer_diameter_at_z_mm(probe)
+                self._append_pottery_fan_row(zmm, dmm)
+        finally:
+            self._setting_pottery_curve_controls = False
+
+        self._rebuild_pottery_cylinder_tables(preserve=False)
+        self._pottery_output_branch_changed()
+        self._pottery_curve_output_setting_changed()
+        self._refresh_pottery_curve_z_guides()
+
+    def _append_pottery_fan_row(self, z_mm: float, d_mm: float):
+        row = self.pottery_fan_table.rowCount()
+        self.pottery_fan_table.insertRow(row)
+        self.pottery_fan_table.setItem(
+            row, 0, QTableWidgetItem(f"{float(z_mm):.6f}")
+        )
+        self.pottery_fan_table.setItem(
+            row, 1, QTableWidgetItem(f"{float(d_mm):.6f}")
+        )
+
+    def _cylinder_existing_segment_data(self) -> dict[tuple[float, float], tuple[float, float]]:
+        data: dict[tuple[float, float], tuple[float, float]] = {}
+        if not hasattr(self, "pottery_cylinder_segment_table"):
+            return data
+        for row in range(self.pottery_cylinder_segment_table.rowCount()):
+            items = [self.pottery_cylinder_segment_table.item(row, c) for c in range(4)]
+            if any(item is None for item in items):
+                continue
+            try:
+                z0, z1, ref, dia = [float(item.text()) for item in items]
+            except Exception:
+                continue
+            data[(round(z0, 6), round(z1, 6))] = (ref, dia)
+        return data
+
+    def _rebuild_pottery_cylinder_tables(self, preserve: bool = True):
+        if not self.asset or not self.posture_done:
+            return
+        old = self._cylinder_existing_segment_data() if preserve else {}
+        points = sorted(float(z) for z in self.pottery_cylinder_breakpoints_mm)
+        self.pottery_cylinder_breakpoints_mm = points
+
+        self._setting_pottery_curve_controls = True
+        try:
+            self.pottery_cylinder_break_table.setRowCount(0)
+            for z in points:
+                row = self.pottery_cylinder_break_table.rowCount()
+                self.pottery_cylinder_break_table.insertRow(row)
+                self.pottery_cylinder_break_table.setItem(
+                    row, 0, self._readonly_table_item(f"{z:.6f}")
+                )
+
+            self.pottery_cylinder_segment_table.setRowCount(0)
+            for z0, z1 in zip(points[:-1], points[1:]):
+                row = self.pottery_cylinder_segment_table.rowCount()
+                self.pottery_cylinder_segment_table.insertRow(row)
+                key = (round(z0, 6), round(z1, 6))
+                if key in old:
+                    ref, dia = old[key]
+                    if not (z0 <= ref <= z1):
+                        ref = 0.5 * (z0 + z1)
+                        dia = self._pottery_outer_diameter_at_z_mm(ref)
+                else:
+                    ref = 0.5 * (z0 + z1)
+                    try:
+                        dia = self._pottery_outer_diameter_at_z_mm(ref)
+                    except Exception:
+                        vertices = self._pottery_curve_final_vertices()
+                        radii = np.hypot(vertices[:, 0], vertices[:, 1])
+                        dia = 2.0 * float(np.quantile(radii, 0.995)) * float(
+                            self.asset.unit_to_mm
+                        )
+                self.pottery_cylinder_segment_table.setItem(
+                    row, 0, self._readonly_table_item(f"{z0:.6f}")
+                )
+                self.pottery_cylinder_segment_table.setItem(
+                    row, 1, self._readonly_table_item(f"{z1:.6f}")
+                )
+                self.pottery_cylinder_segment_table.setItem(
+                    row, 2, QTableWidgetItem(f"{ref:.6f}")
+                )
+                self.pottery_cylinder_segment_table.setItem(
+                    row, 3, QTableWidgetItem(f"{dia:.6f}")
+                )
+        finally:
+            self._setting_pottery_curve_controls = False
+        self._schedule_pottery_curve_size_update()
+        self._refresh_pottery_curve_z_guides()
+
+    def _pottery_cylinder_segments_mm(self) -> list[dict]:
+        segments: list[dict] = []
+        table = self.pottery_cylinder_segment_table
+        for row in range(table.rowCount()):
+            vals = []
+            for col in range(4):
+                item = table.item(row, col)
+                if item is None:
+                    raise ValueError("円筒区間表に未入力セルがあります。")
+                try:
+                    vals.append(float(item.text()))
+                except ValueError as e:
+                    raise ValueError("円筒区間のZ / 外径には数値を入力してください。") from e
+            z0, z1, ref, dia = vals
+            if z1 <= z0:
+                raise ValueError("円筒区間のZ上端はZ下端より大きくしてください。")
+            if ref < z0 - 1.0e-9 or ref > z1 + 1.0e-9:
+                raise ValueError("円筒区間の基準Zはその区間内に指定してください。")
+            if dia <= 0 or not math.isfinite(dia):
+                raise ValueError("円筒区間の外径は正の有限値にしてください。")
+            segments.append({
+                "z0_mm": z0,
+                "z1_mm": z1,
+                "reference_z_mm": ref,
+                "diameter_mm": dia,
+            })
+        if not segments:
+            raise ValueError("円筒展開には1区間以上が必要です。")
+        return segments
+
+    def _pottery_add_cylinder_breakpoint(self):
+        try:
+            z = float(self.pottery_curve_z_cursor_spin.value())
+            points = sorted(self.pottery_cylinder_breakpoints_mm)
+            if len(points) < 2:
+                raise RuntimeError("円筒区分の端点がありません。")
+            tol = max((points[-1] - points[0]) * 1.0e-8, 1.0e-6)
+            if z <= points[0] + tol or z >= points[-1] - tol:
+                raise ValueError("底部・口縁の端点以外のZを指定してください。")
+            if any(abs(z - p) <= tol for p in points):
+                raise ValueError("同じZの区分点がすでにあります。")
+            self.pottery_cylinder_breakpoints_mm.append(z)
+            self._rebuild_pottery_cylinder_tables(preserve=True)
+        except Exception as e:
+            self._show_error("円筒区分点追加エラー", e)
+
+    def _pottery_delete_cylinder_breakpoint(self):
+        row = self.pottery_cylinder_break_table.currentRow()
+        count = self.pottery_cylinder_break_table.rowCount()
+        if row < 0:
+            QMessageBox.information(self, "区分点未選択", "削除する区分点を選択してください。")
+            return
+        if row in (0, count - 1):
+            QMessageBox.information(self, "端点は保持", "底部・口縁の端点は削除できません。")
+            return
+        del self.pottery_cylinder_breakpoints_mm[row]
+        self._rebuild_pottery_cylinder_tables(preserve=True)
+
+    def _pottery_cylinder_segment_table_changed(self, item=None, *_args):
+        if self._setting_pottery_curve_controls:
+            return
+        if item is not None and getattr(item, "column", lambda: -1)() == 2:
+            try:
+                row = int(item.row())
+                z0 = float(self.pottery_cylinder_segment_table.item(row, 0).text())
+                z1 = float(self.pottery_cylinder_segment_table.item(row, 1).text())
+                ref = float(item.text())
+                if not (z0 <= ref <= z1):
+                    raise ValueError("基準Zは円筒区間内に指定してください。")
+                dia = self._pottery_outer_diameter_at_z_mm(ref)
+                self._setting_pottery_curve_controls = True
+                try:
+                    self.pottery_cylinder_segment_table.item(row, 3).setText(
+                        f"{dia:.6f}"
+                    )
+                finally:
+                    self._setting_pottery_curve_controls = False
+            except Exception as e:
+                self.statusBar().showMessage(f"円筒基準外径の更新エラー: {e}")
+        self._schedule_pottery_curve_size_update()
+
+    def _pottery_set_cylinder_reference_from_cursor(self):
+        row = self.pottery_cylinder_segment_table.currentRow()
+        z = float(self.pottery_curve_z_cursor_spin.value())
+        if row < 0:
+            # Select the interval containing the cursor if possible.
+            for i, segment in enumerate(self._pottery_cylinder_segments_mm()):
+                if segment["z0_mm"] <= z <= segment["z1_mm"]:
+                    row = i
+                    self.pottery_cylinder_segment_table.selectRow(i)
+                    break
+        if row < 0:
+            QMessageBox.information(self, "区間未選択", "基準Zを設定する円筒区間を選択してください。")
+            return
+        try:
+            z0 = float(self.pottery_cylinder_segment_table.item(row, 0).text())
+            z1 = float(self.pottery_cylinder_segment_table.item(row, 1).text())
+            if not (z0 <= z <= z1):
+                raise ValueError("現在Zが選択した円筒区間の外側です。")
+            dia = self._pottery_outer_diameter_at_z_mm(z)
+            self._setting_pottery_curve_controls = True
+            try:
+                self.pottery_cylinder_segment_table.item(row, 2).setText(f"{z:.6f}")
+                self.pottery_cylinder_segment_table.item(row, 3).setText(f"{dia:.6f}")
+            finally:
+                self._setting_pottery_curve_controls = False
+            self._schedule_pottery_curve_size_update()
+        except Exception as e:
+            self._show_error("円筒基準Z設定エラー", e)
+
+    def _pottery_remeasure_cylinder_diameters(self):
+        try:
+            self._setting_pottery_curve_controls = True
+            try:
+                for row in range(self.pottery_cylinder_segment_table.rowCount()):
+                    ref = float(self.pottery_cylinder_segment_table.item(row, 2).text())
+                    dia = self._pottery_outer_diameter_at_z_mm(ref)
+                    self.pottery_cylinder_segment_table.item(row, 3).setText(
+                        f"{dia:.6f}"
+                    )
+            finally:
+                self._setting_pottery_curve_controls = False
+            self._schedule_pottery_curve_size_update()
+        except Exception as e:
+            self._show_error("円筒外径再計測エラー", e)
+
+    def _pottery_fan_table_changed(self, *_args):
+        if self._setting_pottery_curve_controls:
+            return
+        self._schedule_pottery_curve_size_update()
+        self._refresh_pottery_curve_z_guides()
+
+    def _pottery_fan_profile_mm(self) -> list[tuple[float, float]]:
+        rows: list[tuple[float, float]] = []
+        for row in range(self.pottery_fan_table.rowCount()):
+            zi = self.pottery_fan_table.item(row, 0)
+            di = self.pottery_fan_table.item(row, 1)
+            if zi is None or di is None:
+                continue
+            try:
+                z = float(zi.text())
+                d = float(di.text())
+            except ValueError as e:
+                raise ValueError("扇形区分点のZ / 外径には数値を入力してください。") from e
+            if not math.isfinite(z + d) or d <= 0:
+                raise ValueError("扇形区分点の外径は正の有限値にしてください。")
+            rows.append((z, d))
+        rows.sort(key=lambda x: x[0])
+        if len(rows) < 2:
+            raise ValueError("扇形展開には底部・口縁を含む2点以上が必要です。")
+        for a, b in zip(rows[:-1], rows[1:]):
+            if b[0] - a[0] <= 1.0e-9:
+                raise ValueError("扇形区分点のZは重複できません。")
+        return rows
+
+    def _pottery_sort_fan_table(self, rows: list[tuple[float, float]]):
+        self._setting_pottery_curve_controls = True
+        try:
+            self.pottery_fan_table.setRowCount(0)
+            for z, d in sorted(rows):
+                self._append_pottery_fan_row(z, d)
+        finally:
+            self._setting_pottery_curve_controls = False
+        self._refresh_pottery_curve_z_guides()
+
+    def _pottery_add_fan_breakpoint(self):
+        try:
+            rows = self._pottery_fan_profile_mm()
+            z = float(self.pottery_curve_z_cursor_spin.value())
+            zmin, zmax = rows[0][0], rows[-1][0]
+            tol = max((zmax - zmin) * 1.0e-8, 1.0e-6)
+            if z <= zmin + tol or z >= zmax - tol:
+                raise ValueError("底部・口縁の端点以外のZを指定してください。")
+            if any(abs(z - old_z) <= tol for old_z, _d in rows):
+                raise ValueError("同じZの区分点がすでにあります。")
+            d = self._pottery_outer_diameter_at_z_mm(z)
+            rows.append((z, d))
+            self._pottery_sort_fan_table(rows)
+            self._schedule_pottery_curve_size_update()
+        except Exception as e:
+            self._show_error("扇形区分点追加エラー", e)
+
+    def _pottery_delete_fan_breakpoint(self):
+        row = self.pottery_fan_table.currentRow()
+        count = self.pottery_fan_table.rowCount()
+        if row < 0:
+            QMessageBox.information(self, "区分点未選択", "削除する区分点を選択してください。")
+            return
+        if row in (0, count - 1):
+            QMessageBox.information(
+                self, "端点は保持", "底部・口縁の端点は削除できません。"
+            )
+            return
+        self.pottery_fan_table.removeRow(row)
+        self._schedule_pottery_curve_size_update()
+        self._refresh_pottery_curve_z_guides()
+
+    def _pottery_remeasure_fan_diameters(self):
+        try:
+            rows = self._pottery_fan_profile_mm()
+            rows = [
+                (z, self._pottery_outer_diameter_at_z_mm(z))
+                for z, _d in rows
+            ]
+            self._pottery_sort_fan_table(rows)
+            self._schedule_pottery_curve_size_update()
+        except Exception as e:
+            self._show_error("扇形外径再計測エラー", e)
+
+    def _rescale_pottery_curve_ui(self, ratio: float):
+        if not hasattr(self, "pottery_curve_z_cursor_spin"):
+            return
+        ratio = float(ratio)
+        if not math.isfinite(ratio) or ratio <= 0:
+            return
+        self._setting_pottery_curve_controls = True
+        self._setting_pottery_z_cursor = True
+        try:
+            self.pottery_curve_z_cursor_spin.setRange(
+                self.pottery_curve_z_cursor_spin.minimum() * ratio,
+                self.pottery_curve_z_cursor_spin.maximum() * ratio,
+            )
+            self.pottery_curve_z_cursor_spin.setValue(
+                self.pottery_curve_z_cursor_spin.value() * ratio
+            )
+            self.pottery_cylinder_breakpoints_mm = [
+                float(z) * ratio for z in self.pottery_cylinder_breakpoints_mm
+            ]
+            for row in range(self.pottery_cylinder_segment_table.rowCount()):
+                for col in range(4):
+                    item = self.pottery_cylinder_segment_table.item(row, col)
+                    if item is not None:
+                        item.setText(f"{float(item.text()) * ratio:.6f}")
+            for row in range(self.pottery_cylinder_break_table.rowCount()):
+                item = self.pottery_cylinder_break_table.item(row, 0)
+                if item is not None:
+                    item.setText(f"{float(item.text()) * ratio:.6f}")
+            for row in range(self.pottery_fan_table.rowCount()):
+                for col in (0, 1):
+                    item = self.pottery_fan_table.item(row, col)
+                    if item is not None:
+                        item.setText(f"{float(item.text()) * ratio:.6f}")
+        finally:
+            self._setting_pottery_z_cursor = False
+            self._setting_pottery_curve_controls = False
+        self._schedule_pottery_curve_size_update()
+        self._refresh_pottery_curve_z_guides()
+
+    def _pottery_curve_output_setting_changed(self, *_args):
+        if not hasattr(self, "pottery_curve_image_size_mode_combo"):
+            return
+        print_mode = (
+            self.pottery_curve_image_size_mode_combo.currentText()
+            == "印刷スケール指定"
+        )
+        self.pottery_curve_print_dpi_combo.setEnabled(print_mode)
+        self.pottery_curve_print_scale_combo.setEnabled(print_mode)
+        self.pottery_curve_file_size_combo.setEnabled(not print_mode)
+        self._schedule_pottery_curve_size_update()
+
+    def _schedule_pottery_curve_size_update(self, *_args):
+        if self._pottery_curve_size_refresh_pending:
+            return
+        self._pottery_curve_size_refresh_pending = True
+        QTimer.singleShot(120, self._update_pottery_curve_output_size_label)
+
+    def _selected_pottery_curve_dpi(self) -> float:
+        return float(self.pottery_curve_print_dpi_combo.currentText().split()[0])
+
+    def _selected_pottery_curve_scale(self) -> float:
+        text = self.pottery_curve_print_scale_combo.currentText().replace("%", "")
+        return float(text) / 100.0
+
+    def _selected_pottery_curve_target_mb(self) -> float | None:
+        text = self.pottery_curve_file_size_combo.currentText()
+        if text.startswith("S"):
+            return 10.0
+        if text.startswith("M"):
+            return 50.0
+        if text.startswith("L"):
+            return 100.0
+        return None
+
+    @staticmethod
+    def _fan_segment_reference_bbox(
+        z0: float, z1: float, r0: float, r1: float
+    ) -> tuple[float, float, float, float, dict]:
+        dz = float(z1 - z0)
+        dr = float(r1 - r0)
+        slant = math.hypot(dz, dr)
+        if slant <= 1.0e-12:
+            raise ValueError("扇形区間の長さが0です。")
+        if abs(dr) <= 1.0e-9:
+            width = 2.0 * math.pi * max(r0, r1, 1.0e-9)
+            return (-width / 2.0, 0.0, width / 2.0, slant, {
+                "type": "cylindrical_band",
+                "slant": slant,
+                "sector_angle_deg": 360.0,
+            })
+        k = abs(dr) / slant
+        theta = np.linspace(-math.pi, math.pi, 721)
+        values = []
+        for rr in (r0, r1):
+            ss = rr / k
+            phi = theta * k
+            values.append(np.column_stack([ss * np.sin(phi), ss * np.cos(phi)]))
+        pts = np.vstack(values)
+        return (
+            float(pts[:, 0].min()),
+            float(pts[:, 1].min()),
+            float(pts[:, 0].max()),
+            float(pts[:, 1].max()),
+            {
+                "type": "frustum_sector",
+                "slant": slant,
+                "sector_angle_deg": math.degrees(2.0 * math.pi * k),
+                "half_angle_deg": math.degrees(math.atan2(abs(dr), abs(dz))) if abs(dz) > 1e-12 else 90.0,
+            },
+        )
+
+    def _pottery_curve_nominal_size_model(self, kind: str) -> tuple[float, float]:
+        if not self.asset or not self.posture_done:
+            raise RuntimeError("姿勢未決定です。")
+        scale = float(self.asset.unit_to_mm)
+        if kind == "cylindrical":
+            segments = self._pottery_cylinder_segments_mm()
+            widths = [
+                math.pi * float(seg["diameter_mm"]) / scale
+                for seg in segments
+            ]
+            heights = [
+                (float(seg["z1_mm"]) - float(seg["z0_mm"])) / scale
+                for seg in segments
+            ]
+            gap = 10.0 / scale
+            return (
+                max(max(widths), 1.0e-9),
+                max(sum(heights) + gap * max(0, len(heights) - 1), 1.0e-9),
+            )
+
+        profile = [
+            (z / scale, d / (2.0 * scale))
+            for z, d in self._pottery_fan_profile_mm()
+        ]
+        widths = []
+        heights = []
+        for (z0, r0), (z1, r1) in zip(profile[:-1], profile[1:]):
+            x0, y0, x1, y1, _diag = self._fan_segment_reference_bbox(
+                z0, z1, r0, r1
+            )
+            widths.append(max(x1 - x0, 1.0e-9))
+            heights.append(max(y1 - y0, 1.0e-9))
+        gap = 10.0 / scale
+        return max(widths), sum(heights) + gap * max(0, len(heights) - 1)
+
+    @staticmethod
+    def _curve_canvas_metrics(
+        content_w_model: float,
+        content_h_model: float,
+        ppu: float,
+        scale_bar_mm: float,
+        unit_to_mm: float,
+    ) -> dict:
+        margin = 36
+        scale_block_h = 100
+        content_w = max(1, int(round(content_w_model * ppu)))
+        content_h = max(1, int(round(content_h_model * ppu)))
+        bar_px = int(round((scale_bar_mm / unit_to_mm) * ppu))
+        width = max(content_w + 2 * margin, bar_px + 2 * margin)
+        height = content_h + 2 * margin + scale_block_h
+        return {
+            "canvas_w_px": int(width),
+            "canvas_h_px": int(height),
+            "pixels": int(width * height),
+        }
+
+    def _find_curve_ppu_for_limit(
+        self,
+        width_model: float,
+        height_model: float,
+        bpp: float,
+        target_mb: float | None,
+    ) -> tuple[float, dict]:
+        unit_to_mm = float(self.asset.unit_to_mm)
+        scale_bar_mm = self._selected_scale_bar_mm()
+        if target_mb is None:
+            byte_limit = float("inf")
+        else:
+            byte_limit = target_mb * 1_000_000.0 / PNG_FILESIZE_SAFETY_FACTOR
+
+        def ok(ppu: float) -> tuple[bool, dict]:
+            m = self._curve_canvas_metrics(
+                width_model, height_model, ppu, scale_bar_mm, unit_to_mm
+            )
+            hard = (
+                m["canvas_w_px"] > MAX_PNG_DIMENSION_PX
+                or m["canvas_h_px"] > MAX_PNG_DIMENSION_PX
+                or m["pixels"] > MAX_PNG_PIXELS
+            )
+            bytes_est = m["pixels"] * max(float(bpp), 0.01)
+            return (not hard and bytes_est <= byte_limit), m
+
+        lo = 0.01
+        hi = 1.0
+        while hi < 1.0e6:
+            good, _m = ok(hi)
+            if not good:
+                break
+            hi *= 2.0
+        for _ in range(60):
+            mid = 0.5 * (lo + hi)
+            good, _m = ok(mid)
+            if good:
+                lo = mid
+            else:
+                hi = mid
+        metrics = self._curve_canvas_metrics(
+            width_model, height_model, lo, scale_bar_mm, unit_to_mm
+        )
+        return float(lo), metrics
+
+    def _build_pottery_ortho_layout_context(
+        self,
+        views: list[str],
+        modes: list[str],
+        spacing_mm: float,
+    ) -> dict:
+        if not self.asset or not self.posture_done:
+            raise RuntimeError("姿勢未決定です。")
+        if not views:
+            raise RuntimeError("オルソ出力面が未選択です。")
+        final_m = self._current_final_matrix()
+        poly = self._make_polydata(final_m)
+        pts = np.asarray(poly.points)
+        bounds = np.array([
+            pts[:, 0].min(), pts[:, 0].max(),
+            pts[:, 1].min(), pts[:, 1].max(),
+            pts[:, 2].min(), pts[:, 2].max(),
+        ], dtype=float)
+        spacing_model = float(spacing_mm) / float(self.asset.unit_to_mm)
+        rects, aux_rects = self._layout_with_auxiliary_panels(
+            bounds,
+            spacing_model,
+            views,
+            include_quarter="quarter_half_section" in modes,
+            include_half="half_section" in modes,
+            include_section="section" in modes,
+        )
+        all_rects = [rects[v] for v in views] + list(aux_rects.values())
+        return {
+            "poly": poly,
+            "bounds": bounds,
+            "spacing_model": spacing_model,
+            "rects": rects,
+            "aux_rects": aux_rects,
+            "sheet_w": max(r[2] for r in all_rects) - min(r[0] for r in all_rects),
+            "sheet_h": max(r[3] for r in all_rects) - min(r[1] for r in all_rects),
+        }
+
+    def _pottery_ortho_canvas_metrics(
+        self,
+        context: dict,
+        views: list[str],
+        ppu: float,
+        scale_bar_mm: float,
+    ) -> dict:
+        rects = context["rects"]
+        aux_rects = context["aux_rects"]
+        spacing_model = float(context["spacing_model"])
+        all_rects = [rects[v] for v in views] + list(aux_rects.values())
+        min_x = min(r[0] for r in all_rects)
+        min_y = min(r[1] for r in all_rects)
+        max_x = max(r[2] for r in all_rects)
+        max_y = max(r[3] for r in all_rects)
+
+        tick_extent = max(0.0, spacing_model * 0.75)
+        if "front" in views:
+            min_y = min(min_y, rects["front"][1] - tick_extent)
+            max_y = max(max_y, rects["front"][3] + tick_extent)
+        if "top" in views:
+            min_x = min(min_x, rects["top"][0] - tick_extent)
+            max_x = max(max_x, rects["top"][2] + tick_extent)
+
+        ppu = max(float(ppu), 1.0e-12)
+        content_w = max(1, int(round((max_x - min_x) * ppu)))
+        content_h = max(1, int(round((max_y - min_y) * ppu)))
+        margin = 36
+        scale_block_h = 120
+        bar_px = int(round((scale_bar_mm / self.asset.unit_to_mm) * ppu))
+        canvas_w = max(content_w + 2 * margin, bar_px + 2 * margin)
+        canvas_h = content_h + 2 * margin + scale_block_h
+        return {
+            "canvas_w_px": int(canvas_w),
+            "canvas_h_px": int(canvas_h),
+            "pixels": int(canvas_w * canvas_h),
+        }
+
+    def _pottery_default_ortho_bpp_estimate(self) -> float:
+        if self.pottery_ortho_png_bpp_estimate is not None:
+            return float(max(0.02, min(4.0, self.pottery_ortho_png_bpp_estimate)))
+        modes = self._selected_render_modes()
+        if "texture" in modes or "texture_normal" in modes:
+            return 2.2
+        if "shade" in modes:
+            return 0.8
+        return 0.25
+
+    def _find_pottery_ortho_ppu_for_limit(
+        self,
+        context: dict,
+        views: list[str],
+        bpp: float,
+        target_mb: float | None,
+    ) -> tuple[float, dict]:
+        if target_mb is None:
+            byte_limit = float("inf")
+        else:
+            byte_limit = target_mb * 1_000_000.0 / PNG_FILESIZE_SAFETY_FACTOR
+
+        def ok(ppu: float) -> tuple[bool, dict]:
+            m = self._pottery_ortho_canvas_metrics(
+                context, views, ppu, self._selected_scale_bar_mm()
+            )
+            hard = (
+                m["canvas_w_px"] > MAX_PNG_DIMENSION_PX
+                or m["canvas_h_px"] > MAX_PNG_DIMENSION_PX
+                or m["pixels"] > MAX_PNG_PIXELS
+            )
+            estimated = m["pixels"] * max(float(bpp), 0.01)
+            return (not hard and estimated <= byte_limit), m
+
+        lo = 0.01
+        hi = 1.0
+        while hi < 1.0e6:
+            good, _m = ok(hi)
+            if not good:
+                break
+            hi *= 2.0
+        for _ in range(60):
+            mid = 0.5 * (lo + hi)
+            good, _m = ok(mid)
+            if good:
+                lo = mid
+            else:
+                hi = mid
+        return lo, self._pottery_ortho_canvas_metrics(
+            context, views, lo, self._selected_scale_bar_mm()
+        )
+
+    def _sample_pottery_ortho_png_bpp(
+        self,
+        context: dict,
+        views: list[str],
+        modes: list[str],
+    ) -> float:
+        base_modes = [m for m in modes if m in ("texture", "texture_normal", "shade")]
+        if not base_modes:
+            return self._pottery_default_ortho_bpp_estimate()
+        sample_ppu = PNG_FILESIZE_SAMPLE_LONG_EDGE_PX / max(
+            float(context["sheet_w"]), float(context["sheet_h"]), 1.0e-9
+        )
+        sample_modes = [base_modes[0]] + [
+            m for m in modes
+            if m in ("section", "half_section", "quarter_half_section")
+        ]
+        tmp = Path(tempfile.mkdtemp(prefix="pottery_ortho_size_sample_"))
+        try:
+            written = self.export_orthos(
+                tmp,
+                views=views,
+                modes=sample_modes,
+                spacing_mm=float(self.view_spacing.value()),
+                scale_bar_mm=self._selected_scale_bar_mm(),
+                outline_width_px=self._selected_outline_width_px(),
+                individual=False,
+                export_png_plain=True,
+                export_svg=False,
+                export_png_outline=False,
+                progress_callback=None,
+                pixels_per_model_unit=sample_ppu,
+                png_dpi=None,
+                layout_context=context,
+            )
+            pngs = [x for x in written if x.suffix.lower() == ".png"]
+            if not pngs:
+                return self._pottery_default_ortho_bpp_estimate()
+            from PIL import Image
+            with Image.open(pngs[0]) as im:
+                pixels = max(1, int(im.width) * int(im.height))
+            bpp = float(pngs[0].stat().st_size) / pixels
+            self.pottery_ortho_png_bpp_estimate = float(max(0.02, min(4.0, bpp)))
+            return self.pottery_ortho_png_bpp_estimate
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    @staticmethod
+    def _recommended_raster_reduction_factor(metrics: dict, hard: bool) -> float:
+        """Return a friendly linear scale factor (50%, 33%, 25%...) for output."""
+        if not hard:
+            return 0.5
+        w = max(float(metrics.get("canvas_w_px", 1)), 1.0)
+        h = max(float(metrics.get("canvas_h_px", 1)), 1.0)
+        pixels = max(float(metrics.get("pixels", w * h)), 1.0)
+        limit = min(
+            0.5,
+            0.95 * MAX_PNG_DIMENSION_PX / max(w, h),
+            math.sqrt(0.95 * MAX_PNG_PIXELS / pixels),
+        )
+        friendly = (0.5, 1.0 / 3.0, 0.25, 0.20, 0.10, 0.05)
+        for factor in friendly:
+            if factor <= limit + 1.0e-12:
+                return factor
+        return max(0.01, min(0.5, limit * 0.95))
+
+    def _large_raster_preflight_choice(
+        self,
+        title: str,
+        text: str,
+        metrics: dict,
+        hard: bool,
+    ) -> float | None:
+        """Return 1.0, a reduced linear scale, or None for cancel."""
+        factor = self._recommended_raster_reduction_factor(
+            metrics,
+            hard=hard,
+        )
+        percent = factor * 100.0
+        w2 = int(round(float(metrics["canvas_w_px"]) * factor))
+        h2 = int(round(float(metrics["canvas_h_px"]) * factor))
+        mp2 = (
+            float(metrics["pixels"])
+            * factor
+            * factor
+            / 1_000_000.0
+        )
+
+        box = QMessageBox(self)
+        box.setIcon(
+            QMessageBox.Icon.Critical
+            if hard
+            else QMessageBox.Icon.Warning
+        )
+        box.setWindowTitle(title)
+        box.setText(
+            text
+            + "\n\n"
+            + (
+                "現在の設定は安全上限を超えています。"
+                if hard
+                else "大容量画像になる可能性があります。"
+            )
+            + f"\n推奨縮小: 線寸法 {percent:.4g}% "
+              f"→ 約 {w2:,} × {h2:,} px / {mp2:.1f} MP"
+        )
+        reduce_btn = box.addButton(
+            f"{percent:.4g}%に縮小して出力",
+            QMessageBox.ButtonRole.AcceptRole,
+        )
+        current_btn = None
+        if not hard:
+            current_btn = box.addButton(
+                "現設定で出力",
+                QMessageBox.ButtonRole.ActionRole,
+            )
+        cancel_btn = box.addButton(
+            "キャンセル",
+            QMessageBox.ButtonRole.RejectRole,
+        )
+        box.setDefaultButton(reduce_btn)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is reduce_btn:
+            return float(factor)
+        if current_btn is not None and clicked is current_btn:
+            return 1.0
+        return None
+
+    def _resolve_pottery_ortho_resolution(
+        self,
+        views: list[str],
+        modes: list[str],
+        preflight: bool = True,
+    ) -> dict | None:
+        context = self._build_pottery_ortho_layout_context(
+            views, modes, float(self.view_spacing.value())
+        )
+        mode = self.pottery_curve_image_size_mode_combo.currentText()
+        dpi = None
+        target_mb = None
+        if mode == "印刷スケール指定":
+            dpi = self._selected_pottery_curve_dpi()
+            print_scale = self._selected_pottery_curve_scale()
+            ppu = dpi / 25.4 * print_scale * float(self.asset.unit_to_mm)
+            bpp = self._pottery_default_ortho_bpp_estimate()
+            metrics = self._pottery_ortho_canvas_metrics(
+                context, views, ppu, self._selected_scale_bar_mm()
+            )
+        else:
+            print_scale = None
+            bpp = self._sample_pottery_ortho_png_bpp(context, views, modes)
+            target_mb = self._selected_pottery_curve_target_mb()
+            ppu, metrics = self._find_pottery_ortho_ppu_for_limit(
+                context, views, bpp, target_mb
+            )
+
+        hard = (
+            metrics["canvas_w_px"] > MAX_PNG_DIMENSION_PX
+            or metrics["canvas_h_px"] > MAX_PNG_DIMENSION_PX
+            or metrics["pixels"] > MAX_PNG_PIXELS
+        )
+        estimated = metrics["pixels"] * bpp * PNG_FILESIZE_SAFETY_FACTOR
+        working = metrics["pixels"] * PNG_WORKING_BYTES_PER_PIXEL
+        warning = (
+            metrics["pixels"] >= PNG_WARNING_PIXELS
+            or estimated >= PNG_WARNING_ESTIMATED_MB * 1_000_000.0
+            or working >= 1_200_000_000.0
+        )
+        lines = []
+        if dpi is not None:
+            print_w = metrics["canvas_w_px"] / dpi * 25.4
+            print_h = metrics["canvas_h_px"] / dpi * 25.4
+            lines.append(
+                f"印刷: {dpi:g} dpi / {print_scale * 100.0:.4g}% / "
+                f"約 {print_w:.1f} × {print_h:.1f} mm"
+            )
+        elif target_mb is not None:
+            lines.append(f"PNG目標上限: {target_mb:g} MB / 1ファイル")
+        else:
+            lines.append("Maximum: 現在の安全上限まで")
+        lines.extend([
+            f"画像: {metrics['canvas_w_px']:,} × {metrics['canvas_h_px']:,} px",
+            f"総画素数: {metrics['pixels'] / 1_000_000.0:.1f} MP",
+            f"推定PNG: {estimated / 1_000_000.0:.1f} MB",
+            f"処理時メモリ目安: {working / 1_000_000_000.0:.2f} GB",
+        ])
+        text = "\n".join(lines)
+        self.pottery_curve_output_size_label.setText(text.replace("\n", "<br>"))
+        if preflight and (hard or warning):
+            factor = self._large_raster_preflight_choice(
+                "画像サイズ上限超過" if hard else "大容量画像の確認",
+                text,
+                metrics,
+                hard=hard,
+            )
+            if factor is None:
+                return None
+            if factor != 1.0:
+                ppu *= float(factor)
+                metrics = self._pottery_ortho_canvas_metrics(
+                    context,
+                    views,
+                    ppu,
+                    self._selected_scale_bar_mm(),
+                )
+                text += (
+                    f"\n→ 書き出し解像度を線寸法 {factor * 100.0:.4g}% "
+                    "へ縮小します。"
+                )
+                self.pottery_curve_output_size_label.setText(
+                    text.replace("\n", "<br>")
+                )
+        return {
+            "ppu": float(ppu),
+            "png_dpi": dpi,
+            "target_mb": target_mb,
+            "bpp": float(bpp),
+            "metrics": metrics,
+            "mode": mode,
+            "context": context,
+        }
+
+    def _update_pottery_curve_output_size_label(self):
+        self._pottery_curve_size_refresh_pending = False
+        if not hasattr(self, "pottery_curve_output_size_label"):
+            return
+        if not self.asset or not self.posture_done or self._is_lithic():
+            self.pottery_curve_output_size_label.setText(
+                "姿勢決定後に出力サイズを計算します。"
+            )
+            return
+        try:
+            branch = self._pottery_output_branch_key()
+            mode = self.pottery_curve_image_size_mode_combo.currentText()
+            if branch == "ortho":
+                views = [k for k, cb in self.view_checks.items() if cb.isChecked()]
+                modes = self._selected_render_modes()
+                if not views:
+                    self.pottery_curve_output_size_label.setText("出力面が未選択です。")
+                    return
+                context = self._build_pottery_ortho_layout_context(
+                    views, modes, float(self.view_spacing.value())
+                )
+                bpp = self._pottery_default_ortho_bpp_estimate()
+                if mode == "印刷スケール指定":
+                    dpi = self._selected_pottery_curve_dpi()
+                    scale = self._selected_pottery_curve_scale()
+                    ppu = dpi / 25.4 * scale * float(self.asset.unit_to_mm)
+                    target = None
+                    lead = f"オルソ / {dpi:g} dpi / {scale * 100.0:.4g}%"
+                else:
+                    dpi = None
+                    target = self._selected_pottery_curve_target_mb()
+                    ppu, _ = self._find_pottery_ortho_ppu_for_limit(
+                        context, views, bpp, target
+                    )
+                    lead = (
+                        f"オルソ / 目標 ≤ {target:g} MB / 1 PNG"
+                        if target is not None else "オルソ / Maximum"
+                    )
+                metrics = self._pottery_ortho_canvas_metrics(
+                    context, views, ppu, self._selected_scale_bar_mm()
+                )
+            else:
+                width_model, height_model = self._pottery_curve_nominal_size_model(branch)
+                selected_surfaces = self._selected_pottery_curve_surfaces()
+                surface_text = " / ".join(
+                    self._pottery_curve_surface_title(s)
+                    for s in selected_surfaces
+                )
+                bpp = self.pottery_curve_png_bpp_estimate or 1.5
+                if mode == "印刷スケール指定":
+                    dpi = self._selected_pottery_curve_dpi()
+                    scale = self._selected_pottery_curve_scale()
+                    ppu = dpi / 25.4 * scale * float(self.asset.unit_to_mm)
+                    target = None
+                    lead = (
+                        f"{'円筒' if branch == 'cylindrical' else '扇形'} / "
+                        f"{dpi:g} dpi / {scale * 100.0:.4g}%"
+                    )
+                else:
+                    dpi = None
+                    target = self._selected_pottery_curve_target_mb()
+                    ppu, _ = self._find_curve_ppu_for_limit(
+                        width_model, height_model, bpp, target
+                    )
+                    lead = (
+                        f"{'円筒' if branch == 'cylindrical' else '扇形'} / "
+                        + (
+                            f"目標 ≤ {target:g} MB / 1 PNG"
+                            if target is not None else "Maximum"
+                        )
+                    )
+                metrics = self._curve_canvas_metrics(
+                    width_model, height_model, ppu,
+                    self._selected_scale_bar_mm(), float(self.asset.unit_to_mm)
+                )
+
+            est = metrics["pixels"] * bpp * PNG_FILESIZE_SAFETY_FACTOR
+            raw = metrics["pixels"] * 3.0
+            if branch != "ortho":
+                lead += f" / 展開面: {surface_text}"
+                if "upper" in selected_surfaces:
+                    lead += "（上面は出力時に実メッシュ範囲で再計算）"
+            self.pottery_curve_output_size_label.setText(
+                f"{lead}<br>"
+                f"画像: {metrics['canvas_w_px']:,} × {metrics['canvas_h_px']:,} px / "
+                f"{metrics['pixels'] / 1_000_000.0:.1f} MP<br>"
+                f"推定PNG: {est / 1_000_000.0:.1f} MB（暫定） / "
+                f"RGB展開: {raw / 1_000_000.0:.1f} MB"
+            )
+        except Exception as e:
+            self.pottery_curve_output_size_label.setText(f"サイズ計算待ち: {e}")
+
+    @staticmethod
+    def _pottery_theta(vertices: np.ndarray) -> np.ndarray:
+        """Front (-Y) is theta=0; Back (+Y) is the +/-pi seam."""
+        v = np.asarray(vertices, dtype=float)
+        return np.arctan2(v[:, 0], -v[:, 1])
+
+    def _poly_from_mapped_faces(
+        self,
+        mapped_points: np.ndarray,
+        selected_faces: np.ndarray,
+    ) -> pv.PolyData:
+        if not self.asset:
+            raise RuntimeError("モデルが読み込まれていません。")
+        faces = np.asarray(selected_faces, dtype=np.int64)
+        if len(faces) == 0:
+            raise RuntimeError("展開対象となる三角形がありません。")
+        used, inv = np.unique(faces.ravel(), return_inverse=True)
+        local_faces = inv.reshape(-1, 3)
+        vtk_faces = np.column_stack([
+            np.full(len(local_faces), 3, dtype=np.int64), local_faces
+        ]).ravel()
+        poly = pv.PolyData(
+            np.asarray(mapped_points, dtype=float)[used],
+            vtk_faces,
+        )
+        if self.asset.appearance_kind == "vertex_color" and self.asset.vertex_colors is not None:
+            colors = np.asarray(self.asset.vertex_colors, dtype=np.uint8)[used]
+            if colors.shape[1] == 4:
+                colors = colors[:, :3]
+            poly.point_data["RGB"] = colors
+        elif self.asset.appearance_kind == "texture" and self.asset.uv is not None:
+            uv = np.asarray(self.asset.uv, dtype=float)[used].copy()
+            # Preserve the original OBJ UV convention here as well; the same
+            # coordinates must be reused for cylindrical/fan mapped meshes.
+            poly.active_texture_coordinates = uv
+        return poly
+
+    def _prepare_pottery_curve_surface_view(
+        self,
+        polys: list[pv.PolyData],
+        surface: str,
+    ) -> tuple[list[pv.PolyData], tuple[float, float, float, float]]:
+        if not polys:
+            raise RuntimeError("展開メッシュがありません。")
+
+        if surface not in POTTERY_CURVE_SURFACE_LABELS:
+            raise ValueError(f"Unknown pottery curve surface: {surface}")
+
+        if surface == "outer":
+            prepared = [poly.copy(deep=True) for poly in polys]
+            xs = np.concatenate([np.asarray(p.points)[:, 0] for p in prepared])
+            zs = np.concatenate([np.asarray(p.points)[:, 2] for p in prepared])
+            return prepared, (
+                float(np.min(xs)),
+                float(np.max(xs)),
+                float(np.min(zs)),
+                float(np.max(zs)),
+            )
+
+        if surface == "inner":
+            # Keep the exact same X/Z handedness as the outer development.
+            # Negating the retained rho depth makes the smallest original rho
+            # nearest to a +Y camera, so the inner surface wins the depth test
+            # without horizontally mirroring the development.
+            prepared = []
+            for poly in polys:
+                p = poly.copy(deep=True)
+                pts = np.asarray(p.points, dtype=float).copy()
+                pts[:, 1] *= -1.0
+                p.points = pts
+                prepared.append(p)
+            xs = np.concatenate([np.asarray(p.points)[:, 0] for p in prepared])
+            zs = np.concatenate([np.asarray(p.points)[:, 2] for p in prepared])
+            return prepared, (
+                float(np.min(xs)),
+                float(np.max(xs)),
+                float(np.min(zs)),
+                float(np.max(zs)),
+            )
+
+        # "upper": look from +Z onto the developed 3D mesh.  The base
+        # development stacks slope/height segments along Z for outer/inner
+        # views; that stacking disappears in a +Z projection.  Re-stack
+        # segment copies along Y so each segment remains independently visible.
+        gap = 10.0 / float(self.asset.unit_to_mm)
+        prepared = []
+        cursor = 0.0
+        scene_xmin = float("inf")
+        scene_xmax = float("-inf")
+        scene_ymin = float("inf")
+        scene_ymax = float("-inf")
+        for poly in polys:
+            p = poly.copy(deep=True)
+            pts = np.asarray(p.points, dtype=float).copy()
+            xmin = float(np.min(pts[:, 0]))
+            xmax = float(np.max(pts[:, 0]))
+            ymin = float(np.min(pts[:, 1]))
+            ymax = float(np.max(pts[:, 1]))
+            pts[:, 0] -= 0.5 * (xmin + xmax)
+            pts[:, 1] += cursor - ymin
+            p.points = pts
+
+            b = p.bounds
+            scene_xmin = min(scene_xmin, float(b[0]))
+            scene_xmax = max(scene_xmax, float(b[1]))
+            scene_ymin = min(scene_ymin, float(b[2]))
+            scene_ymax = max(scene_ymax, float(b[3]))
+            cursor += max(ymax - ymin, 1.0e-9) + gap
+
+            prepared.append(p)
+
+        return prepared, (
+            scene_xmin,
+            scene_xmax,
+            scene_ymin,
+            scene_ymax,
+        )
+
+    def _build_pottery_curve_scene(self, kind: str) -> tuple[list[pv.PolyData], tuple[float, float, float, float], dict]:
+        if not self.asset:
+            raise RuntimeError("モデルが読み込まれていません。")
+        vertices = self._pottery_curve_final_vertices()
+        faces = np.asarray(self.asset.mesh.faces, dtype=np.int64)
+        theta = self._pottery_theta(vertices)
+        rho = np.hypot(vertices[:, 0], vertices[:, 1])
+        seam_ok = np.ptp(theta[faces], axis=1) < math.pi
+        scale = float(self.asset.unit_to_mm)
+
+        if kind == "cylindrical":
+            segments = self._pottery_cylinder_segments_mm()
+            gap = 10.0 / scale
+            polys: list[pv.PolyData] = []
+            segment_diags: list[dict] = []
+            cursor = 0.0
+            scene_xmin = float("inf")
+            scene_xmax = float("-inf")
+            scene_zmin = float("inf")
+            scene_zmax = float("-inf")
+            epsz = max(float(np.ptp(vertices[:, 2])) * 1.0e-9, 1.0e-10)
+            face_z = vertices[faces, 2]
+            face_z_center = np.mean(face_z, axis=1)
+
+            for index, segment in enumerate(segments, start=1):
+                z0 = float(segment["z0_mm"]) / scale
+                z1 = float(segment["z1_mm"]) / scale
+                radius = float(segment["diameter_mm"]) / (2.0 * scale)
+                if radius <= 0.0 or z1 <= z0:
+                    raise ValueError(f"円筒区間{index}の設定が不正です。")
+
+                upper = (
+                    face_z_center <= z1 + epsz
+                    if index == len(segments)
+                    else face_z_center < z1
+                )
+                within = (face_z_center >= z0 - epsz) & upper
+                selected = faces[seam_ok & within]
+                if len(selected) == 0:
+                    raise RuntimeError(f"円筒区間{index}に三角形がありません。")
+
+                mapped = np.column_stack([
+                    radius * theta,
+                    rho,
+                    np.clip(vertices[:, 2], z0, z1) - z0,
+                ])
+                poly = self._poly_from_mapped_faces(mapped, selected)
+                b = poly.bounds
+                local_mid_x = 0.5 * (float(b[0]) + float(b[1]))
+                local_zmin = float(b[4])
+                local_h = float(b[5] - b[4])
+                pts = np.asarray(poly.points).copy()
+                pts[:, 0] -= local_mid_x
+                pts[:, 2] += cursor - local_zmin
+                poly.points = pts
+                b = poly.bounds
+                polys.append(poly)
+                scene_xmin = min(scene_xmin, float(b[0]))
+                scene_xmax = max(scene_xmax, float(b[1]))
+                scene_zmin = min(scene_zmin, float(b[4]))
+                scene_zmax = max(scene_zmax, float(b[5]))
+                segment_diags.append({
+                    "segment": index,
+                    "z0_mm": float(segment["z0_mm"]),
+                    "z1_mm": float(segment["z1_mm"]),
+                    "reference_z_mm": float(segment["reference_z_mm"]),
+                    "reference_diameter_mm": float(segment["diameter_mm"]),
+                    "reference_radius_mm": float(segment["diameter_mm"]) / 2.0,
+                    "mapping": "u=Rref*theta; v=z-z0; depth=rho",
+                })
+                cursor += local_h + gap
+
+            diag = {
+                "projection": "piecewise_cylindrical",
+                "axis": "Z",
+                "seam": "Back (+Y)",
+                "segments": segment_diags,
+                "segment_layout": (
+                    "independent cylindrical strips stacked with 10 mm gaps"
+                ),
+            }
+            return polys, (scene_xmin, scene_xmax, scene_zmin, scene_zmax), diag
+
+        profile_mm = self._pottery_fan_profile_mm()
+        profile = [(z / scale, d / (2.0 * scale)) for z, d in profile_mm]
+        gap = 10.0 / scale
+        polys: list[pv.PolyData] = []
+        segment_diags = []
+        cursor = 0.0
+        scene_xmin = float("inf")
+        scene_xmax = float("-inf")
+        scene_zmin = float("inf")
+        scene_zmax = float("-inf")
+        epsz = max(float(np.ptp(vertices[:, 2])) * 1.0e-9, 1.0e-10)
+
+        face_z = vertices[faces, 2]
+        face_z_center = np.mean(face_z, axis=1)
+        fan_pairs = list(zip(profile[:-1], profile[1:]))
+        for index, ((z0, r0), (z1, r1)) in enumerate(fan_pairs, start=1):
+            if z1 <= z0:
+                raise ValueError("扇形区分点はZ昇順で指定してください。")
+            upper = (
+                face_z_center <= z1 + epsz
+                if index == len(fan_pairs)
+                else face_z_center < z1
+            )
+            within = (face_z_center >= z0 - epsz) & upper
+            selected = faces[seam_ok & within]
+            if len(selected) == 0:
+                raise RuntimeError(f"扇形区間{index}に三角形がありません。")
+
+            dz = z1 - z0
+            dr = r1 - r0
+            slant = math.hypot(dz, dr)
+            tt = np.clip((vertices[:, 2] - z0) / dz, 0.0, 1.0)
+            rref = r0 + dr * tt
+            if abs(dr) <= 1.0e-9:
+                x2 = rref * theta
+                z2 = tt * slant
+                sector_type = "cylindrical_band"
+                sector_angle = 360.0
+            else:
+                k = abs(dr) / slant
+                ss = rref / k
+                phi = theta * k
+                x2 = ss * np.sin(phi)
+                z2 = ss * np.cos(phi)
+                sector_type = "frustum_sector"
+                sector_angle = math.degrees(2.0 * math.pi * k)
+
+            mapped = np.column_stack([x2, rho, z2])
+            poly = self._poly_from_mapped_faces(mapped, selected)
+            b = poly.bounds
+            local_mid_x = 0.5 * (float(b[0]) + float(b[1]))
+            local_zmin = float(b[4])
+            local_h = float(b[5] - b[4])
+            pts = np.asarray(poly.points).copy()
+            pts[:, 0] -= local_mid_x
+            pts[:, 2] += cursor - local_zmin
+            poly.points = pts
+            b = poly.bounds
+            polys.append(poly)
+            scene_xmin = min(scene_xmin, float(b[0]))
+            scene_xmax = max(scene_xmax, float(b[1]))
+            scene_zmin = min(scene_zmin, float(b[4]))
+            scene_zmax = max(scene_zmax, float(b[5]))
+            segment_diags.append({
+                "segment": index,
+                "z0_mm": profile_mm[index - 1][0],
+                "z1_mm": profile_mm[index][0],
+                "d0_mm": profile_mm[index - 1][1],
+                "d1_mm": profile_mm[index][1],
+                "slant_mm": slant * scale,
+                "type": sector_type,
+                "sector_angle_deg": sector_angle,
+            })
+            cursor += local_h + gap
+
+        diag = {
+            "projection": "piecewise_fan",
+            "axis": "Z",
+            "seam": "Back (+Y)",
+            "segments": segment_diags,
+            "segment_layout": "true frustum developments stacked with 10 mm gaps; each slope interval is developed independently",
+            "mapping_note": "piecewise slopes are not forced into one globally developable surface",
+        }
+        return polys, (scene_xmin, scene_xmax, scene_zmin, scene_zmax), diag
+
+    def _render_pottery_curve_scene(
+        self,
+        polys: list[pv.PolyData],
+        bounds2d: tuple[float, float, float, float],
+        ppu: float,
+        surface: str = "outer",
+    ):
+        from PIL import Image
+
+        hmin, hmax, vmin, vmax = bounds2d
+        world_w = max(float(hmax - hmin), 1.0e-9)
+        world_h = max(float(vmax - vmin), 1.0e-9)
+        width = max(64, int(round(world_w * ppu)))
+        height = max(64, int(round(world_h * ppu)))
+        self._validate_png_dimensions(
+            width + 72,
+            height + 172,
+            self._selected_scale_bar_mm(),
+        )
+
+        pl = None
+        try:
+            pl = pv.Plotter(off_screen=True, window_size=(width, height))
+            try:
+                pl.disable_anti_aliasing()
+            except Exception:
+                pass
+            pl.set_background("white")
+            mode = self._pottery_curve_render_mode()
+            appearance = mode in ("texture", "texture_normal")
+            lighting = mode in ("texture_normal", "shade")
+            for poly in polys:
+                self._add_mesh_actor(
+                    pl,
+                    poly,
+                    appearance=appearance,
+                    lighting=lighting,
+                )
+
+            if surface in ("outer", "inner"):
+                depth_values = np.concatenate(
+                    [np.asarray(poly.points)[:, 1] for poly in polys]
+                )
+                depth_min = float(np.min(depth_values))
+                depth_max = float(np.max(depth_values))
+                extent = max(
+                    world_w,
+                    world_h,
+                    depth_max - depth_min,
+                    1.0e-9,
+                )
+                center = np.array([
+                    0.5 * (hmin + hmax),
+                    0.5 * (depth_min + depth_max),
+                    0.5 * (vmin + vmax),
+                ])
+                # Inner view has already had rho depth negated so the same +Y
+                # camera preserves X/Z handedness while selecting the inner wall.
+                pos = center + np.array([0.0, extent * 3.0, 0.0])
+                up = [0.0, 0.0, 1.0]
+            elif surface == "upper":
+                depth_values = np.concatenate(
+                    [np.asarray(poly.points)[:, 2] for poly in polys]
+                )
+                depth_min = float(np.min(depth_values))
+                depth_max = float(np.max(depth_values))
+                extent = max(
+                    world_w,
+                    world_h,
+                    depth_max - depth_min,
+                    1.0e-9,
+                )
+                center = np.array([
+                    0.5 * (hmin + hmax),
+                    0.5 * (vmin + vmax),
+                    0.5 * (depth_min + depth_max),
+                ])
+                pos = center + np.array([0.0, 0.0, extent * 3.0])
+                up = [0.0, 1.0, 0.0]
+            else:
+                raise ValueError(f"Unknown pottery curve surface: {surface}")
+
+            pl.camera_position = [pos.tolist(), center.tolist(), up]
+            pl.enable_parallel_projection()
+            pl.camera.parallel_scale = world_h / 2.0
+            pl.reset_camera_clipping_range()
+            arr = pl.screenshot(
+                return_img=True,
+                transparent_background=True,
+                window_size=[width, height],
+            )
+        finally:
+            if pl is not None:
+                try:
+                    pl.close()
+                except Exception:
+                    pass
+
+        image = Image.fromarray(np.asarray(arr, dtype=np.uint8)).convert("RGBA")
+        margin = 36
+        scale_block_h = 100
+        bar_px = int(round(
+            (self._selected_scale_bar_mm() / float(self.asset.unit_to_mm)) * ppu
+        ))
+        canvas_w = max(image.width + 2 * margin, bar_px + 2 * margin)
+        canvas_h = image.height + 2 * margin + scale_block_h
+        self._validate_png_dimensions(
+            canvas_w,
+            canvas_h,
+            self._selected_scale_bar_mm(),
+        )
+        canvas = Image.new(
+            "RGBA",
+            (canvas_w, canvas_h),
+            (255, 255, 255, 255),
+        )
+        canvas.alpha_composite(image, dest=(margin, margin))
+        self._draw_scale_bar(
+            canvas,
+            ppu,
+            self._selected_scale_bar_mm(),
+            margin,
+            canvas_h - 30,
+        )
+        return canvas.convert("RGB")
+
+    def _sample_pottery_curve_png_bpp(
+        self,
+        polys: list[pv.PolyData],
+        bounds2d: tuple[float, float, float, float],
+        surface: str,
+    ) -> float:
+        import io
+
+        hmin, hmax, vmin, vmax = bounds2d
+        long_model = max(hmax - hmin, vmax - vmin, 1.0e-9)
+        ppu = PNG_FILESIZE_SAMPLE_LONG_EDGE_PX / long_model
+        image = self._render_pottery_curve_scene(
+            polys,
+            bounds2d,
+            ppu,
+            surface=surface,
+        )
+        buf = io.BytesIO()
+        image.save(buf, format="PNG", optimize=False)
+        pixels = max(image.width * image.height, 1)
+        bpp = len(buf.getvalue()) / float(pixels)
+        bpp = max(0.01, float(bpp))
+        self.pottery_curve_png_bpp_estimate = bpp
+        return bpp
+
+    def _resolve_pottery_curve_resolution(
+        self,
+        bounds2d: tuple[float, float, float, float],
+        polys: list[pv.PolyData],
+        surface: str,
+        preflight: bool,
+    ) -> dict | None:
+        hmin, hmax, vmin, vmax = bounds2d
+        width_model = max(hmax - hmin, 1.0e-9)
+        height_model = max(vmax - vmin, 1.0e-9)
+        bpp = self._sample_pottery_curve_png_bpp(
+            polys,
+            bounds2d,
+            surface=surface,
+        )
+        mode = self.pottery_curve_image_size_mode_combo.currentText()
+        dpi = None
+        target_mb = None
+        if mode == "印刷スケール指定":
+            dpi = self._selected_pottery_curve_dpi()
+            print_scale = self._selected_pottery_curve_scale()
+            ppu = (
+                dpi
+                / 25.4
+                * print_scale
+                * float(self.asset.unit_to_mm)
+            )
+            metrics = self._curve_canvas_metrics(
+                width_model,
+                height_model,
+                ppu,
+                self._selected_scale_bar_mm(),
+                float(self.asset.unit_to_mm),
+            )
+        else:
+            print_scale = None
+            target_mb = self._selected_pottery_curve_target_mb()
+            ppu, metrics = self._find_curve_ppu_for_limit(
+                width_model,
+                height_model,
+                bpp,
+                target_mb,
+            )
+
+        hard = (
+            metrics["canvas_w_px"] > MAX_PNG_DIMENSION_PX
+            or metrics["canvas_h_px"] > MAX_PNG_DIMENSION_PX
+            or metrics["pixels"] > MAX_PNG_PIXELS
+        )
+        estimated = (
+            metrics["pixels"]
+            * bpp
+            * PNG_FILESIZE_SAFETY_FACTOR
+        )
+        working = metrics["pixels"] * PNG_WORKING_BYTES_PER_PIXEL
+        warning = (
+            metrics["pixels"] >= PNG_WARNING_PIXELS
+            or estimated >= PNG_WARNING_ESTIMATED_MB * 1_000_000.0
+            or working >= 1_200_000_000.0
+        )
+
+        surface_title = self._pottery_curve_surface_title(surface)
+        lines = [f"展開面: {surface_title}"]
+        if dpi is not None:
+            print_w = metrics["canvas_w_px"] / dpi * 25.4
+            print_h = metrics["canvas_h_px"] / dpi * 25.4
+            lines.append(
+                f"印刷: {dpi:g} dpi / {print_scale * 100.0:.4g}% / "
+                f"約 {print_w:.1f} × {print_h:.1f} mm"
+            )
+        elif target_mb is not None:
+            lines.append(
+                f"PNG目標上限: {target_mb:g} MB / 1ファイル"
+            )
+        else:
+            lines.append("Maximum: 現在の安全上限まで")
+        lines.extend([
+            f"画像: {metrics['canvas_w_px']:,} × "
+            f"{metrics['canvas_h_px']:,} px",
+            f"総画素数: {metrics['pixels'] / 1_000_000.0:.1f} MP",
+            f"推定PNG: {estimated / 1_000_000.0:.1f} MB",
+            f"処理時メモリ目安: {working / 1_000_000_000.0:.2f} GB",
+        ])
+        info_text = "\n".join(lines)
+        self.pottery_curve_output_size_label.setText(
+            info_text.replace("\n", "<br>")
+        )
+
+        if preflight and (hard or warning):
+            factor = self._large_raster_preflight_choice(
+                (
+                    f"画像サイズ上限超過: {surface_title}"
+                    if hard
+                    else f"大容量画像の確認: {surface_title}"
+                ),
+                info_text,
+                metrics,
+                hard=hard,
+            )
+            if factor is None:
+                return None
+            if factor != 1.0:
+                ppu *= float(factor)
+                metrics = self._curve_canvas_metrics(
+                    width_model,
+                    height_model,
+                    ppu,
+                    self._selected_scale_bar_mm(),
+                    float(self.asset.unit_to_mm),
+                )
+                info_text += (
+                    f"\n→ 書き出し解像度を線寸法 {factor * 100.0:.4g}% "
+                    "へ縮小します。"
+                )
+                self.pottery_curve_output_size_label.setText(
+                    info_text.replace("\n", "<br>")
+                )
+
+        return {
+            "ppu": float(ppu),
+            "png_dpi": dpi,
+            "target_mb": target_mb,
+            "bpp": float(bpp),
+            "metrics": metrics,
+            "mode": mode,
+            "surface": surface,
+        }
+
+    def _pottery_curve_metadata(self) -> dict:
+        kind = self._pottery_output_branch_key()
+        if kind == "ortho":
+            return {}
+        data = {
+            "axis": "Z",
+            "source_up_normalized_to": "Z-up",
+            "front_theta_zero": "Front (-Y)",
+            "seam": "Back (+Y), theta=+/-pi",
+            "projection": kind,
+            "render_mode": self._pottery_curve_render_mode(),
+            "surfaces": self._selected_pottery_curve_surfaces(),
+            "surface_semantics": {
+                "outer": (
+                    "developed X/Z view with retained rho as depth; "
+                    "largest rho wins depth test"
+                ),
+                "inner": (
+                    "same X/Z handedness as outer; retained rho depth is "
+                    "negated so smallest rho wins depth test"
+                ),
+                "upper": (
+                    "camera +Z view of the developed 3D mesh; independent "
+                    "segments are stacked along Y to avoid overlap"
+                ),
+            },
+            "image_size_mode": (
+                self.pottery_curve_image_size_mode_combo.currentText()
+            ),
+        }
+        if kind == "cylindrical":
+            data["breakpoints_z_mm"] = [
+                float(z) for z in sorted(self.pottery_cylinder_breakpoints_mm)
+            ]
+            data["segments"] = self._pottery_cylinder_segments_mm()
+        else:
+            data["breakpoints"] = [
+                {"z_mm": z, "diameter_mm": d}
+                for z, d in self._pottery_fan_profile_mm()
+            ]
+        return data
+
+    def export_pottery_curved_unwrap(
+        self,
+        out_dir: Path,
+        kind: str,
+        preview_long_edge_px: int | None = None,
+        preflight: bool = True,
+    ) -> list[Path]:
+        if kind not in ("cylindrical", "fan"):
+            raise ValueError(kind)
+        if not self.asset or not self.posture_done:
+            raise RuntimeError(
+                "姿勢決定後に曲面展開を実行してください。"
+            )
+
+        surfaces = self._selected_pottery_curve_surfaces()
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        base_polys, _base_bounds, diag = self._build_pottery_curve_scene(kind)
+        stem = self.asset.source_path.stem
+        tag = "cylindrical" if kind == "cylindrical" else "fan"
+        mode = self._pottery_curve_render_mode()
+
+        written: list[Path] = []
+        raster_outputs: list[dict] = []
+
+        try:
+            for surface in surfaces:
+                view_polys, bounds2d = self._prepare_pottery_curve_surface_view(
+                    base_polys,
+                    surface,
+                )
+                hmin, hmax, vmin, vmax = bounds2d
+
+                if preview_long_edge_px is not None:
+                    ppu = float(preview_long_edge_px) / max(
+                        hmax - hmin,
+                        vmax - vmin,
+                        1.0e-9,
+                    )
+                    resolution = {
+                        "ppu": ppu,
+                        "png_dpi": None,
+                        "target_mb": None,
+                        "surface": surface,
+                    }
+                else:
+                    resolution = self._resolve_pottery_curve_resolution(
+                        bounds2d,
+                        view_polys,
+                        surface=surface,
+                        preflight=preflight,
+                    )
+                    if resolution is None:
+                        for path in written:
+                            try:
+                                path.unlink()
+                            except OSError:
+                                pass
+                        return []
+
+                image = self._render_pottery_curve_scene(
+                    view_polys,
+                    bounds2d,
+                    float(resolution["ppu"]),
+                    surface=surface,
+                )
+                path = out_dir / (
+                    f"{stem}_{tag}_{surface}_{mode}.png"
+                )
+                save_kwargs = {}
+                if resolution.get("png_dpi") is not None:
+                    dpi = float(resolution["png_dpi"])
+                    save_kwargs["dpi"] = (dpi, dpi)
+                image.save(path, format="PNG", **save_kwargs)
+
+                target_mb = resolution.get("target_mb")
+                if (
+                    target_mb is not None
+                    and path.stat().st_size
+                    > target_mb * 1_000_000.0
+                ):
+                    ratio = math.sqrt(
+                        target_mb
+                        * 1_000_000.0
+                        / max(path.stat().st_size, 1)
+                    ) * 0.97
+                    corrected_ppu = max(
+                        0.01,
+                        float(resolution["ppu"]) * ratio,
+                    )
+                    image = self._render_pottery_curve_scene(
+                        view_polys,
+                        bounds2d,
+                        corrected_ppu,
+                        surface=surface,
+                    )
+                    image.save(path, format="PNG")
+                    resolution["ppu"] = corrected_ppu
+
+                written.append(path)
+                raster_outputs.append({
+                    "surface": surface,
+                    "surface_label": (
+                        self._pottery_curve_surface_title(surface)
+                    ),
+                    "pixels_per_model_unit": float(resolution["ppu"]),
+                    "dpi_metadata": resolution.get("png_dpi"),
+                    "target_mb": resolution.get("target_mb"),
+                    "png_file": path.name,
+                    "bounds_2d_model_units": [
+                        float(v) for v in bounds2d
+                    ],
+                })
+
+            settings = {
+                "application": APP_NAME,
+                "version": APP_VERSION,
+                "source_file": self.asset.source_path.name,
+                "unit_to_mm": float(self.asset.unit_to_mm),
+                "coordinate_system": {
+                    "up_axis": "Z",
+                    "vessel_axis": "Z",
+                    "horizontal_plane": "X-Y",
+                },
+                "projection": diag,
+                "ui": self._pottery_curve_metadata(),
+                "raster_outputs": raster_outputs,
+            }
+            settings_path = out_dir / f"{stem}_{tag}_settings.json"
+            settings_path.write_text(
+                json.dumps(
+                    settings,
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            written.append(settings_path)
+            return written
+        except Exception:
+            # Keep component export atomic from the caller's point of view.
+            for path in written:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+            raise
+
+    # ---------- Export / batch completion ----------
+    def _selected_render_modes(self) -> list[str]:
+        modes = []
+        if self.mode_texture.isChecked() and self.mode_texture.isEnabled():
+            modes.append("texture")
+        if self.mode_texture_normal.isChecked() and self.mode_texture_normal.isEnabled():
+            modes.append("texture_normal")
+        if self.mode_shade.isChecked():
+            modes.append("shade")
+        if self.mode_section.isChecked():
+            modes.append("section")
+        if self.mode_half_section.isChecked():
+            modes.append("half_section")
+        if self.mode_quarter_half.isChecked():
+            modes.append("quarter_half_section")
+        return modes
+
+    def _selected_scale_bar_mm(self) -> float:
+        return float(self.scale_bar_combo.currentText().split()[0])
+
+    def _selected_outline_width_px(self) -> int:
+        return int(self.outline_width_combo.currentText().split()[0])
+
+    def _lithic_metadata(self, final_matrix: np.ndarray) -> dict:
+        if not self.asset:
+            return {}
+
+        inverse = np.linalg.inv(final_matrix)
+        transformed = trimesh.transform_points(
+            np.asarray(self.asset.mesh.vertices, dtype=float),
+            final_matrix,
+        )
+        bounds = np.array([
+            transformed[:, 0].min(),
+            transformed[:, 0].max(),
+            transformed[:, 1].min(),
+            transformed[:, 1].max(),
+            transformed[:, 2].min(),
+            transformed[:, 2].max(),
+        ], dtype=float)
+
+        sections = []
+        for section in self.lithic_sections:
+            coordinate = self._lithic_section_coordinate(section, bounds)
+            sections.append(
+                {
+                    "id": section["id"],
+                    "axis": section["axis"],
+                    "normalized_position": float(section["position"]),
+                    "coordinate_input_unit": float(coordinate),
+                    "coordinate_mm": float(
+                        coordinate * self.asset.unit_to_mm
+                    ),
+                    "plane": (
+                        "y=constant / X-Z section"
+                        if section["axis"] == "X"
+                        else "x=constant / Y-Z section"
+                    ),
+                }
+            )
+
+        second_matrix_written = not np.allclose(
+            self.lithic_obb_to_result_matrix,
+            np.eye(4),
+            atol=1e-9,
+            rtol=0.0,
+        )
+
+        return {
+            "application": APP_NAME,
+            "version": APP_VERSION,
+            "artifact_type": "lithic",
+            "source": {
+                "file": str(self.asset.source_path),
+                "sha256": self.asset.source_sha256,
+                "input_unit": self.asset.input_unit,
+                "unit_to_mm": self.asset.unit_to_mm,
+                "coordinate_values_rescaled": False,
+                "normals_status": self.asset.normals_status,
+                "appearance_kind": self.asset.appearance_kind,
+            },
+            "coordinate_system": {
+                "handedness": "right-handed",
+                "axes": {
+                    "X": "width",
+                    "Y": "length",
+                    "Z": "thickness",
+                },
+                "origin_definition": (
+                    "final axis-aligned bounding-box minimum corner "
+                    "(x_min, y_min, z_min)"
+                ),
+                "origin_expected": [0.0, 0.0, 0.0],
+            },
+            "posture": {
+                **self.pose_info,
+                "pose_base_mode": self.lithic_pose_base_mode,
+                "manual_axis_rotations_deg": dict(
+                    self.lithic_angles_deg
+                ),
+                "pose_confirmed": bool(self.lithic_pose_confirmed),
+                "final_bounds_input_unit": bounds.tolist(),
+            },
+            "transform": {
+                "matrix_convention": (
+                    "row-major storage; column homogeneous vector application"
+                ),
+                "equation_final": (
+                    (
+                        "p_result = M_final @ [x,y,z,1]^T"
+                    )
+                    if self.lithic_pose_base_mode == "input"
+                    else (
+                        "p_result = M_obb_to_result @ "
+                        "M_original_to_obb @ [x,y,z,1]^T"
+                    )
+                ),
+                "original_to_obb_matrix_4x4": (
+                    self.lithic_original_to_obb_matrix
+                ),
+                "obb_to_result_matrix_4x4": (
+                    self.lithic_obb_to_result_matrix
+                ),
+                "obb_to_result_is_identity": bool(
+                    not second_matrix_written
+                ),
+                "final_original_to_result_matrix_4x4": final_matrix,
+                "final_inverse_matrix_4x4": inverse,
+                "matrix_files": (
+                    {
+                        "final": [
+                            "transform_matrix.csv",
+                            "transform_matrix_cloudcompare.txt",
+                        ],
+                        "original_to_obb": [],
+                        "obb_to_result": [],
+                    }
+                    if self.lithic_pose_base_mode == "input"
+                    else {
+                        "final": [],
+                        "original_to_obb": [
+                            "transform_original_to_obb.csv",
+                            "transform_original_to_obb_cloudcompare.txt",
+                        ],
+                        "obb_to_result": (
+                            [
+                                "transform_obb_to_result.csv",
+                                "transform_obb_to_result_cloudcompare.txt",
+                            ]
+                            if second_matrix_written
+                            else []
+                        ),
+                    }
+                ),
+            },
+            "sections": sections,
+            "orthographic_export": {
+                "views": self._selected_lithic_views(),
+                "projection": "parallel/orthographic",
+                "axis_meanings": {
+                    "X": "width",
+                    "Y": "length",
+                    "Z": "thickness",
+                },
+                "render_modes": self._selected_lithic_modes(),
+                "image_size_mode": self.lithic_image_size_mode_combo.currentText(),
+                "print_dpi": (
+                    self._selected_lithic_print_dpi()
+                    if self.lithic_image_size_mode_combo.currentText()
+                    == "印刷スケール指定"
+                    else None
+                ),
+                "print_scale_percent": (
+                    self._selected_lithic_print_scale() * 100.0
+                    if self.lithic_image_size_mode_combo.currentText()
+                    == "印刷スケール指定"
+                    else None
+                ),
+                "file_size_target_mb_per_png": (
+                    self._selected_lithic_file_size_target_mb()
+                    if self.lithic_image_size_mode_combo.currentText()
+                    == "ファイルサイズ指定"
+                    else None
+                ),
+                "file_size_maximum_mode": bool(
+                    self.lithic_image_size_mode_combo.currentText()
+                    == "ファイルサイズ指定"
+                    and self._selected_lithic_file_size_target_mb() is None
+                ),
+                "view_spacing_mm": float(
+                    self.lithic_view_spacing.value()
+                ),
+                "scale_bar_mm": self._selected_lithic_scale_bar_mm(),
+                "png_outline_width_px": (
+                    self._selected_lithic_outline_width_px()
+                ),
+                "individual_views_and_sections": bool(
+                    self.lithic_export_individual.isChecked()
+                ),
+                "outputs": [
+                    name
+                    for name, enabled in (
+                        ("PNG", self.lithic_output_png.isChecked()),
+                        ("SVG", self.lithic_output_svg.isChecked()),
+                        (
+                            "PNG+outline",
+                            self.lithic_outline_overlay.isChecked(),
+                        ),
+                    )
+                    if enabled
+                ],
+                "layout": (
+                    "six-view cross; X sections below Bottom when selected, otherwise below Front; "
+                    "Y sections at far right"
+                ),
+                "preview_section_lines": (
+                    "blue interactive lines are preview-only and are "
+                    "not drawn into saved ortho images"
+                ),
+            },
+        }
+
+    def _metadata(self, final_matrix: np.ndarray) -> dict:
+        if not self.asset:
+            return {}
+        if self._is_lithic():
+            return self._lithic_metadata(final_matrix)
+        inverse = np.linalg.inv(final_matrix)
+        center = self.center_axis_after_pose
+        ref = self.reference_plane
+        return {
+            "application": APP_NAME,
+            "version": APP_VERSION,
+            "artifact_type": "lithic" if self._is_lithic() else "pottery",
+            "source": {
+                "file": str(self.asset.source_path),
+                "sha256": self.asset.source_sha256,
+                "input_unit": self.asset.input_unit,
+                "unit_to_mm": self.asset.unit_to_mm,
+                "coordinate_values_rescaled": False,
+                "normals_status": self.asset.normals_status,
+                "appearance_kind": self.asset.appearance_kind,
+            },
+            "coordinate_system": {
+                "handedness": "right-handed",
+                "z_axis": "up",
+                "front_definition": "manual Z-axis rotation",
+                "origin_definition": "center_axis_intersection_with_posture_AABB_lower_plane",
+            },
+            "posture": {
+                **self.pose_info,
+                "initial_slice_axis": None if self.initial_axis is None else {
+                    "point": self.initial_axis.point,
+                    "direction": self.initial_axis.direction,
+                    "confidence": self.initial_axis.confidence,
+                    "diagnostics": self.initial_axis.diagnostics,
+                },
+                "reference_plane": None if ref is None else {
+                    "point": ref.point,
+                    "normal": ref.normal,
+                    "residual_rms_input_unit": ref.residual_rms,
+                    "confidence": ref.confidence,
+                    "diagnostics": ref.diagnostics,
+                },
+                "center_axis_after_posture": None if center is None else {
+                    "point": center.point,
+                    "direction": center.direction,
+                    "confidence": center.confidence,
+                    "diagnostics": center.diagnostics,
+                    "angle_to_z_deg": angle_between_deg(center.direction, np.array([0.0, 0.0, 1.0])),
+                },
+                "front_rotation_deg": self.front_angle_deg,
+                "lithic_axis_rotations_deg": (
+                    dict(self.lithic_angles_deg) if self._is_lithic() else None
+                ),
+                "lithic_obb_extents_xyz": (
+                    None if self.lithic_obb_extents is None
+                    else self.lithic_obb_extents.tolist()
+                ),
+            },
+            "transform": {
+                "matrix_convention": "row-major storage; column homogeneous vector application",
+                "transform_direction": "raw_to_normalized",
+                "equation": "p_normalized = M_raw_to_normalized @ [x, y, z, 1]^T",
+                "matrix_4x4": final_matrix,
+                "inverse_matrix_4x4": inverse,
+            },
+            "pottery_output_branch": self._pottery_output_branch_key(),
+            "curve_unwrap": self._pottery_curve_metadata(),
+            "orthographic_export": {
+                "views": [k for k, cb in self.view_checks.items() if cb.isChecked()],
+                "view_spacing_mm": self.view_spacing.value(),
+                "projection": "parallel/orthographic",
+                "render_modes": self._selected_render_modes(),
+                "image_size_mode": self.pottery_curve_image_size_mode_combo.currentText(),
+                "print_dpi": (
+                    self._selected_pottery_curve_dpi()
+                    if self.pottery_curve_image_size_mode_combo.currentText()
+                    == "印刷スケール指定" else None
+                ),
+                "print_scale": (
+                    self._selected_pottery_curve_scale()
+                    if self.pottery_curve_image_size_mode_combo.currentText()
+                    == "印刷スケール指定" else None
+                ),
+                "target_png_mb": (
+                    self._selected_pottery_curve_target_mb()
+                    if self.pottery_curve_image_size_mode_combo.currentText()
+                    == "ファイルサイズ指定" else None
+                ),
+                "composite": True,
+                "individual_views": self.export_individual.isChecked(),
+                "scale_bar_mm": self._selected_scale_bar_mm(),
+                "png_outline_width_px": self._selected_outline_width_px(),
+                "scale_bar_style": "simple black line with end ticks; centered label above",
+                "outputs": [
+                    name for name, enabled in (
+                        ("PNG", self.output_png.isChecked()),
+                        ("SVG", self.output_svg.isChecked()),
+                        ("PNG+outline", self.outline_overlay.isChecked()),
+                    ) if enabled
+                ],
+                "png_plain": bool(self.output_png.isChecked()),
+                "svg_outline": bool(self.output_svg.isChecked()),
+                "png_with_svg_outline": bool(self.outline_overlay.isChecked()),
+                "png_outline_scope": "orthographic base modes only; excludes section/half_section/quarter_half_section",
+                "composite_layout": "front outline at far left; after front: quarter-half then half-section when selected; section at far right",
+                "layout_ticks": {
+                    "front_center_axis": "top and bottom; length=spacing/2; edge margin=spacing/4; width=5px",
+                    "top_half_section_line": "left and right; length=spacing/2; edge margin=spacing/4; width=5px"
+                },
+                "section_definition": "x-z plane through post-pose AABB x-y midpoint axis",
+                "svg_content": "projected silhouette contour lines plus vertical section when selected",
+                "outline_method": "opaque orthographic mask -> VTK marching squares",
+                "outline_alpha_threshold": OUTLINE_ALPHA_THRESHOLD,
+                "svg_stroke_mm": OUTLINE_SVG_STROKE_MM,
+            },
+        }
+
+    def _set_export_progress(self, value: int, text: str):
+        value = int(max(0, min(100, value)))
+        if self._is_lithic():
+            self.lithic_export_progress.setValue(value)
+            self.lithic_export_stage_label.setText(text)
+        else:
+            self.export_progress.setValue(value)
+            self.export_stage_label.setText(text)
+        self.statusBar().showMessage(text)
+        QApplication.processEvents()
+
+    def _require_confirmed_lithic_pose(self) -> bool:
+        if (
+            not self.asset
+            or not self.posture_done
+            or not self.lithic_pose_confirmed
+            or self.lithic_confirmed_final_matrix is None
+        ):
+            QMessageBox.warning(
+                self,
+                "姿勢未決定",
+                "先に石器の「姿勢決定」を押してください。",
+            )
+            return False
+        return True
+
+    def _confirm_lithic_export_without_measurements(
+        self,
+        product_label: str,
+    ) -> bool:
+        """Warn, but allow export, when current measurement data is absent."""
+        if not self._require_confirmed_lithic_pose():
+            return False
+
+        final_matrix = np.asarray(
+            self.lithic_confirmed_final_matrix,
+            dtype=float,
+        )
+        if self._inventory_is_current(final_matrix):
+            return True
+
+        answer = QMessageBox.question(
+            self,
+            "計測データ未保存",
+            "現在の姿勢・単位に対応する計測データが保存されていません。\n\n"
+            f"計測データを保存せずに「{product_label}」を実行しますか？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
+    def _lithic_final_output_dir(self) -> Path:
+        if not self.asset:
+            raise RuntimeError("モデルが読み込まれていません。")
+        final_dir = OUTPUT_DIR / self.asset.source_path.stem
+        final_dir.mkdir(parents=True, exist_ok=True)
+        marker = final_dir / SPLIT_EXPORT_IN_PROGRESS_MARKER
+        marker.touch(exist_ok=True)
+        return final_dir
+
+    def _lithic_component_staging_dir(self, component: str) -> Path:
+        if not self.asset:
+            raise RuntimeError("モデルが読み込まれていません。")
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        staging = OUTPUT_DIR / (
+            f"{self.asset.source_path.stem}.__working_{component}__"
+        )
+        if staging.exists():
+            shutil.rmtree(staging)
+        staging.mkdir(parents=True, exist_ok=False)
+        return staging
+
+    @staticmethod
+    def _merge_component_files(staging: Path, final_dir: Path) -> list[Path]:
+        """Atomically expose a completed component at file granularity."""
+        written: list[Path] = []
+        for source in sorted(staging.iterdir()):
+            if not source.is_file():
+                continue
+            target = final_dir / source.name
+            if target.exists():
+                target.unlink()
+            source.replace(target)
+            written.append(target)
+        shutil.rmtree(staging)
+        return written
+
+    @staticmethod
+    def _numbered_output_name(name: str, index: int) -> str:
+        p = Path(name)
+        return f"{p.stem}_{index:02d}{p.suffix}"
+
+    @staticmethod
+    def _replace_json_filename_strings(value, name_map: dict[str, str]):
+        if isinstance(value, dict):
+            return {
+                k: MainWindow._replace_json_filename_strings(v, name_map)
+                for k, v in value.items()
+            }
+        if isinstance(value, list):
+            return [
+                MainWindow._replace_json_filename_strings(v, name_map)
+                for v in value
+            ]
+        if isinstance(value, str):
+            return name_map.get(value, value)
+        return value
+
+    def _merge_layout_files_with_confirmation(
+        self,
+        staging: Path,
+        final_dir: Path,
+        product_label: str,
+    ) -> list[Path] | None:
+        """Merge drawing outputs without silently overwriting prior runs.
+
+        If any target filename already exists, the user can:
+        - overwrite the current names;
+        - save the complete new export set with a shared _01, _02, ... suffix;
+        - cancel and keep both staging/final files unchanged.
+        """
+        sources = [
+            p for p in sorted(staging.iterdir())
+            if p.is_file()
+        ]
+        conflicts = [
+            p for p in sources
+            if (final_dir / p.name).exists()
+        ]
+        if not conflicts:
+            return self._merge_component_files(staging, final_dir)
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("同名ファイルが存在します")
+        shown = "\n".join(f"• {p.name}" for p in conflicts[:6])
+        more = (
+            f"\n…ほか {len(conflicts) - 6} ファイル"
+            if len(conflicts) > 6
+            else ""
+        )
+        box.setText(
+            f"{product_label}の同名ファイルがすでに存在します。\n\n"
+            f"{shown}{more}\n\n"
+            "上書きするか、今回の出力一式を別名で保存してください。"
+        )
+        overwrite_btn = box.addButton(
+            "上書き",
+            QMessageBox.ButtonRole.AcceptRole,
+        )
+        rename_btn = box.addButton(
+            "別名で保存",
+            QMessageBox.ButtonRole.ActionRole,
+        )
+        cancel_btn = box.addButton(
+            "キャンセル",
+            QMessageBox.ButtonRole.RejectRole,
+        )
+        box.setDefaultButton(rename_btn)
+        box.exec()
+        clicked = box.clickedButton()
+
+        if clicked is cancel_btn or clicked is None:
+            return None
+        if clicked is overwrite_btn:
+            return self._merge_component_files(staging, final_dir)
+
+        # Find one shared sequence number that is free for the whole export set.
+        sequence = None
+        for index in range(1, 10000):
+            if all(
+                not (
+                    final_dir
+                    / self._numbered_output_name(source.name, index)
+                ).exists()
+                for source in sources
+            ):
+                sequence = index
+                break
+        if sequence is None:
+            raise RuntimeError("別名保存用の連番を確保できませんでした。")
+
+        name_map = {
+            source.name: self._numbered_output_name(
+                source.name,
+                sequence,
+            )
+            for source in sources
+        }
+
+        # Keep JSON references (for example raster_outputs[].png_file) in sync
+        # with the numbered filenames.
+        for source in sources:
+            if source.suffix.lower() != ".json":
+                continue
+            try:
+                data = json.loads(source.read_text(encoding="utf-8"))
+                data = self._replace_json_filename_strings(data, name_map)
+                source.write_text(
+                    json.dumps(data, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+            except Exception:
+                # A layout JSON that is not ours should not block image saving.
+                pass
+
+        written: list[Path] = []
+        for source in sources:
+            target = final_dir / name_map[source.name]
+            source.replace(target)
+            written.append(target)
+        shutil.rmtree(staging)
+        return written
+
+    def _remove_existing_lithic_ortho_files(self, final_dir: Path) -> None:
+        """Remove prior lithic drawing products before regenerating them.
+
+        Measurement CSVs, PLY, transform files, and the in-progress marker are
+        deliberately preserved.
+        """
+        if not self.asset or not final_dir.exists():
+            return
+        stem = self.asset.source_path.stem
+        view_tokens = (
+            "_ortho_",
+            "_front_",
+            "_back_",
+            "_left_",
+            "_right_",
+            "_top_",
+            "_bottom_",
+            "_section_",
+        )
+        for path in list(final_dir.iterdir()):
+            if (
+                path.is_file()
+                and path.name.startswith(stem)
+                and path.suffix.lower() in (".png", ".svg")
+                and any(token in path.name for token in view_tokens)
+            ):
+                path.unlink()
+
+    def _export_lithic_measurements(self):
+        if not self._require_confirmed_lithic_pose():
+            return
+
+        staging = None
+        try:
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            self.lithic_measurement_export_btn.setEnabled(False)
+            self._set_export_progress(5, "石器 計測データを書き出し中")
+            QApplication.processEvents()
+
+            final_m = np.asarray(
+                self.lithic_confirmed_final_matrix,
+                dtype=float,
+            )
+            staging = self._lithic_component_staging_dir("measurements")
+
+            # Per-specimen measurements and section bbox CSVs.
+            self._write_individual_measurement_csv(staging, final_m)
+
+            # Cross-specimen inventories.
+            if not self.export_measurement_inventory(show_message=False):
+                raise RuntimeError("計測一覧の更新に失敗しました。")
+
+            final_dir = self._lithic_final_output_dir()
+            written = self._merge_component_files(staging, final_dir)
+
+            self._set_export_progress(
+                100,
+                f"計測データ出力完了: {final_dir}",
+            )
+            QMessageBox.information(
+                self,
+                "計測データ出力",
+                "計測データを書き出しました。\n"
+                f"保存先: {final_dir}\n"
+                f"個体別CSV: {len(written)} ファイル\n"
+                "あわせて geometry / 3D model inventory を更新しました。",
+            )
+        except Exception as e:
+            if staging is not None and staging.exists():
+                shutil.rmtree(staging, ignore_errors=True)
+            self._set_export_progress(0, "計測データ出力失敗")
+            self._show_error("石器 計測データ出力エラー", e)
+        finally:
+            QApplication.restoreOverrideCursor()
+            if self.asset is not None:
+                self.lithic_measurement_export_btn.setEnabled(True)
+
+    @staticmethod
+    def _png_bytes_per_pixel(paths: list[Path]) -> float | None:
+        """Return the largest observed compressed bytes/pixel ratio."""
+        from PIL import Image
+
+        ratios: list[float] = []
+        for path in paths:
+            if path.suffix.lower() != ".png" or not path.exists():
+                continue
+            try:
+                with Image.open(path) as image:
+                    pixels = int(image.width) * int(image.height)
+                if pixels > 0:
+                    ratios.append(float(path.stat().st_size) / float(pixels))
+            except Exception:
+                continue
+        return max(ratios) if ratios else None
+
+    def _sample_lithic_png_bpp(
+        self,
+        context: dict,
+        views: list[str],
+        modes: list[str],
+        export_png_plain: bool,
+        export_png_outline: bool,
+    ) -> float:
+        """Estimate PNG compression from a low-resolution real render."""
+        if not export_png_plain and not export_png_outline:
+            return self._lithic_default_png_bpp_estimate()
+
+        sample_dir = Path(tempfile.mkdtemp(prefix="aom_png_size_sample_"))
+        try:
+            long_model = max(
+                float(context["sheet_w"]),
+                float(context["sheet_h"]),
+                1.0e-9,
+            )
+            sample_ppu = PNG_FILESIZE_SAMPLE_LONG_EDGE_PX / long_model
+            written = self.export_lithic_orthos(
+                sample_dir,
+                views=views,
+                modes=modes,
+                spacing_mm=float(self.lithic_view_spacing.value()),
+                scale_bar_mm=self._selected_lithic_scale_bar_mm(),
+                outline_width_px=self._selected_lithic_outline_width_px(),
+                individual=False,
+                export_png_plain=export_png_plain,
+                export_svg=False,
+                export_png_outline=export_png_outline,
+                progress_callback=None,
+                pixels_per_model_unit=sample_ppu,
+                png_dpi=None,
+                layout_context=context,
+            )
+            ratio = self._png_bytes_per_pixel(
+                [path for path in written if path.suffix.lower() == ".png"]
+            )
+            if ratio is None:
+                ratio = self._lithic_default_png_bpp_estimate()
+            ratio = float(max(0.02, min(4.0, ratio)))
+            self.lithic_png_bpp_estimate = ratio
+            self._schedule_lithic_output_size_update()
+            return ratio
+        finally:
+            shutil.rmtree(sample_dir, ignore_errors=True)
+
+    def _find_lithic_ppu_for_limit(
+        self,
+        context: dict,
+        views: list[str],
+        bpp: float,
+        target_mb: float | None,
+    ) -> tuple[float, dict]:
+        """Maximize ppu under canvas safety and optional PNG-size limit."""
+        main_rects = context["main_rects"]
+        section_rects = context["section_rects"]
+        spacing_model = float(context["spacing_model"])
+        scale_bar_mm = self._selected_lithic_scale_bar_mm()
+        target_bytes = (
+            None if target_mb is None else float(target_mb) * 1_000_000.0
+        )
+
+        def acceptable(ppu: float) -> tuple[bool, dict]:
+            metrics = self._lithic_canvas_metrics(
+                views,
+                main_rects,
+                section_rects,
+                ppu,
+                scale_bar_mm,
+                spacing_model,
+            )
+            safe = (
+                metrics["canvas_w_px"] <= MAX_PNG_DIMENSION_PX
+                and metrics["canvas_h_px"] <= MAX_PNG_DIMENSION_PX
+                and metrics["pixels"] <= MAX_PNG_PIXELS
+            )
+            if target_bytes is not None:
+                estimated = (
+                    metrics["pixels"]
+                    * float(bpp)
+                    * PNG_FILESIZE_SAFETY_FACTOR
+                )
+                safe = safe and estimated <= target_bytes
+            return bool(safe), metrics
+
+        long_model = max(
+            float(context["sheet_w"]),
+            float(context["sheet_h"]),
+            1.0e-9,
+        )
+        hi = max(1.0, (MAX_PNG_DIMENSION_PX / long_model) * 2.0)
+        # Increase if a very small physical layout still fits at this bound.
+        for _ in range(12):
+            ok, _metrics = acceptable(hi)
+            if not ok:
+                break
+            hi *= 2.0
+        lo = 1.0e-6
+        best_metrics = acceptable(lo)[1]
+        for _ in range(60):
+            mid = (lo + hi) * 0.5
+            ok, metrics = acceptable(mid)
+            if ok:
+                lo = mid
+                best_metrics = metrics
+            else:
+                hi = mid
+        return float(lo), best_metrics
+
+    def _lithic_preflight_text(
+        self,
+        metrics: dict,
+        bpp: float,
+        dpi: float | None,
+        scale: float | None,
+        target_mb: float | None,
+    ) -> tuple[str, bool, bool]:
+        pixels = int(metrics["pixels"])
+        estimated_bytes = (
+            pixels * float(bpp) * PNG_FILESIZE_SAFETY_FACTOR
+        )
+        working_bytes = pixels * PNG_WORKING_BYTES_PER_PIXEL
+        hard = (
+            metrics["canvas_w_px"] > MAX_PNG_DIMENSION_PX
+            or metrics["canvas_h_px"] > MAX_PNG_DIMENSION_PX
+            or pixels > MAX_PNG_PIXELS
+        )
+        warning = (
+            pixels >= PNG_WARNING_PIXELS
+            or working_bytes >= PNG_WARNING_PIXELS * PNG_WORKING_BYTES_PER_PIXEL
+            or (
+                target_mb is None
+                and estimated_bytes >= PNG_WARNING_ESTIMATED_MB * 1_000_000.0
+            )
+            or (
+                dpi is not None
+                and estimated_bytes >= PNG_WARNING_ESTIMATED_MB * 1_000_000.0
+            )
+        )
+
+        lines = [
+            f"画像: {metrics['canvas_w_px']:,} × "
+            f"{metrics['canvas_h_px']:,} px",
+            f"総画素数: {pixels / 1_000_000.0:.1f} MP",
+            f"推定PNG: {self._format_decimal_mb(estimated_bytes)} "
+            f"(安全係数 {PNG_FILESIZE_SAFETY_FACTOR:.1f})",
+            f"処理時メモリ目安: {working_bytes / 1_000_000_000.0:.2f} GB",
+        ]
+        if dpi is not None and scale is not None:
+            print_w_mm = metrics["canvas_w_px"] / float(dpi) * 25.4
+            print_h_mm = metrics["canvas_h_px"] / float(dpi) * 25.4
+            lines.insert(
+                0,
+                f"印刷: {int(round(dpi))} dpi / {scale * 100.0:.4g}% / "
+                f"約 {print_w_mm:.1f} × {print_h_mm:.1f} mm",
+            )
+        elif target_mb is not None:
+            lines.insert(0, f"PNG目標上限: {target_mb:g} MB / 1ファイル")
+        else:
+            lines.insert(0, "Maximum: 現在の安全上限まで")
+
+        if hard:
+            lines.append(
+                f"上限超過: 1辺 {MAX_PNG_DIMENSION_PX:,} px / "
+                f"総画素 {MAX_PNG_PIXELS / 1_000_000:.0f} MP"
+            )
+        elif warning:
+            lines.append("注意: 大容量画像です。書き出しに時間とメモリを要します。")
+        return "\n".join(lines), bool(warning), bool(hard)
+
+    def _resolve_lithic_output_resolution(
+        self,
+        context: dict,
+        views: list[str],
+        modes: list[str],
+        export_png_plain: bool,
+        export_png_outline: bool,
+    ) -> dict | None:
+        """Resolve ppu/dpi, show preflight warnings, and return export config."""
+        mode = self.lithic_image_size_mode_combo.currentText()
+        has_png = bool(export_png_plain or export_png_outline)
+
+        # SVG itself is vector output and has no raster file-size target.
+        # When PNG is not selected, preserve print-resolution semantics in
+        # print mode; file-size mode falls back to the legacy 3600px contour
+        # sampling density solely for SVG outline extraction.
+        if not has_png and mode != "印刷スケール指定":
+            long_model = max(
+                float(context["sheet_w"]),
+                float(context["sheet_h"]),
+                1.0e-9,
+            )
+            ppu = ORTHO_COMPOSITE_LONG_EDGE_PX / long_model
+            metrics = self._lithic_canvas_metrics(
+                views,
+                context["main_rects"],
+                context["section_rects"],
+                ppu,
+                self._selected_lithic_scale_bar_mm(),
+                float(context["spacing_model"]),
+            )
+            return {
+                "ppu": float(ppu),
+                "png_dpi": None,
+                "metrics": metrics,
+                "bpp": self._lithic_default_png_bpp_estimate(),
+                "target_mb": None,
+                "mode": "svg_only",
+            }
+
+        bpp = self._sample_lithic_png_bpp(
+            context,
+            views,
+            modes,
+            export_png_plain,
+            export_png_outline,
+        )
+
+        if mode == "印刷スケール指定":
+            dpi = float(self._selected_lithic_print_dpi())
+            scale = float(self._selected_lithic_print_scale())
+            ppu = dpi / 25.4 * scale * float(self.asset.unit_to_mm)
+            metrics = self._lithic_canvas_metrics(
+                views,
+                context["main_rects"],
+                context["section_rects"],
+                ppu,
+                self._selected_lithic_scale_bar_mm(),
+                float(context["spacing_model"]),
+            )
+            text, warning, hard = self._lithic_preflight_text(
+                metrics, bpp, dpi, scale, None
+            )
+            self.lithic_output_size_label.setText(text.replace("\n", "<br>"))
+            if hard or warning:
+                factor = self._large_raster_preflight_choice(
+                    "画像サイズ上限超過" if hard else "大容量画像の確認",
+                    text,
+                    metrics,
+                    hard=hard,
+                )
+                if factor is None:
+                    return None
+                if factor != 1.0:
+                    ppu *= float(factor)
+                    metrics = self._lithic_canvas_metrics(
+                        views,
+                        context["main_rects"],
+                        context["section_rects"],
+                        ppu,
+                        self._selected_lithic_scale_bar_mm(),
+                        float(context["spacing_model"]),
+                    )
+                    text += (
+                        f"\n→ 書き出し解像度を線寸法 {factor * 100.0:.4g}% "
+                        "へ縮小します。"
+                    )
+                    self.lithic_output_size_label.setText(
+                        text.replace("\n", "<br>")
+                    )
+            return {
+                "ppu": float(ppu),
+                "png_dpi": float(dpi),
+                "metrics": metrics,
+                "bpp": float(bpp),
+                "target_mb": None,
+                "mode": "print",
+            }
+
+        target_mb = self._selected_lithic_file_size_target_mb()
+        ppu, metrics = self._find_lithic_ppu_for_limit(
+            context, views, bpp, target_mb
+        )
+        text, warning, hard = self._lithic_preflight_text(
+            metrics, bpp, None, None, target_mb
+        )
+        self.lithic_output_size_label.setText(text.replace("\n", "<br>"))
+        if hard or warning:
+            factor = self._large_raster_preflight_choice(
+                "画像サイズ上限超過" if hard else "大容量画像の確認",
+                text,
+                metrics,
+                hard=hard,
+            )
+            if factor is None:
+                return None
+            if factor != 1.0:
+                ppu *= float(factor)
+                metrics = self._lithic_canvas_metrics(
+                    views,
+                    context["main_rects"],
+                    context["section_rects"],
+                    ppu,
+                    self._selected_lithic_scale_bar_mm(),
+                    float(context["spacing_model"]),
+                )
+                text += (
+                    f"\n→ 書き出し解像度を線寸法 {factor * 100.0:.4g}% "
+                    "へ縮小します。"
+                )
+                self.lithic_output_size_label.setText(
+                    text.replace("\n", "<br>")
+                )
+        return {
+            "ppu": float(ppu),
+            "png_dpi": None,
+            "metrics": metrics,
+            "bpp": float(bpp),
+            "target_mb": target_mb,
+            "mode": "file_size",
+        }
+
+    def _export_lithic_orthographic_files(self):
+        if not self._confirm_lithic_export_without_measurements("展開図出力"):
+            return
+
+        views = self._selected_lithic_views()
+        modes = self._selected_lithic_modes()
+        export_png_plain = self.lithic_output_png.isChecked()
+        export_svg = self.lithic_output_svg.isChecked()
+        export_png_outline = self.lithic_outline_overlay.isChecked()
+
+        if not views:
+            QMessageBox.warning(
+                self, "未選択", "少なくとも1つの出力面を選択してください。"
+            )
+            return
+        if not export_png_plain and not export_svg and not export_png_outline:
+            QMessageBox.warning(
+                self,
+                "未選択",
+                "PNGのみ / SVG / PNG+輪郭 の少なくとも1つを選択してください。",
+            )
+            return
+        if (export_png_plain or export_png_outline) and not modes:
+            QMessageBox.warning(
+                self,
+                "未選択",
+                "PNG出力では少なくとも1つの表現を選択してください。",
+            )
+            return
+
+        staging = None
+        try:
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            self.lithic_ortho_export_btn.setEnabled(False)
+            self._set_export_progress(2, "画像レイアウトと出力サイズを計算中")
+
+            context = self._build_lithic_output_layout_context(
+                views,
+                float(self.lithic_view_spacing.value()),
+            )
+            resolution = self._resolve_lithic_output_resolution(
+                context,
+                views,
+                modes,
+                export_png_plain,
+                export_png_outline,
+            )
+            if resolution is None:
+                self._set_export_progress(0, "展開図出力をキャンセルしました")
+                return
+
+            ppu = float(resolution["ppu"])
+            png_dpi = resolution["png_dpi"]
+            target_mb = resolution["target_mb"]
+            staging = self._lithic_component_staging_dir("orthos")
+
+            def ortho_progress(frac: float, message: str):
+                self._set_export_progress(
+                    5 + int(88 * float(frac)),
+                    message,
+                )
+
+            def render_once(current_ppu: float) -> list[Path]:
+                return self.export_lithic_orthos(
+                    staging,
+                    views=views,
+                    modes=modes,
+                    spacing_mm=float(self.lithic_view_spacing.value()),
+                    scale_bar_mm=self._selected_lithic_scale_bar_mm(),
+                    outline_width_px=self._selected_lithic_outline_width_px(),
+                    individual=self.lithic_export_individual.isChecked(),
+                    export_png_plain=export_png_plain,
+                    export_svg=export_svg,
+                    export_png_outline=export_png_outline,
+                    progress_callback=ortho_progress,
+                    pixels_per_model_unit=current_ppu,
+                    png_dpi=png_dpi,
+                    layout_context=context,
+                )
+
+            self._set_export_progress(
+                5, "石器オルソ / 輪郭 / 断面生成を開始"
+            )
+            written = render_once(ppu)
+
+            # File-size mode uses a measured low-resolution compression ratio.
+            # If the real full-resolution PNG still exceeds the selected cap,
+            # perform one conservative corrective re-render.
+            if target_mb is not None and (export_png_plain or export_png_outline):
+                target_bytes = float(target_mb) * 1_000_000.0
+                png_now = [
+                    path for path in written
+                    if path.suffix.lower() == ".png" and path.exists()
+                ]
+                max_actual = max(
+                    (float(path.stat().st_size) for path in png_now),
+                    default=0.0,
+                )
+                if max_actual > target_bytes:
+                    correction = math.sqrt(target_bytes / max_actual) * 0.90
+                    correction = max(0.05, min(0.98, correction))
+                    ppu *= correction
+                    shutil.rmtree(staging, ignore_errors=True)
+                    staging.mkdir(parents=True, exist_ok=False)
+                    self._set_export_progress(
+                        5,
+                        "PNG容量を目標値へ補正して再生成中",
+                    )
+                    written = render_once(ppu)
+                    png_now = [
+                        path for path in written
+                        if path.suffix.lower() == ".png" and path.exists()
+                    ]
+                    max_actual = max(
+                        (float(path.stat().st_size) for path in png_now),
+                        default=0.0,
+                    )
+                    if max_actual > target_bytes:
+                        raise RuntimeError(
+                            f"PNG容量を {target_mb:g} MB 以下に収められませんでした。"
+                            "S/M/Lを1段階大きくするか、出力面を減らしてください。"
+                        )
+
+            png_files = [p for p in written if p.suffix.lower() == ".png"]
+            svg_files = [p for p in written if p.suffix.lower() == ".svg"]
+
+            if export_png_plain:
+                plain_pngs = [
+                    p for p in png_files
+                    if not p.stem.endswith("_outline")
+                ]
+                if not plain_pngs:
+                    raise RuntimeError(
+                        "「PNGのみ」がONですがPNGが生成されませんでした。"
+                    )
+            if export_png_outline:
+                outlined_pngs = [
+                    p for p in png_files
+                    if p.stem.endswith("_outline")
+                ]
+                if not outlined_pngs:
+                    raise RuntimeError(
+                        "「PNG+輪郭」がONですが輪郭付きPNGが生成されませんでした。"
+                    )
+            if export_svg and not svg_files:
+                raise RuntimeError(
+                    "「SVG」がONですがSVGが生成されませんでした。"
+                )
+
+            for path in png_files:
+                self._verify_png_file(path)
+            for path in svg_files:
+                self._verify_svg_file(path)
+
+            # Refresh displayed estimate with the actual largest PNG size.
+            if png_files:
+                actual_bpp = self._png_bytes_per_pixel(png_files)
+                if actual_bpp is not None:
+                    self.lithic_png_bpp_estimate = actual_bpp
+                largest_png = max(png_files, key=lambda path: path.stat().st_size)
+                from PIL import Image
+                with Image.open(largest_png) as im:
+                    w_px, h_px = im.size
+                actual_mb = largest_png.stat().st_size / 1_000_000.0
+                self.lithic_output_size_label.setText(
+                    f"実出力: {w_px:,} × {h_px:,} px / "
+                    f"最大PNG {actual_mb:.1f} MB"
+                    + (
+                        f" / {int(round(png_dpi))} dpi metadata"
+                        if png_dpi is not None else ""
+                    )
+                )
+
+            final_dir = self._lithic_final_output_dir()
+            merged = self._merge_layout_files_with_confirmation(
+                staging,
+                final_dir,
+                "石器 展開図",
+            )
+            if merged is None:
+                shutil.rmtree(staging, ignore_errors=True)
+                self._set_export_progress(0, "展開図出力をキャンセルしました")
+                return
+
+            self._set_export_progress(
+                100,
+                f"展開図出力完了: {final_dir}",
+            )
+            QMessageBox.information(
+                self,
+                "展開図出力",
+                f"展開図を書き出しました。\n保存先: {final_dir}\n"
+                f"出力ファイル: {len(merged)}",
+            )
+        except Exception as e:
+            if staging is not None and staging.exists():
+                shutil.rmtree(staging, ignore_errors=True)
+            self._set_export_progress(0, "展開図出力失敗")
+            self._show_error("石器 展開図出力エラー", e)
+        finally:
+            QApplication.restoreOverrideCursor()
+            if self.asset is not None:
+                self.lithic_ortho_export_btn.setEnabled(True)
+
+    def _write_lithic_transform_files(
+        self,
+        out_dir: Path,
+        final_m: np.ndarray,
+    ) -> list[Path]:
+        """Write transform metadata associated with the PLY product."""
+        written: list[Path] = []
+
+        json_path = out_dir / "transform.json"
+        export_transform_json(json_path, self._metadata(final_m))
+        written.append(json_path)
+
+        if getattr(self, "lithic_pose_base_mode", "automatic") == "input":
+            # No OBB stage exists in input-pose mode, so avoid misleading
+            # original_to_obb filenames and write the actual final transform.
+            csv_path = out_dir / "transform_matrix.csv"
+            txt_path = out_dir / "transform_matrix_cloudcompare.txt"
+            export_matrix_csv(csv_path, final_m)
+            export_matrix_txt(txt_path, final_m)
+            written.extend([csv_path, txt_path])
+            return written
+
+        csv_path = out_dir / "transform_original_to_obb.csv"
+        txt_path = out_dir / "transform_original_to_obb_cloudcompare.txt"
+        export_matrix_csv(csv_path, self.lithic_original_to_obb_matrix)
+        export_matrix_txt(txt_path, self.lithic_original_to_obb_matrix)
+        written.extend([csv_path, txt_path])
+
+        has_post_obb = not np.allclose(
+            self.lithic_obb_to_result_matrix,
+            np.eye(4),
+            atol=1e-9,
+            rtol=0.0,
+        )
+        if has_post_obb:
+            csv_path = out_dir / "transform_obb_to_result.csv"
+            txt_path = out_dir / "transform_obb_to_result_cloudcompare.txt"
+            export_matrix_csv(csv_path, self.lithic_obb_to_result_matrix)
+            export_matrix_txt(txt_path, self.lithic_obb_to_result_matrix)
+            written.extend([csv_path, txt_path])
+
+        return written
+
+    def _export_lithic_ply_files(self):
+        if not self._confirm_lithic_export_without_measurements(
+            "PLY / Transform出力"
+        ):
+            return
+
+        staging = None
+        try:
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            self.lithic_ply_export_btn.setEnabled(False)
+            staging = self._lithic_component_staging_dir("ply")
+
+            final_m = np.asarray(
+                self.lithic_confirmed_final_matrix,
+                dtype=float,
+            )
+            stem = self.asset.source_path.stem
+            mesh_path = staging / f"{stem}_rev.ply"
+
+            self._set_export_progress(
+                10, f"正規化PLYを書き出し中: {mesh_path.name}"
+            )
+            export_normalized_mesh(self.asset, final_m, mesh_path)
+            self._set_export_progress(70, "Transform情報を書き出し中")
+            self._write_lithic_transform_files(staging, final_m)
+
+            final_dir = self._lithic_final_output_dir()
+            merged = self._merge_component_files(staging, final_dir)
+
+            self._set_export_progress(
+                100,
+                f"PLY / Transform出力完了: {final_dir}",
+            )
+            QMessageBox.information(
+                self,
+                "PLY / Transform出力",
+                f"PLYとTransform情報を書き出しました。\n"
+                f"保存先: {final_dir}\n"
+                f"出力ファイル: {len(merged)}",
+            )
+        except Exception as e:
+            if staging is not None and staging.exists():
+                shutil.rmtree(staging, ignore_errors=True)
+            self._set_export_progress(0, "PLY / Transform出力失敗")
+            self._show_error("石器 PLY / Transform出力エラー", e)
+        finally:
+            QApplication.restoreOverrideCursor()
+            if self.asset is not None:
+                self.lithic_ply_export_btn.setEnabled(True)
+
+    def _finish_lithic_and_next(self):
+        """Mark split export work complete and advance the input queue."""
+        if not self.asset or not self._is_lithic():
+            return
+
+        final_dir = OUTPUT_DIR / self.asset.source_path.stem
+        if not final_dir.exists():
+            answer = QMessageBox.question(
+                self,
+                "出力なし",
+                "この資料ではまだ出力ファイルが作成されていません。\n"
+                "出力なしで完了扱いにして次のファイルへ進みますか？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            final_dir.mkdir(parents=True, exist_ok=True)
+
+        marker = final_dir / SPLIT_EXPORT_IN_PROGRESS_MARKER
+        if marker.exists():
+            marker.unlink()
+
+        self.statusBar().showMessage(
+            f"完了: {self.asset.source_path.name} — 次のファイルへ進みます。"
+        )
+        self.scan_queue_and_load()
+
+    def _require_confirmed_pottery_pose(self) -> bool:
+        if not self.asset or self._is_lithic() or not self.posture_done:
+            QMessageBox.warning(
+                self, "姿勢未決定", "先に土器の姿勢と正面を確定してください。"
+            )
+            return False
+        return True
+
+    def _confirm_pottery_export_without_measurements(
+        self,
+        product_label: str,
+    ) -> bool:
+        if not self._require_confirmed_pottery_pose():
+            return False
+        final_matrix = np.asarray(self._current_final_matrix(), dtype=float)
+        if self._inventory_is_current(final_matrix):
+            return True
+        answer = QMessageBox.question(
+            self,
+            "計測データ未保存",
+            "現在の姿勢・単位に対応する計測データが保存されていません。\n\n"
+            f"計測データを保存せずに「{product_label}」を実行しますか？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
+    def _pottery_final_output_dir(self) -> Path:
+        if not self.asset:
+            raise RuntimeError("モデルが読み込まれていません。")
+        final_dir = OUTPUT_DIR / self.asset.source_path.stem
+        final_dir.mkdir(parents=True, exist_ok=True)
+        (final_dir / SPLIT_EXPORT_IN_PROGRESS_MARKER).touch(exist_ok=True)
+        return final_dir
+
+    def _pottery_component_staging_dir(self, component: str) -> Path:
+        if not self.asset:
+            raise RuntimeError("モデルが読み込まれていません。")
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        staging = OUTPUT_DIR / (
+            f"{self.asset.source_path.stem}.__working_pottery_{component}__"
+        )
+        if staging.exists():
+            shutil.rmtree(staging)
+        staging.mkdir(parents=True, exist_ok=False)
+        return staging
+
+    def _remove_existing_pottery_layout_files(
+        self,
+        final_dir: Path,
+        branch: str,
+    ) -> None:
+        if not self.asset or not final_dir.exists():
+            return
+        stem = self.asset.source_path.stem
+        for path in list(final_dir.iterdir()):
+            if not path.is_file():
+                continue
+            name = path.name
+            if branch == "cylindrical":
+                if name.startswith(f"{stem}_cylindrical_"):
+                    path.unlink()
+                continue
+            if branch == "fan":
+                if name.startswith(f"{stem}_fan_"):
+                    path.unlink()
+                continue
+            if path.suffix.lower() not in (".png", ".svg"):
+                continue
+            ortho_tokens = (
+                f"{stem}_ortho_",
+                f"{stem}_front_",
+                f"{stem}_back_",
+                f"{stem}_left_",
+                f"{stem}_right_",
+                f"{stem}_top_",
+                f"{stem}_bottom_",
+                f"{stem}_section",
+            )
+            if name.startswith(ortho_tokens):
+                path.unlink()
+
+    def _export_pottery_measurements(self):
+        if not self._require_confirmed_pottery_pose():
+            return
+        staging = None
+        try:
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            self.pottery_measurement_export_btn.setEnabled(False)
+            self._set_export_progress(5, "土器 計測データを書き出し中")
+            final_m = np.asarray(self._current_final_matrix(), dtype=float)
+            staging = self._pottery_component_staging_dir("measurements")
+            self._write_individual_measurement_csv(staging, final_m)
+            if not self.export_measurement_inventory(show_message=False):
+                raise RuntimeError("計測一覧の更新に失敗しました。")
+            final_dir = self._pottery_final_output_dir()
+            merged = self._merge_component_files(staging, final_dir)
+            self._set_export_progress(100, f"計測データ出力完了: {final_dir}")
+            QMessageBox.information(
+                self,
+                "計測データ出力",
+                f"計測データを書き出しました。\n保存先: {final_dir}\n"
+                f"個体別CSV: {len(merged)} ファイル\n"
+                "あわせて geometry / 3D model inventory を更新しました。",
+            )
+        except Exception as e:
+            if staging is not None and staging.exists():
+                shutil.rmtree(staging, ignore_errors=True)
+            self._set_export_progress(0, "計測データ出力失敗")
+            self._show_error("土器 計測データ出力エラー", e)
+        finally:
+            QApplication.restoreOverrideCursor()
+            if self.asset is not None:
+                self.pottery_measurement_export_btn.setEnabled(True)
+
+    def _export_pottery_ply_files(self):
+        if not self._confirm_pottery_export_without_measurements(
+            "PLY / Transform出力"
+        ):
+            return
+        staging = None
+        try:
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            self.pottery_ply_export_btn.setEnabled(False)
+            staging = self._pottery_component_staging_dir("ply")
+            final_m = np.asarray(self._current_final_matrix(), dtype=float)
+            stem = self.asset.source_path.stem
+            mesh_path = staging / f"{stem}_rev.ply"
+            self._set_export_progress(10, f"正規化PLYを書き出し中: {mesh_path.name}")
+            export_normalized_mesh(self.asset, final_m, mesh_path)
+            self._set_export_progress(65, "Transform情報を書き出し中")
+            export_transform_json(staging / "transform.json", self._metadata(final_m))
+            export_matrix_csv(staging / "transform_matrix.csv", final_m)
+            export_matrix_txt(staging / "transform_matrix_cloudcompare.txt", final_m)
+            final_dir = self._pottery_final_output_dir()
+            merged = self._merge_component_files(staging, final_dir)
+            self._set_export_progress(100, f"PLY / Transform出力完了: {final_dir}")
+            QMessageBox.information(
+                self,
+                "PLY / Transform出力",
+                f"PLYとTransform情報を書き出しました。\n保存先: {final_dir}\n"
+                f"出力ファイル: {len(merged)}",
+            )
+        except Exception as e:
+            if staging is not None and staging.exists():
+                shutil.rmtree(staging, ignore_errors=True)
+            self._set_export_progress(0, "PLY / Transform出力失敗")
+            self._show_error("土器 PLY / Transform出力エラー", e)
+        finally:
+            QApplication.restoreOverrideCursor()
+            if self.asset is not None:
+                self.pottery_ply_export_btn.setEnabled(True)
+
+    def _validate_pottery_ortho_selection(self) -> tuple[list[str], list[str]] | None:
+        views = [k for k, cb in self.view_checks.items() if cb.isChecked()]
+        modes = self._selected_render_modes()
+        export_png_plain = self.output_png.isChecked()
+        export_svg = self.output_svg.isChecked()
+        export_png_outline = self.outline_overlay.isChecked()
+        if not views:
+            QMessageBox.warning(self, "未選択", "少なくとも1つのオルソ面を選択してください。")
+            return None
+        if not export_png_plain and not export_svg and not export_png_outline:
+            QMessageBox.warning(
+                self,
+                "未選択",
+                "PNGのみ / SVG / PNG+輪郭 の少なくとも1つを選択してください。",
+            )
+            return None
+        if (export_png_plain or export_png_outline) and not modes:
+            QMessageBox.warning(
+                self,
+                "未選択",
+                "PNG出力では少なくとも1つのオルソ表現を選択してください。",
+            )
+            return None
+        base_modes = [m for m in modes if m in ("texture", "texture_normal", "shade")]
+        if (
+            (export_png_plain or export_png_outline)
+            and any(m in modes for m in ("section", "half_section", "quarter_half_section"))
+            and not base_modes
+        ):
+            QMessageBox.warning(
+                self,
+                "未選択",
+                "縦断面・半截・1/4半截をPNGへ配置する場合は、"
+                "テクスチャ / Normal / シェードのいずれか1つ以上を選択してください。",
+            )
+            return None
+        return views, modes
+
+    def _export_pottery_current_layout(self):
+        branch = self._pottery_output_branch_key()
+        label = {
+            "ortho": "オルソ展開図出力",
+            "cylindrical": "円筒展開図出力",
+            "fan": "扇形展開図出力",
+        }[branch]
+        if not self._confirm_pottery_export_without_measurements(label):
+            return
+
+        staging = None
+        try:
+            if branch == "ortho":
+                selection = self._validate_pottery_ortho_selection()
+                if selection is None:
+                    return
+                views, modes = selection
+            elif branch == "cylindrical":
+                self._pottery_cylinder_segments_mm()
+            else:
+                self._pottery_fan_profile_mm()
+
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            self.pottery_layout_export_btn.setEnabled(False)
+            staging = self._pottery_component_staging_dir(branch)
+
+            if branch == "ortho":
+                export_png_plain = self.output_png.isChecked()
+                export_svg = self.output_svg.isChecked()
+                export_png_outline = self.outline_overlay.isChecked()
+                if export_png_plain or export_png_outline:
+                    resolution = self._resolve_pottery_ortho_resolution(
+                        views, modes, preflight=True
+                    )
+                    if resolution is None:
+                        shutil.rmtree(staging, ignore_errors=True)
+                        return
+                else:
+                    context = self._build_pottery_ortho_layout_context(
+                        views, modes, float(self.view_spacing.value())
+                    )
+                    resolution = {
+                        "ppu": ORTHO_COMPOSITE_LONG_EDGE_PX / max(
+                            float(context["sheet_w"]),
+                            float(context["sheet_h"]),
+                            1.0e-9,
+                        ),
+                        "png_dpi": None,
+                        "target_mb": None,
+                        "context": context,
+                    }
+
+                def ortho_progress(frac: float, message: str):
+                    self._set_export_progress(5 + int(88 * float(frac)), message)
+
+                written = self.export_orthos(
+                    staging,
+                    views=views,
+                    modes=modes,
+                    spacing_mm=float(self.view_spacing.value()),
+                    scale_bar_mm=self._selected_scale_bar_mm(),
+                    outline_width_px=self._selected_outline_width_px(),
+                    individual=self.export_individual.isChecked(),
+                    export_png_plain=export_png_plain,
+                    export_svg=export_svg,
+                    export_png_outline=export_png_outline,
+                    progress_callback=ortho_progress,
+                    pixels_per_model_unit=float(resolution["ppu"]),
+                    png_dpi=resolution.get("png_dpi"),
+                    layout_context=resolution["context"],
+                )
+
+                target_mb = resolution.get("target_mb")
+                png_files = [p for p in written if p.suffix.lower() == ".png"]
+                if target_mb is not None and png_files:
+                    largest = max(p.stat().st_size for p in png_files)
+                    target_bytes = float(target_mb) * 1_000_000.0
+                    if largest > target_bytes:
+                        ratio = math.sqrt(target_bytes / max(largest, 1)) * 0.97
+                        corrected_ppu = max(0.01, float(resolution["ppu"]) * ratio)
+                        shutil.rmtree(staging)
+                        staging.mkdir(parents=True, exist_ok=False)
+                        written = self.export_orthos(
+                            staging,
+                            views=views,
+                            modes=modes,
+                            spacing_mm=float(self.view_spacing.value()),
+                            scale_bar_mm=self._selected_scale_bar_mm(),
+                            outline_width_px=self._selected_outline_width_px(),
+                            individual=self.export_individual.isChecked(),
+                            export_png_plain=export_png_plain,
+                            export_svg=export_svg,
+                            export_png_outline=export_png_outline,
+                            progress_callback=ortho_progress,
+                            pixels_per_model_unit=corrected_ppu,
+                            png_dpi=None,
+                            layout_context=resolution["context"],
+                        )
+                for p in [x for x in written if x.suffix.lower() == ".png"]:
+                    self._verify_png_file(p)
+                for p in [x for x in written if x.suffix.lower() == ".svg"]:
+                    self._verify_svg_file(p)
+            else:
+                self._set_export_progress(5, f"{label}を生成中")
+                written = self.export_pottery_curved_unwrap(
+                    staging,
+                    kind=branch,
+                    preview_long_edge_px=None,
+                    preflight=True,
+                )
+                if not written:
+                    shutil.rmtree(staging, ignore_errors=True)
+                    return
+                for p in [x for x in written if x.suffix.lower() == ".png"]:
+                    self._verify_png_file(p)
+
+            final_dir = self._pottery_final_output_dir()
+            merged = self._merge_layout_files_with_confirmation(
+                staging,
+                final_dir,
+                label,
+            )
+            if merged is None:
+                shutil.rmtree(staging, ignore_errors=True)
+                self._set_export_progress(0, f"{label}をキャンセルしました")
+                return
+            self._set_export_progress(100, f"{label}完了: {final_dir}")
+            QMessageBox.information(
+                self,
+                label,
+                f"書き出しが完了しました。\n保存先: {final_dir}\n"
+                f"出力ファイル: {len(merged)}\n\n"
+                "出力方式を切り替えると、同じ資料について別の展開図を続けて出力できます。",
+            )
+        except Exception as e:
+            if staging is not None and staging.exists():
+                shutil.rmtree(staging, ignore_errors=True)
+            self._set_export_progress(0, f"{label}失敗")
+            self._show_error(f"土器 {label}エラー", e)
+        finally:
+            QApplication.restoreOverrideCursor()
+            if self.asset is not None:
+                self.pottery_layout_export_btn.setEnabled(True)
+
+    def _finish_pottery_and_next(self):
+        if not self.asset or self._is_lithic():
+            return
+        final_dir = OUTPUT_DIR / self.asset.source_path.stem
+        if not final_dir.exists():
+            answer = QMessageBox.question(
+                self,
+                "出力なし",
+                "この資料ではまだ出力ファイルが作成されていません。\n"
+                "出力なしで完了扱いにして次のファイルへ進みますか？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            final_dir.mkdir(parents=True, exist_ok=True)
+        marker = final_dir / SPLIT_EXPORT_IN_PROGRESS_MARKER
+        if marker.exists():
+            marker.unlink()
+        self.statusBar().showMessage(
+            f"完了: {self.asset.source_path.name} — 次のファイルへ進みます。"
+        )
+        self.scan_queue_and_load()
+
+    def save_current_and_next(self):
+        """Legacy compatibility entry point.
+
+        v1.0.0 keeps pottery outputs separated so that orthographic, cylindrical,
+        and fan developments can be exported consecutively before advancing.
+        """
+        if self._is_lithic():
+            QMessageBox.information(
+                self,
+                "石器出力",
+                "石器は個別の出力ボタンを使用してください。",
+            )
+            return
+        QMessageBox.information(
+            self,
+            "土器出力",
+            "v1.0.0では「計測データ出力」「現在の展開図を出力」"
+            "「PLY / Transform出力」を個別に使用し、最後に「次のファイルへ」を押します。",
+        )
+
+    @staticmethod
+    def _verify_png_file(path: Path) -> None:
+        from PIL import Image
+        if not path.exists() or path.stat().st_size <= 0:
+            raise RuntimeError(f"PNGが空または存在しません: {path.name}")
+        try:
+            with Image.open(path) as im:
+                im.verify()
+        except Exception as e:
+            raise RuntimeError(f"PNGが不正です: {path.name}: {e}") from e
+
+    @staticmethod
+    def _verify_svg_file(path: Path) -> None:
+        import xml.etree.ElementTree as ET
+        if not path.exists() or path.stat().st_size <= 0:
+            raise RuntimeError(f"SVGが空または存在しません: {path.name}")
+        try:
+            root = ET.parse(path).getroot()
+        except Exception as e:
+            raise RuntimeError(f"SVG XMLが不正です: {path.name}: {e}") from e
+        view_box = root.attrib.get("viewBox", "").split()
+        if len(view_box) != 4:
+            raise RuntimeError(f"SVG viewBoxが不正です: {path.name}")
+        ns = {"svg": "http://www.w3.org/2000/svg"}
+        if not root.findall(".//svg:path", ns):
+            raise RuntimeError(f"SVGに輪郭pathがありません: {path.name}")
+
+    # ---------- Orthographic composite export ----------
+    @staticmethod
+    def _view_size(bounds: np.ndarray, view: str) -> tuple[float, float]:
+        dx = float(bounds[1] - bounds[0])
+        dy = float(bounds[3] - bounds[2])
+        dz = float(bounds[5] - bounds[4])
+        if view in ("front", "back"):
+            return dx, dz
+        if view in ("left", "right"):
+            return dy, dz
+        if view in ("top", "bottom"):
+            return dx, dy
+        raise ValueError(view)
+
+    @staticmethod
+    def _layout_rects(bounds: np.ndarray, spacing_model: float) -> dict[str, tuple[float, float, float, float]]:
+        dx = float(bounds[1] - bounds[0])
+        dy = float(bounds[3] - bounds[2])
+        dz = float(bounds[5] - bounds[4])
+        s = float(spacing_model)
+        return {
+            "front": (0.0, 0.0, dx, dz),
+            "left": (-(s + dy), 0.0, -s, dz),
+            "right": (dx + s, 0.0, dx + s + dy, dz),
+            "back": (dx + 2.0 * s + dy, 0.0, 2.0 * dx + 2.0 * s + dy, dz),
+            "top": (0.0, dz + s, dx, dz + s + dy),
+            "bottom": (0.0, -(s + dy), dx, -s),
+        }
+
+
+    @staticmethod
+    def _layout_with_auxiliary_panels(
+        bounds: np.ndarray,
+        spacing_model: float,
+        selected_views: list[str],
+        include_quarter: bool,
+        include_half: bool,
+        include_section: bool,
+    ) -> tuple[
+        dict[str, tuple[float, float, float, float]],
+        dict[str, tuple[float, float, float, float]],
+    ]:
+        """Return shifted ortho rects and auxiliary panel rects.
+
+        Horizontal order around the front view:
+            front - quarter - half - right
+
+        Therefore, for six views with all auxiliary panels:
+            front_outline - left - front - quarter - half - right - back - section
+
+        If quarter is OFF but half is ON:
+            front_outline - left - front - half - right - back - section
+
+        Top and bottom remain vertically aligned with front.
+        """
+        rects = MainWindow._layout_rects(bounds, spacing_model)
+        dx = float(bounds[1] - bounds[0])
+        dz = float(bounds[5] - bounds[4])
+        s = float(spacing_model)
+
+        inserted_count = int(bool(include_quarter)) + int(bool(include_half))
+        if inserted_count:
+            shift = inserted_count * (dx + s)
+            for key in ("right", "back"):
+                x0, y0, x1, y1 = rects[key]
+                rects[key] = (x0 + shift, y0, x1 + shift, y1)
+
+        selected_rects = [rects[v] for v in selected_views]
+        aux: dict[str, tuple[float, float, float, float]] = {}
+
+        _fx0, _fy0, fx1, _fy1 = rects["front"]
+        cursor_x = fx1 + s
+
+        if include_quarter:
+            aux["quarter_panel"] = (cursor_x, 0.0, cursor_x + dx, dz)
+            cursor_x += dx + s
+
+        if include_half:
+            aux["half_panel"] = (cursor_x, 0.0, cursor_x + dx, dz)
+            cursor_x += dx + s
+
+        left_candidates = list(selected_rects)
+        left_candidates.extend(
+            aux[key]
+            for key in ("quarter_panel", "half_panel")
+            if key in aux
+        )
+        min_x = min(r[0] for r in left_candidates)
+        max_x = max(r[2] for r in left_candidates)
+
+        # Front outline is always the leftmost composite panel.
+        aux["front_outline_panel"] = (min_x - s - dx, 0.0, min_x - s, dz)
+
+        # Vertical section is always the rightmost composite panel.
+        if include_section:
+            aux["section_panel"] = (max_x + s, 0.0, max_x + s + dx, dz)
+
+        return rects, aux
+
+    def _paths_to_rgba(
+        self,
+        paths: list[np.ndarray],
+        bounds: np.ndarray,
+        view: str,
+        ppu: float,
+        width_px: int,
+        fill_section: bool = False,
+    ) -> np.ndarray:
+        from PIL import Image, ImageDraw
+
+        world_w, world_h = self._view_size(bounds, view)
+        width = max(64, int(round(max(world_w, 1e-9) * ppu)))
+        height = max(64, int(round(max(world_h, 1e-9) * ppu)))
+        img = Image.new("RGBA", (width, height), (255, 255, 255, 0))
+        draw = ImageDraw.Draw(img)
+        if fill_section:
+            self._fill_section_paths(
+                draw,
+                paths,
+                width_px,
+                canvas_size=(width, height),
+            )
+        else:
+            self._draw_polyline_paths(draw, paths, width_px)
+        return np.asarray(img, dtype=np.uint8)
+
+    @staticmethod
+    def _mode_appearance_flags(mode: str) -> tuple[bool, bool]:
+        if mode == "texture":
+            return True, False
+        if mode == "texture_normal":
+            return True, True
+        if mode == "shade":
+            return False, True
+        raise ValueError(mode)
+
+    def _half_panel_for_mode(
+        self,
+        poly: pv.PolyData,
+        bounds: np.ndarray,
+        ppu: float,
+        mode: str,
+        section_paths_3d: list[np.ndarray],
+        section_fill_width_px: int,
+    ) -> np.ndarray:
+        """Render the front-half-removed model and fill its cut face black."""
+        from PIL import Image, ImageDraw
+
+        use_appearance, lighting = self._mode_appearance_flags(mode)
+        plane_y = (float(bounds[2]) + float(bounds[3])) / 2.0
+
+        # Front camera is on -Y. Keep y >= mid-plane, removing the front half.
+        half_poly = poly.clip(
+            normal=(0, 1, 0),
+            origin=(0, plane_y, 0),
+            invert=False,
+        )
+        if half_poly.n_points == 0:
+            raise RuntimeError("半截モデルの生成に失敗しました。")
+
+        half = self._render_poly_views(
+            half_poly,
+            bounds,
+            ["front"],
+            ppu,
+            use_appearance=use_appearance,
+            lighting=lighting,
+            progress_callback=None,
+            progress_mode_label=f"{mode}_half",
+        )["front"]
+
+        projected = self._project_world_paths_to_pixels(
+            section_paths_3d, bounds, "front", ppu
+        )
+        half_im = Image.fromarray(np.asarray(half, dtype=np.uint8), mode="RGBA")
+        draw = ImageDraw.Draw(half_im)
+        self._fill_section_paths(
+            draw,
+            projected,
+            section_fill_width_px,
+            canvas_size=half_im.size,
+        )
+        return np.asarray(half_im, dtype=np.uint8)
+
+    def _quarter_panel_for_mode(
+        self,
+        poly: pv.PolyData,
+        bounds: np.ndarray,
+        ppu: float,
+        mode: str,
+        section_paths_3d: list[np.ndarray],
+        section_fill_width_px: int,
+        half_panel: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Create 1/4 half-section: left half full front, right half half-section."""
+        use_appearance, lighting = self._mode_appearance_flags(mode)
+
+        full = self._render_poly_views(
+            poly,
+            bounds,
+            ["front"],
+            ppu,
+            use_appearance=use_appearance,
+            lighting=lighting,
+            progress_callback=None,
+            progress_mode_label=f"{mode}_quarter_full",
+        )["front"]
+
+        if half_panel is None:
+            half_panel = self._half_panel_for_mode(
+                poly,
+                bounds,
+                ppu,
+                mode,
+                section_paths_3d,
+                section_fill_width_px,
+            )
+
+        return self._split_left_right(full, half_panel)
+
+    @staticmethod
+    def _camera_for_view(bounds: np.ndarray, view: str):
+        center = np.array([
+            (bounds[0] + bounds[1]) / 2,
+            (bounds[2] + bounds[3]) / 2,
+            (bounds[4] + bounds[5]) / 2,
+        ], dtype=float)
+        max_extent = max(bounds[1]-bounds[0], bounds[3]-bounds[2], bounds[5]-bounds[4], 1e-9)
+        dist = float(max_extent) * 3.0
+        if view == "front":
+            pos, up = center + np.array([0, -dist, 0]), np.array([0, 0, 1])
+        elif view == "back":
+            pos, up = center + np.array([0, dist, 0]), np.array([0, 0, 1])
+        elif view == "right":
+            pos, up = center + np.array([dist, 0, 0]), np.array([0, 0, 1])
+        elif view == "left":
+            pos, up = center + np.array([-dist, 0, 0]), np.array([0, 0, 1])
+        elif view == "top":
+            pos, up = center + np.array([0, 0, dist]), np.array([0, 1, 0])
+        elif view == "bottom":
+            pos, up = center + np.array([0, 0, -dist]), np.array([0, 1, 0])
+        else:
+            raise ValueError(view)
+        return pos, center, up
+
+
+    def _projection_frame(self, bounds: np.ndarray, view: str):
+        from itertools import product
+
+        pos, center, up = self._camera_for_view(bounds, view)
+        pos = np.asarray(pos, dtype=float)
+        center = np.asarray(center, dtype=float)
+        up = np.asarray(up, dtype=float)
+
+        forward = center - pos
+        forward /= max(np.linalg.norm(forward), 1e-12)
+        right = np.cross(forward, up)
+        right /= max(np.linalg.norm(right), 1e-12)
+        true_up = np.cross(right, forward)
+        true_up /= max(np.linalg.norm(true_up), 1e-12)
+
+        corners = np.array(
+            list(product(
+                [bounds[0], bounds[1]],
+                [bounds[2], bounds[3]],
+                [bounds[4], bounds[5]],
+            )),
+            dtype=float,
+        )
+        rel = corners - center
+        u = rel @ right
+        v = rel @ true_up
+        return center, right, true_up, float(u.min()), float(u.max()), float(v.min()), float(v.max())
+
+    def _project_world_paths_to_pixels(
+        self,
+        paths_3d: list[np.ndarray],
+        bounds: np.ndarray,
+        view: str,
+        pixels_per_model_unit: float,
+    ) -> list[np.ndarray]:
+        center, right, true_up, umin, _umax, _vmin, vmax = self._projection_frame(bounds, view)
+        projected: list[np.ndarray] = []
+        for path in paths_3d:
+            if len(path) < 2:
+                continue
+            rel = np.asarray(path, dtype=float) - center
+            u = rel @ right
+            v = rel @ true_up
+            x = (u - umin) * float(pixels_per_model_unit)
+            y = (vmax - v) * float(pixels_per_model_unit)
+            projected.append(np.column_stack([x, y]))
+        return projected
+
+    @staticmethod
+    def _draw_polyline_paths(
+        draw,
+        paths: list[np.ndarray],
+        width_px: int,
+        fill=(0, 0, 0, 255),
+    ):
+        """Draw section/outline polylines exactly as supplied.
+
+        In particular, open section paths are *not* force-closed.  This keeps
+        line/SVG output faithful to vtkCutter/vtkStripper and prevents a long
+        artificial diagonal between unrelated endpoints.
+        """
+        width_px = max(1, int(width_px))
+        for path in paths:
+            arr = np.asarray(path, dtype=float)
+            if len(arr) < 2:
+                continue
+            pts = [
+                (int(round(float(x))), int(round(float(y))))
+                for x, y in arr
+                if np.isfinite(x) and np.isfinite(y)
+            ]
+            if len(pts) >= 2:
+                draw.line(
+                    pts,
+                    fill=fill,
+                    width=width_px,
+                    joint="curve",
+                )
+
+    @staticmethod
+    def _clean_section_path_2d(path: np.ndarray) -> np.ndarray:
+        """Remove non-finite and consecutive duplicate 2D points."""
+        arr = np.asarray(path, dtype=float)
+        if arr.ndim != 2 or arr.shape[1] < 2:
+            return np.empty((0, 2), dtype=float)
+        arr = arr[:, :2]
+        arr = arr[np.isfinite(arr).all(axis=1)]
+        if len(arr) < 2:
+            return arr
+
+        keep = np.ones(len(arr), dtype=bool)
+        delta = np.linalg.norm(np.diff(arr, axis=0), axis=1)
+        keep[1:] = delta > 1.0e-6
+        return arr[keep]
+
+    @staticmethod
+    def _section_path_tangent(
+        path: np.ndarray,
+        at_start: bool,
+        sample_count: int = 4,
+    ) -> np.ndarray | None:
+        """Return the tangent pointing *into* the path from an endpoint."""
+        arr = np.asarray(path, dtype=float)
+        if len(arr) < 2:
+            return None
+
+        k = min(max(1, int(sample_count)), len(arr) - 1)
+        if at_start:
+            vec = arr[k] - arr[0]
+        else:
+            vec = arr[-1] - arr[-1 - k]
+
+        norm = float(np.linalg.norm(vec))
+        if norm <= 1.0e-12:
+            return None
+        return vec / norm
+
+    @staticmethod
+    def _section_connection_is_smooth(
+        path_a: np.ndarray,
+        path_b: np.ndarray,
+        max_angle_deg: float = 60.0,
+    ) -> bool:
+        """Check a proposed A(end) -> B(start) small-gap bridge."""
+        a = np.asarray(path_a, dtype=float)
+        b = np.asarray(path_b, dtype=float)
+        if len(a) < 2 or len(b) < 2:
+            return False
+
+        connection = b[0] - a[-1]
+        distance = float(np.linalg.norm(connection))
+        if distance <= 1.0e-12:
+            return True
+        conn = connection / distance
+
+        # A tangent must continue toward the bridge.
+        ta_into = MainWindow._section_path_tangent(a, at_start=False)
+        # _section_path_tangent(end) points from interior -> end, which is
+        # exactly the outward continuation direction at A.
+        # B tangent at start points from start -> interior.
+        tb_into = MainWindow._section_path_tangent(b, at_start=True)
+        if ta_into is None or tb_into is None:
+            return False
+
+        cos_limit = float(np.cos(np.deg2rad(max_angle_deg)))
+        return (
+            float(np.dot(ta_into, conn)) >= cos_limit
+            and float(np.dot(tb_into, conn)) >= cos_limit
+        )
+
+    @staticmethod
+    def _repair_section_paths_for_fill(
+        paths: list[np.ndarray],
+        canvas_size: tuple[int, int],
+    ) -> tuple[list[np.ndarray], list[np.ndarray], dict]:
+        """Reconstruct fill contours without altering visible section lines.
+
+        Vector repair stages:
+          1. clean consecutive duplicates,
+          2. snap/merge nearly coincident endpoints,
+          3. bridge only small gaps whose tangent directions are compatible,
+          4. close only small, compatible self-gaps.
+
+        Large gaps are never bridged here.
+        """
+        width, height = [max(1, int(v)) for v in canvas_size]
+        diagonal = float(np.hypot(width, height))
+
+        # Pixel-domain tolerances.  They scale with exported image size but
+        # remain bounded so high-resolution exports do not permit large,
+        # invented bridges.
+        snap_tol = max(1.25, min(3.0, diagonal * 0.0006))
+        gap_tol = max(3.0, min(12.0, diagonal * 0.0025))
+        tangent_limit_deg = 60.0
+
+        work = [
+            MainWindow._clean_section_path_2d(path)
+            for path in paths
+        ]
+        work = [path.copy() for path in work if len(path) >= 2]
+
+        def oriented_for_end(path: np.ndarray, endpoint: int) -> np.ndarray:
+            # endpoint 0=start, 1=end.  Return path with selected endpoint last.
+            return path[::-1].copy() if endpoint == 0 else path.copy()
+
+        def oriented_for_start(path: np.ndarray, endpoint: int) -> np.ndarray:
+            # Return path with selected endpoint first.
+            return path.copy() if endpoint == 0 else path[::-1].copy()
+
+        merge_count = 0
+        bridge_count = 0
+
+        # Greedy nearest admissible endpoint joining.  Section contour counts
+        # are normally small, so clarity/determinism is preferable to a more
+        # complex graph optimiser here.
+        while len(work) >= 2:
+            best = None
+
+            for i in range(len(work) - 1):
+                for j in range(i + 1, len(work)):
+                    for endpoint_i in (0, 1):
+                        for endpoint_j in (0, 1):
+                            a = oriented_for_end(work[i], endpoint_i)
+                            b = oriented_for_start(work[j], endpoint_j)
+                            d = float(np.linalg.norm(a[-1] - b[0]))
+                            if d > gap_tol:
+                                continue
+
+                            admissible = (
+                                d <= snap_tol
+                                or MainWindow._section_connection_is_smooth(
+                                    a,
+                                    b,
+                                    max_angle_deg=tangent_limit_deg,
+                                )
+                            )
+                            if not admissible:
+                                continue
+
+                            candidate = (
+                                d,
+                                i,
+                                j,
+                                endpoint_i,
+                                endpoint_j,
+                                a,
+                                b,
+                            )
+                            if best is None or candidate[0] < best[0]:
+                                best = candidate
+
+            if best is None:
+                break
+
+            d, i, j, _ei, _ej, a, b = best
+
+            if d <= snap_tol:
+                joint = (a[-1] + b[0]) * 0.5
+                a[-1] = joint
+                b[0] = joint
+                merged = np.vstack([a, b[1:]])
+            else:
+                # Keep an explicit short bridge only in the *fill repair*
+                # geometry.  It is never used by _draw_polyline_paths().
+                merged = np.vstack([a, b])
+                bridge_count += 1
+
+            work[i] = merged
+            del work[j]
+            merge_count += 1
+
+        closed: list[np.ndarray] = []
+        open_paths: list[np.ndarray] = []
+        self_close_count = 0
+
+        for path in work:
+            if len(path) < 2:
+                continue
+
+            d = float(np.linalg.norm(path[-1] - path[0]))
+            if d <= snap_tol:
+                joint = (path[-1] + path[0]) * 0.5
+                repaired = path.copy()
+                repaired[0] = joint
+                repaired[-1] = joint
+                closed.append(repaired)
+                continue
+
+            if d <= gap_tol:
+                # For closure, treat the same path as A(end) and B(start).
+                b = path.copy()
+                if MainWindow._section_connection_is_smooth(
+                    path,
+                    b,
+                    max_angle_deg=tangent_limit_deg,
+                ):
+                    repaired = np.vstack([path, path[0]])
+                    closed.append(repaired)
+                    self_close_count += 1
+                    continue
+
+            open_paths.append(path)
+
+        diagnostics = {
+            "snap_tolerance_px": snap_tol,
+            "gap_tolerance_px": gap_tol,
+            "tangent_limit_deg": tangent_limit_deg,
+            "merge_count": merge_count,
+            "short_bridge_count": bridge_count,
+            "self_close_count": self_close_count,
+            "closed_path_count": len(closed),
+            "open_path_count": len(open_paths),
+        }
+        return closed, open_paths, diagnostics
+
+    @staticmethod
+    def _fill_section_paths(
+        draw,
+        paths: list[np.ndarray],
+        width_px: int,
+        canvas_size: tuple[int, int] | None = None,
+    ):
+        """Fill pottery cut faces with repaired contours.
+
+        Visible linework is always drawn from the original vtkCutter paths.
+        Fill geometry is reconstructed independently:
+
+          * small endpoint gaps: vector snap/stitch with tangent constraint,
+          * closed contours: even-odd XOR fill,
+          * remaining small raster gaps: conservative morphology closing.
+
+        This avoids both failure modes:
+          1. long artificial diagonal lines from unconditional path closure,
+          2. missing black cut-face fill when vtkStripper returns a slightly
+             fragmented/open contour.
+
+        Large unresolved gaps are intentionally not invented.
+        """
+        from PIL import Image, ImageDraw
+        from scipy.ndimage import (
+            binary_closing,
+            binary_fill_holes,
+            generate_binary_structure,
+            iterate_structure,
+            label,
+        )
+
+        width_px = max(1, int(width_px))
+        if canvas_size is None:
+            # PIL's ImageDraw currently exposes its target image as _image.
+            # All in-app call sites pass canvas_size explicitly; this is only
+            # a defensive fallback for older callers.
+            target = getattr(draw, "_image", None)
+            if target is None:
+                raise RuntimeError("section fill requires canvas_size")
+            canvas_size = target.size
+
+        canvas_w, canvas_h = [
+            max(1, int(v)) for v in canvas_size
+        ]
+
+        raw_paths = [
+            MainWindow._clean_section_path_2d(path)
+            for path in paths
+        ]
+        raw_paths = [path for path in raw_paths if len(path) >= 2]
+        if not raw_paths:
+            return
+
+        closed_paths, open_paths, diag = (
+            MainWindow._repair_section_paths_for_fill(
+                raw_paths,
+                (canvas_w, canvas_h),
+            )
+        )
+
+        # --------------------------------------------------------------
+        # A. Even-odd vector fill.
+        #
+        # Each loop toggles the mask rather than simply OR-ing polygons.
+        # Nested loops therefore preserve holes instead of filling them.
+        # --------------------------------------------------------------
+        parity = np.zeros((canvas_h, canvas_w), dtype=bool)
+
+        for path in closed_paths:
+            if len(path) < 3:
+                continue
+            loop_img = Image.new(
+                "1",
+                (canvas_w, canvas_h),
+                0,
+            )
+            loop_draw = ImageDraw.Draw(loop_img)
+            pts = [
+                (int(round(float(x))), int(round(float(y))))
+                for x, y in path
+            ]
+            if len(pts) < 3:
+                continue
+            loop_draw.polygon(pts, fill=1)
+            parity ^= np.asarray(loop_img, dtype=bool)
+
+        # --------------------------------------------------------------
+        # B. Conservative raster fallback for small unresolved gaps.
+        #
+        # Only the still-open paths are rasterised here.  Morphological
+        # closing can repair a few-pixel Cutter/Stripper discontinuity but
+        # cannot create the old long diagonal because its radius is bounded
+        # by half the vector gap tolerance.
+        # --------------------------------------------------------------
+        if open_paths:
+            gap_tol = float(diag["gap_tolerance_px"])
+            radius = max(
+                1,
+                min(6, int(np.ceil(gap_tol * 0.5))),
+            )
+            pad = radius + 4
+            padded_size = (
+                canvas_w + 2 * pad,
+                canvas_h + 2 * pad,
+            )
+            boundary_img = Image.new("1", padded_size, 0)
+            boundary_draw = ImageDraw.Draw(boundary_img)
+
+            for path in open_paths:
+                pts = [
+                    (
+                        int(round(float(x))) + pad,
+                        int(round(float(y))) + pad,
+                    )
+                    for x, y in path
+                ]
+                if len(pts) >= 2:
+                    boundary_draw.line(
+                        pts,
+                        fill=1,
+                        width=max(1, min(2, width_px)),
+                    )
+
+            boundary = np.asarray(boundary_img, dtype=bool)
+            structure = iterate_structure(
+                generate_binary_structure(2, 2),
+                radius,
+            )
+            repaired_boundary = binary_closing(
+                boundary,
+                structure=structure,
+                iterations=1,
+            )
+            filled = binary_fill_holes(repaired_boundary)
+            interior = filled & ~repaired_boundary
+
+            # Crop away the padding.
+            interior = interior[
+                pad : pad + canvas_h,
+                pad : pad + canvas_w,
+            ]
+
+            # Accept only bounded interior components of reasonable size.
+            # A huge component would indicate that the contour is genuinely
+            # incomplete, in which case silently inventing a fill is worse
+            # than leaving that region unfilled.
+            labeled, count = label(interior)
+            canvas_area = float(canvas_w * canvas_h)
+            fallback = np.zeros_like(parity)
+            for component_id in range(1, count + 1):
+                component = labeled == component_id
+                area = int(np.count_nonzero(component))
+                if area < 4:
+                    continue
+                if area / max(canvas_area, 1.0) > 0.45:
+                    continue
+                fallback |= component
+
+            parity |= fallback
+
+        if np.any(parity):
+            mask_img = Image.fromarray(
+                (parity.astype(np.uint8) * 255),
+                mode="L",
+            )
+            draw.bitmap(
+                (0, 0),
+                mask_img,
+                fill=(0, 0, 0, 255),
+            )
+
+        # Draw the *original* linework last.  No repair bridge is exposed as
+        # a visible section line.
+        MainWindow._draw_polyline_paths(
+            draw,
+            raw_paths,
+            width_px,
+            fill=(0, 0, 0, 255),
+        )
+
+    @staticmethod
+    def _split_left_right(full_rgba, half_rgba):
+        from PIL import Image
+
+        full = np.asarray(full_rgba, dtype=np.uint8)
+        half = np.asarray(half_rgba, dtype=np.uint8)
+        full_im = Image.fromarray(full, mode="RGBA")
+        half_im = Image.fromarray(half, mode="RGBA")
+        out = Image.new("RGBA", full_im.size, (255, 255, 255, 0))
+        split_x = full_im.width // 2
+        out.alpha_composite(full_im.crop((0, 0, split_x, full_im.height)), dest=(0, 0))
+        out.alpha_composite(
+            half_im.crop((split_x, 0, half_im.width, half_im.height)),
+            dest=(split_x, 0),
+        )
+        return np.asarray(out, dtype=np.uint8)
+
+    @staticmethod
+    def _section_paths_3d(poly: pv.PolyData, plane_y: float) -> list[np.ndarray]:
+        from vtkmodules.vtkCommonDataModel import vtkPlane
+        from vtkmodules.vtkFiltersCore import vtkCleanPolyData, vtkCutter, vtkStripper
+
+        plane = vtkPlane()
+        plane.SetOrigin(0.0, float(plane_y), 0.0)
+        plane.SetNormal(0.0, 1.0, 0.0)
+
+        cutter = vtkCutter()
+        cutter.SetCutFunction(plane)
+        cutter.SetInputData(poly)
+        cutter.Update()
+
+        clean = vtkCleanPolyData()
+        clean.SetInputConnection(cutter.GetOutputPort())
+        clean.PointMergingOn()
+
+        stripper = vtkStripper()
+        stripper.SetInputConnection(clean.GetOutputPort())
+        stripper.JoinContiguousSegmentsOn()
+        stripper.Update()
+
+        wrapped = pv.wrap(stripper.GetOutput())
+        if wrapped.n_points == 0 or wrapped.n_lines == 0:
+            return []
+
+        pts = np.asarray(wrapped.points, dtype=float)
+        lines = np.asarray(wrapped.lines, dtype=np.int64)
+        paths: list[np.ndarray] = []
+        i = 0
+        while i < len(lines):
+            n = int(lines[i])
+            if n >= 2:
+                ids = lines[i + 1 : i + 1 + n]
+                path = pts[ids]
+                # Preserve vtkCutter/vtkStripper topology exactly.
+                # Open paths stay open for line/SVG output; black section
+                # filling uses a separate conservative repair pipeline.
+                if len(path) >= 2:
+                    paths.append(path)
+            i += n + 1
+        return paths
+
+    def _render_poly_views(
+        self,
+        poly: pv.PolyData,
+        bounds: np.ndarray,
+        views: list[str],
+        pixels_per_model_unit: float,
+        use_appearance: bool,
+        lighting: bool,
+        progress_callback=None,
+        progress_base: int = 0,
+        progress_total: int = 1,
+        progress_mode_label: str = "render",
+    ) -> dict[str, np.ndarray]:
+        rendered: dict[str, np.ndarray] = {}
+        pl = None
+        try:
+            pl = pv.Plotter(off_screen=True, window_size=(512, 512))
+            try:
+                pl.disable_anti_aliasing()
+            except (AttributeError, TypeError):
+                try:
+                    pl.ren_win.SetMultiSamples(0)
+                except Exception:
+                    pass
+            pl.set_background("white")
+            self._add_mesh_actor(pl, poly, use_appearance, lighting)
+            pl.enable_parallel_projection()
+
+            for i, view in enumerate(views):
+                world_w, world_h = self._view_size(bounds, view)
+                world_w = max(world_w, 1e-9)
+                world_h = max(world_h, 1e-9)
+                width = max(64, int(round(world_w * pixels_per_model_unit)))
+                height = max(64, int(round(world_h * pixels_per_model_unit)))
+                pl.window_size = [width, height]
+
+                pos, center, up = self._camera_for_view(bounds, view)
+                pl.camera_position = [pos.tolist(), center.tolist(), up.tolist()]
+                pl.enable_parallel_projection()
+                pl.camera.parallel_scale = world_h / 2.0
+                pl.reset_camera_clipping_range()
+                rendered[view] = pl.screenshot(
+                    return_img=True,
+                    transparent_background=True,
+                    window_size=[width, height],
+                )
+                if progress_callback is not None:
+                    done = progress_base + i + 1
+                    progress_callback(
+                        done / max(progress_total, 1),
+                        f"オルソ生成中: {progress_mode_label} / {view} ({done}/{progress_total})",
+                    )
+        finally:
+            if pl is not None:
+                try:
+                    pl.close()
+                except Exception:
+                    pass
+        return rendered
+
+    def _render_views_for_mode(
+        self,
+        poly: pv.PolyData,
+        bounds: np.ndarray,
+        views: list[str],
+        mode: str,
+        pixels_per_model_unit: float,
+        progress_callback=None,
+        progress_base: int = 0,
+        progress_total: int = 1,
+    ) -> dict[str, np.ndarray]:
+        if mode in ("texture", "texture_normal", "shade"):
+            use_appearance = mode in ("texture", "texture_normal")
+            lighting = mode in ("texture_normal", "shade")
+            return self._render_poly_views(
+                poly,
+                bounds,
+                views,
+                pixels_per_model_unit,
+                use_appearance=use_appearance,
+                lighting=lighting,
+                progress_callback=progress_callback,
+                progress_base=progress_base,
+                progress_total=progress_total,
+                progress_mode_label=mode,
+            )
+
+        plane_y = (float(bounds[2]) + float(bounds[3])) / 2.0
+        section_paths_3d = self._section_paths_3d(poly, plane_y)
+        outline_width_px = self._selected_outline_width_px()
+
+        if mode == "section":
+            from PIL import Image, ImageDraw
+
+            rendered: dict[str, np.ndarray] = {}
+            for i, view in enumerate(views):
+                world_w, world_h = self._view_size(bounds, view)
+                width = max(64, int(round(max(world_w, 1e-9) * pixels_per_model_unit)))
+                height = max(64, int(round(max(world_h, 1e-9) * pixels_per_model_unit)))
+                img = Image.new("RGBA", (width, height), (255, 255, 255, 0))
+                draw = ImageDraw.Draw(img)
+                projected = self._project_world_paths_to_pixels(
+                    section_paths_3d, bounds, view, pixels_per_model_unit
+                )
+                self._draw_polyline_paths(draw, projected, outline_width_px)
+                rendered[view] = np.asarray(img, dtype=np.uint8)
+                if progress_callback is not None:
+                    done = progress_base + i + 1
+                    progress_callback(
+                        done / max(progress_total, 1),
+                        f"オルソ生成中: {mode} / {view} ({done}/{progress_total})",
+                    )
+            return rendered
+
+        if mode in ("half_section", "quarter_half_section"):
+            from PIL import Image, ImageDraw
+
+            # Front is the -Y side in the current camera convention.
+            # Remove the front half and keep the back half.
+            half_poly = poly.clip(normal=(0, 1, 0), origin=(0, plane_y, 0), invert=False)
+            if half_poly.n_points == 0:
+                raise RuntimeError("半截モデルの生成に失敗しました。")
+
+            projected_sections = {
+                view: self._project_world_paths_to_pixels(
+                    section_paths_3d, bounds, view, pixels_per_model_unit
+                )
+                for view in views
+            }
+
+            half_rendered = self._render_poly_views(
+                half_poly,
+                bounds,
+                views,
+                pixels_per_model_unit,
+                use_appearance=bool(self.asset and self.asset.appearance_kind != "none"),
+                lighting=True,
+                progress_callback=progress_callback,
+                progress_base=progress_base,
+                progress_total=progress_total,
+                progress_mode_label=mode,
+            )
+
+            result: dict[str, np.ndarray] = {}
+            full_rendered_cache: dict[str, np.ndarray] | None = None
+            if mode == "quarter_half_section":
+                full_rendered_cache = self._render_poly_views(
+                    poly,
+                    bounds,
+                    views,
+                    pixels_per_model_unit,
+                    use_appearance=bool(self.asset and self.asset.appearance_kind != "none"),
+                    lighting=True,
+                    progress_callback=None,
+                    progress_base=0,
+                    progress_total=1,
+                    progress_mode_label="quarter_half_full",
+                )
+
+            for view in views:
+                base = Image.fromarray(np.asarray(half_rendered[view], dtype=np.uint8), mode="RGBA")
+                draw = ImageDraw.Draw(base)
+                self._fill_section_paths(
+                    draw,
+                    projected_sections.get(view, []),
+                    outline_width_px,
+                    canvas_size=base.size,
+                )
+                half_arr = np.asarray(base, dtype=np.uint8)
+
+                if mode == "half_section":
+                    result[view] = half_arr
+                else:
+                    result[view] = self._split_left_right(full_rendered_cache[view], half_arr)
+            return result
+
+        if mode == "outline_mask":
+            return self._render_poly_views(
+                poly,
+                bounds,
+                views,
+                pixels_per_model_unit,
+                use_appearance=False,
+                lighting=False,
+                progress_callback=progress_callback,
+                progress_base=progress_base,
+                progress_total=progress_total,
+                progress_mode_label=mode,
+            )
+
+        raise ValueError(f"Unknown render mode: {mode}")
+
+    @staticmethod
+    def _outline_paths_from_rgba(rgba) -> list[np.ndarray]:
+        """Vectorize the opaque projected region of one orthographic view.
+
+        The renderer already produces RGBA with a transparent background.
+        We contour the alpha mask at 50% opacity using VTK marching squares,
+        then join adjacent line segments with vtkStripper.  A transparent
+        one-pixel frame guarantees closed contours even when the model touches
+        the rendered image boundary.
+        """
+        from vtkmodules.vtkCommonCore import VTK_UNSIGNED_CHAR, vtkIdList
+        from vtkmodules.vtkCommonDataModel import vtkImageData
+        from vtkmodules.vtkFiltersCore import vtkCleanPolyData, vtkMarchingSquares, vtkStripper
+        from vtkmodules.util.numpy_support import numpy_to_vtk
+
+        arr = np.asarray(rgba, dtype=np.uint8)
+        if arr.ndim != 3:
+            raise ValueError("Expected an HxWxC orthographic image")
+        if arr.shape[2] >= 4:
+            alpha = arr[:, :, 3]
+        else:
+            # Defensive fallback.  Dedicated outline-mask renders should be RGBA.
+            alpha = np.where(np.any(arr[:, :, :3] < 250, axis=2), 255, 0).astype(np.uint8)
+
+        h, w = alpha.shape
+        pad = 1
+        padded = np.pad(alpha, pad_width=pad, mode="constant", constant_values=0)
+
+        image = vtkImageData()
+        image.SetDimensions(int(padded.shape[1]), int(padded.shape[0]), 1)
+        scalars = numpy_to_vtk(
+            padded.ravel(order="C"),
+            deep=True,
+            array_type=VTK_UNSIGNED_CHAR,
+        )
+        image.GetPointData().SetScalars(scalars)
+
+        contour = vtkMarchingSquares()
+        contour.SetInputData(image)
+        contour.SetValue(0, float(OUTLINE_ALPHA_THRESHOLD))
+
+        clean = vtkCleanPolyData()
+        clean.SetInputConnection(contour.GetOutputPort())
+        clean.PointMergingOn()
+
+        stripper = vtkStripper()
+        stripper.SetInputConnection(clean.GetOutputPort())
+        stripper.JoinContiguousSegmentsOn()
+        stripper.Update()
+
+        out = stripper.GetOutput()
+        cells = out.GetLines()
+        cells.InitTraversal()
+        ids = vtkIdList()
+
+        paths: list[np.ndarray] = []
+        while cells.GetNextCell(ids):
+            n = ids.GetNumberOfIds()
+            if n < 2:
+                continue
+            pts = np.empty((n, 2), dtype=np.float64)
+            for i in range(n):
+                x, y, _z = out.GetPoint(ids.GetId(i))
+                pts[i, 0] = x - pad
+                pts[i, 1] = y - pad
+
+            # Keep boundary contours within the actual raster extent.
+            pts[:, 0] = np.clip(pts[:, 0], 0.0, float(w))
+            pts[:, 1] = np.clip(pts[:, 1], 0.0, float(h))
+
+            # Remove consecutive duplicates introduced by boundary clipping.
+            if len(pts) > 1:
+                keep = np.ones(len(pts), dtype=bool)
+                keep[1:] = np.any(np.abs(np.diff(pts, axis=0)) > 1e-9, axis=1)
+                pts = pts[keep]
+            if len(pts) >= 2:
+                paths.append(pts)
+
+        return paths
+
+    @staticmethod
+    def _draw_outline_paths(canvas, paths: list[np.ndarray], offset=(0, 0), width_px: int = OUTLINE_PNG_WIDTH_PX):
+        from PIL import ImageDraw
+
+        draw = ImageDraw.Draw(canvas)
+        ox, oy = int(offset[0]), int(offset[1])
+        width_px = max(1, int(width_px))
+        for path in paths:
+            if len(path) < 2:
+                continue
+            points = [
+                (ox + int(round(float(x))), oy + int(round(float(y))))
+                for x, y in path
+            ]
+            draw.line(points, fill=(0, 0, 0, 255), width=width_px, joint="curve")
+
+    @staticmethod
+    def _svg_path_d(path: np.ndarray, scale_mm: float, offset_x_mm: float = 0.0, offset_y_mm: float = 0.0) -> str:
+        if len(path) < 2:
+            return ""
+        pts = [
+            (
+                offset_x_mm + float(p[0]) * scale_mm,
+                offset_y_mm + float(p[1]) * scale_mm,
+            )
+            for p in path
+        ]
+        parts = [f"M {pts[0][0]:.6g} {pts[0][1]:.6g}"]
+        parts.extend(f"L {x:.6g} {y:.6g}" for x, y in pts[1:])
+        if np.linalg.norm(np.asarray(pts[0]) - np.asarray(pts[-1])) <= max(scale_mm * 1.5, 1e-12):
+            parts.append("Z")
+        return " ".join(parts)
+
+    def _write_individual_outline_svg(
+        self,
+        path: Path,
+        view: str,
+        paths: list[np.ndarray],
+        bounds: np.ndarray,
+        ppu: float,
+    ) -> None:
+        world_w, world_h = self._view_size(bounds, view)
+        width_mm = world_w * float(self.asset.unit_to_mm)
+        height_mm = world_h * float(self.asset.unit_to_mm)
+        pixel_to_mm = float(self.asset.unit_to_mm) / float(ppu)
+
+        d_items = []
+        for contour in paths:
+            d = self._svg_path_d(contour, pixel_to_mm)
+            if d:
+                d_items.append(
+                    f'  <path d="{d}" fill="none" stroke="black" '
+                    f'stroke-width="{OUTLINE_SVG_STROKE_MM:g}" '
+                    f'stroke-linejoin="round" stroke-linecap="round"/>'
+                )
+
+        svg = [
+            '<?xml version="1.0" encoding="UTF-8"?>',
+            f'<svg xmlns="http://www.w3.org/2000/svg" '
+            f'viewBox="0 0 {width_mm:.9g} {height_mm:.9g}" '
+            f'preserveAspectRatio="xMidYMid meet" data-coordinate-unit="mm">',
+            '  <metadata>Outline coordinates and viewBox are in millimetres.</metadata>',
+            f'  <g id="{view}" data-view="{view}">',
+            *d_items,
+            '  </g>',
+            '</svg>',
+            '',
+        ]
+        path.write_text("\n".join(svg), encoding="utf-8")
+
+    def _write_composite_outline_svg(
+        self,
+        path: Path,
+        outlines: dict[str, list[np.ndarray]],
+        views: list[str],
+        rects: dict[str, tuple[float, float, float, float]],
+        ppu: float,
+    ) -> None:
+        selected_rects = [rects[v] for v in views]
+        min_x = min(r[0] for r in selected_rects)
+        min_y = min(r[1] for r in selected_rects)
+        max_x = max(r[2] for r in selected_rects)
+        max_y = max(r[3] for r in selected_rects)
+        sheet_w = max_x - min_x
+        sheet_h = max_y - min_y
+        unit_to_mm = float(self.asset.unit_to_mm)
+        width_mm = sheet_w * unit_to_mm
+        height_mm = sheet_h * unit_to_mm
+        pixel_to_mm = unit_to_mm / float(ppu)
+
+        body = []
+        for view in views:
+            x0, _y0, _x1, y1 = rects[view]
+            offset_x_mm = (x0 - min_x) * unit_to_mm
+            offset_y_mm = (max_y - y1) * unit_to_mm
+            body.append(f'  <g id="{view}" data-view="{view}">')
+            for contour in outlines.get(view, []):
+                d = self._svg_path_d(
+                    contour,
+                    pixel_to_mm,
+                    offset_x_mm=offset_x_mm,
+                    offset_y_mm=offset_y_mm,
+                )
+                if d:
+                    body.append(
+                        f'    <path d="{d}" fill="none" stroke="black" '
+                        f'stroke-width="{OUTLINE_SVG_STROKE_MM:g}" '
+                        f'stroke-linejoin="round" stroke-linecap="round"/>'
+                    )
+            body.append('  </g>')
+
+        svg = [
+            '<?xml version="1.0" encoding="UTF-8"?>',
+            f'<svg xmlns="http://www.w3.org/2000/svg" '
+            f'viewBox="0 0 {width_mm:.9g} {height_mm:.9g}" '
+            f'preserveAspectRatio="xMidYMid meet" data-coordinate-unit="mm">',
+            '  <metadata>Outline coordinates and viewBox are in millimetres.</metadata>',
+            *body,
+            '</svg>',
+            '',
+        ]
+        path.write_text("\n".join(svg), encoding="utf-8")
+
+    @staticmethod
+    def _paste_rgba(canvas, rgba, xy: tuple[int, int]):
+        from PIL import Image
+        arr = np.asarray(rgba, dtype=np.uint8)
+        im = Image.fromarray(arr, mode="RGBA") if arr.shape[-1] == 4 else Image.fromarray(arr).convert("RGBA")
+        canvas.alpha_composite(im, dest=xy)
+
+    @staticmethod
+    def _load_scale_font(size_px: int):
+        from PIL import ImageFont
+        try:
+            return ImageFont.truetype("DejaVuSans.ttf", size_px)
+        except Exception:
+            return ImageFont.load_default()
+
+    def _draw_scale_bar(self, canvas, pixels_per_model_unit: float, scale_bar_mm: float, left_px: int, baseline_y: int):
+        from PIL import ImageDraw
+        model_length = float(scale_bar_mm) / float(self.asset.unit_to_mm)
+        bar_px = max(1, int(round(model_length * pixels_per_model_unit)))
+        draw = ImageDraw.Draw(canvas)
+        line_w = max(2, int(round(canvas.width / 1600)))
+        tick_h = max(10, line_w * 4)
+        x0 = int(left_px)
+        x1 = x0 + bar_px
+        y = int(baseline_y)
+        draw.line([(x0, y), (x1, y)], fill="black", width=line_w)
+        draw.line([(x0, y - tick_h // 2), (x0, y + tick_h // 2)], fill="black", width=line_w)
+        draw.line([(x1, y - tick_h // 2), (x1, y + tick_h // 2)], fill="black", width=line_w)
+
+        label = f"{scale_bar_mm:g} mm"
+        font = self._load_scale_font(max(28, int(round(canvas.width / 100))))
+        bbox = draw.textbbox((0, 0), label, font=font)
+        tw = bbox[2] - bbox[0]
+        th = bbox[3] - bbox[1]
+        tx = x0 + (bar_px - tw) / 2.0
+        ty = y - tick_h / 2.0 - th - max(7, line_w * 2)
+        draw.text((tx, ty), label, fill="black", font=font)
+
+    def _validate_png_dimensions(self, width: int, height: int, scale_bar_mm: float) -> None:
+        width = int(width)
+        height = int(height)
+        pixels = width * height
+        if (
+            width > MAX_PNG_DIMENSION_PX
+            or height > MAX_PNG_DIMENSION_PX
+            or pixels > MAX_PNG_PIXELS
+        ):
+            raise RuntimeError(
+                "PNGの計算寸法が異常に大きくなります "
+                f"({width:,} x {height:,} px)。"
+                f"入力単位（現在: {self.asset.input_unit}）と "
+                f"スケールバー（{scale_bar_mm:g} mm）を確認してください。"
+            )
+
+    @staticmethod
+    def _draw_layout_ticks(
+        canvas,
+        rects: dict[str, tuple[float, float, float, float]],
+        views: list[str],
+        ppu: float,
+        spacing_model: float,
+        margin_px: int,
+        min_x: float,
+        max_y: float,
+    ) -> None:
+        """Draw archaeological layout ticks in the inter-view spacing.
+
+        Front:
+            center-axis tick above and below the image.
+        Top:
+            half-section-line tick left and right of the image.
+
+        For spacing S:
+            edge margin = S/4
+            tick length = S/2
+            remaining outer margin = S/4
+        Stroke width is fixed at 5 px.
+        """
+        from PIL import ImageDraw
+
+        if spacing_model <= 0:
+            return
+
+        draw = ImageDraw.Draw(canvas)
+        gap = float(spacing_model) / 4.0
+        length = float(spacing_model) / 2.0
+        width_px = 5
+
+        def px_x(x_model: float) -> int:
+            return int(round(margin_px + (x_model - min_x) * ppu))
+
+        def px_y(y_model: float) -> int:
+            return int(round(margin_px + (max_y - y_model) * ppu))
+
+        if "front" in views:
+            x0, y0, x1, y1 = rects["front"]
+            xc = (x0 + x1) / 2.0
+
+            # Upper center-axis tick.
+            draw.line(
+                [
+                    (px_x(xc), px_y(y1 + gap)),
+                    (px_x(xc), px_y(y1 + gap + length)),
+                ],
+                fill="black",
+                width=width_px,
+            )
+
+            # Lower center-axis tick.
+            draw.line(
+                [
+                    (px_x(xc), px_y(y0 - gap)),
+                    (px_x(xc), px_y(y0 - gap - length)),
+                ],
+                fill="black",
+                width=width_px,
+            )
+
+        if "top" in views:
+            x0, y0, x1, y1 = rects["top"]
+            yc = (y0 + y1) / 2.0
+
+            # Left and right ticks mark the y-mid half-section plane.
+            draw.line(
+                [
+                    (px_x(x0 - gap), px_y(yc)),
+                    (px_x(x0 - gap - length), px_y(yc)),
+                ],
+                fill="black",
+                width=width_px,
+            )
+            draw.line(
+                [
+                    (px_x(x1 + gap), px_y(yc)),
+                    (px_x(x1 + gap + length), px_y(yc)),
+                ],
+                fill="black",
+                width=width_px,
+            )
+
+    def _compose_mode(
+        self,
+        rendered: dict[str, np.ndarray],
+        views: list[str],
+        rects: dict[str, tuple[float, float, float, float]],
+        ppu: float,
+        out_path: Path,
+        scale_bar_mm: float,
+        spacing_model: float,
+        outlines: dict[str, list[np.ndarray]] | None = None,
+        outline_width_px: int = OUTLINE_PNG_WIDTH_PX,
+        auxiliary_panels: dict[str, np.ndarray] | None = None,
+        auxiliary_rects: dict[str, tuple[float, float, float, float]] | None = None,
+        png_dpi: float | None = None,
+    ) -> None:
+        from PIL import Image
+
+        auxiliary_panels = auxiliary_panels or {}
+        auxiliary_rects = auxiliary_rects or {}
+
+        all_rects = [rects[v] for v in views]
+        all_rects.extend(
+            auxiliary_rects[key]
+            for key in auxiliary_panels
+            if key in auxiliary_rects
+        )
+        min_x = min(r[0] for r in all_rects)
+        min_y = min(r[1] for r in all_rects)
+        max_x = max(r[2] for r in all_rects)
+        max_y = max(r[3] for r in all_rects)
+
+        # Reserve the full S/4 + S/2 extent used by layout ticks so they
+        # are not clipped even when adjacent views are not selected.
+        tick_extent = max(0.0, float(spacing_model) * 0.75)
+        if "front" in views:
+            min_y = min(min_y, rects["front"][1] - tick_extent)
+            max_y = max(max_y, rects["front"][3] + tick_extent)
+        if "top" in views:
+            min_x = min(min_x, rects["top"][0] - tick_extent)
+            max_x = max(max_x, rects["top"][2] + tick_extent)
+
+        content_w = max(1, int(round((max_x - min_x) * ppu)))
+        content_h = max(1, int(round((max_y - min_y) * ppu)))
+        margin = 36
+        scale_block_h = 120
+        bar_px = int(round((scale_bar_mm / self.asset.unit_to_mm) * ppu))
+        canvas_w = max(content_w + 2 * margin, bar_px + 2 * margin)
+        canvas_h = content_h + 2 * margin + scale_block_h
+        self._validate_png_dimensions(canvas_w, canvas_h, scale_bar_mm)
+        canvas = Image.new("RGBA", (canvas_w, canvas_h), (255, 255, 255, 255))
+
+        # Auxiliary panels are never targets of PNG+outline.
+        for key, img in auxiliary_panels.items():
+            x0, _y0, _x1, y1 = auxiliary_rects[key]
+            px = margin + int(round((x0 - min_x) * ppu))
+            py = margin + int(round((max_y - y1) * ppu))
+            self._paste_rgba(canvas, img, (px, py))
+
+        # Only ordinary orthographic panels receive the optional outline overlay.
+        for view in views:
+            img = rendered[view]
+            x0, _y0, _x1, y1 = rects[view]
+            px = margin + int(round((x0 - min_x) * ppu))
+            py = margin + int(round((max_y - y1) * ppu))
+            self._paste_rgba(canvas, img, (px, py))
+            if outlines is not None:
+                self._draw_outline_paths(
+                    canvas,
+                    outlines.get(view, []),
+                    offset=(px, py),
+                    width_px=outline_width_px,
+                )
+
+        self._draw_layout_ticks(
+            canvas,
+            rects,
+            views,
+            ppu,
+            spacing_model,
+            margin,
+            min_x,
+            max_y,
+        )
+
+        baseline = canvas_h - 34
+        self._draw_scale_bar(canvas, ppu, scale_bar_mm, margin, baseline)
+        self._save_png_image(canvas, out_path, dpi=png_dpi)
+
+    def _save_individual_view(
+        self,
+        rgba,
+        ppu: float,
+        path: Path,
+        scale_bar_mm: float,
+        outline_paths: list[np.ndarray] | None = None,
+        outline_width_px: int = OUTLINE_PNG_WIDTH_PX,
+        png_dpi: float | None = None,
+    ):
+        from PIL import Image
+        arr = np.asarray(rgba, dtype=np.uint8)
+        view_im = Image.fromarray(arr, mode="RGBA") if arr.shape[-1] == 4 else Image.fromarray(arr).convert("RGBA")
+        margin = 30
+        scale_block_h = 100
+        bar_px = int(round((scale_bar_mm / self.asset.unit_to_mm) * ppu))
+        width = max(view_im.width + 2 * margin, bar_px + 2 * margin)
+        height = view_im.height + 2 * margin + scale_block_h
+        self._validate_png_dimensions(width, height, scale_bar_mm)
+        canvas = Image.new("RGBA", (width, height), (255, 255, 255, 255))
+        canvas.alpha_composite(view_im, dest=(margin, margin))
+        if outline_paths is not None:
+            self._draw_outline_paths(
+                canvas,
+                outline_paths,
+                offset=(margin, margin),
+                width_px=outline_width_px,
+            )
+        self._draw_scale_bar(canvas, ppu, scale_bar_mm, margin, height - 30)
+        self._save_png_image(canvas, path, dpi=png_dpi)
+
+    def export_orthos(
+        self,
+        out_dir: Path,
+        views: list[str],
+        modes: list[str],
+        spacing_mm: float,
+        scale_bar_mm: float,
+        outline_width_px: int,
+        individual: bool,
+        export_png_plain: bool = True,
+        export_svg: bool = False,
+        export_png_outline: bool = False,
+        progress_callback=None,
+        pixels_per_model_unit: float | None = None,
+        png_dpi: float | None = None,
+        layout_context: dict | None = None,
+    ) -> list[Path]:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        context = (
+            layout_context
+            if layout_context is not None
+            else self._build_pottery_ortho_layout_context(views, modes, spacing_mm)
+        )
+        poly = context["poly"]
+        bounds = np.asarray(context["bounds"], dtype=float)
+        spacing_model = float(context["spacing_model"])
+        rects = context["rects"]
+        aux_rects = context["aux_rects"]
+
+        base_modes = [m for m in modes if m in ("texture", "texture_normal", "shade")]
+        section_selected = "section" in modes
+        half_selected = "half_section" in modes
+        quarter_selected = "quarter_half_section" in modes
+
+        if pixels_per_model_unit is None:
+            ppu = ORTHO_COMPOSITE_LONG_EDGE_PX / max(
+                float(context["sheet_w"]), float(context["sheet_h"]), 1e-9
+            )
+        else:
+            ppu = float(pixels_per_model_unit)
+        if not math.isfinite(ppu) or ppu <= 0.0:
+            raise RuntimeError("画像解像度 (pixels/model-unit) が不正です。")
+
+        stem = self.asset.source_path.stem
+        written: list[Path] = []
+        need_png = bool(export_png_plain or export_png_outline)
+
+        # Front outline is always required as the leftmost composite panel.
+        outline_views = ["front"]
+        if export_svg or export_png_outline:
+            for view in views:
+                if view not in outline_views:
+                    outline_views.append(view)
+
+        total_renders = (
+            len(outline_views)
+            + (len(base_modes) * len(views) if need_png else 0)
+        )
+        total_renders = max(total_renders, 1)
+        completed = 0
+
+        # --------------------------------------------------------------
+        # Orthographic silhouette outlines
+        # --------------------------------------------------------------
+        masks = self._render_views_for_mode(
+            poly,
+            bounds,
+            outline_views,
+            "outline_mask",
+            ppu,
+            progress_callback=progress_callback,
+            progress_base=completed,
+            progress_total=total_renders,
+        )
+        completed += len(outline_views)
+
+        outlines: dict[str, list[np.ndarray]] = {}
+        for view in outline_views:
+            outlines[view] = self._outline_paths_from_rgba(masks[view])
+            if not outlines[view]:
+                raise RuntimeError(f"輪郭線を抽出できませんでした: {view}")
+        del masks
+
+        front_outline_panel = self._paths_to_rgba(
+            outlines["front"], bounds, "front", ppu, outline_width_px
+        )
+
+        # --------------------------------------------------------------
+        # Vertical section at post-pose AABB y-mid plane
+        # --------------------------------------------------------------
+        plane_y = (float(bounds[2]) + float(bounds[3])) / 2.0
+        section_paths_3d = self._section_paths_3d(poly, plane_y)
+        section_paths_px: list[np.ndarray] = []
+        section_panel = None
+        if section_selected:
+            section_paths_px = self._project_world_paths_to_pixels(
+                section_paths_3d, bounds, "front", ppu
+            )
+            if not section_paths_px:
+                raise RuntimeError("縦断面を抽出できませんでした。")
+            section_panel = self._paths_to_rgba(
+                section_paths_px, bounds, "front", ppu, outline_width_px
+            )
+
+        # --------------------------------------------------------------
+        # Composite SVG: outlines + section.  Quarter/half are raster
+        # products and are intentionally not embedded in SVG.
+        # --------------------------------------------------------------
+        if export_svg:
+            svg_paths: dict[str, list[np.ndarray]] = {}
+            svg_rects: dict[str, tuple[float, float, float, float]] = {}
+            svg_keys: list[str] = []
+
+            svg_paths["front_outline_panel"] = outlines["front"]
+            svg_rects["front_outline_panel"] = aux_rects["front_outline_panel"]
+            svg_keys.append("front_outline_panel")
+
+            for view in views:
+                svg_paths[view] = outlines[view]
+                svg_rects[view] = rects[view]
+                svg_keys.append(view)
+
+            if section_selected:
+                svg_paths["section_panel"] = section_paths_px
+                svg_rects["section_panel"] = aux_rects["section_panel"]
+                svg_keys.append("section_panel")
+
+            composite_svg = out_dir / f"{stem}_ortho_outline.svg"
+            self._write_composite_outline_svg(
+                composite_svg,
+                svg_paths,
+                svg_keys,
+                svg_rects,
+                ppu,
+            )
+            written.append(composite_svg)
+
+            if individual:
+                # Standalone outline/section SVG files are created only here.
+                front_svg = out_dir / f"{stem}_front_outline.svg"
+                self._write_individual_outline_svg(
+                    front_svg, "front", outlines["front"], bounds, ppu
+                )
+                written.append(front_svg)
+
+                for view in views:
+                    path = out_dir / f"{stem}_{view}_outline.svg"
+                    self._write_individual_outline_svg(
+                        path, view, outlines[view], bounds, ppu
+                    )
+                    written.append(path)
+
+                if section_selected:
+                    section_svg = out_dir / f"{stem}_section.svg"
+                    self._write_individual_outline_svg(
+                        section_svg, "front", section_paths_px, bounds, ppu
+                    )
+                    written.append(section_svg)
+
+        # --------------------------------------------------------------
+        # Base orthographic PNG composites.
+        # front outline is far left.
+        # quarter and half are immediately after front (quarter first).
+        # section is far right.
+        # PNG+outline applies ONLY to the ordinary ortho panels.
+        # --------------------------------------------------------------
+        if need_png and base_modes:
+            for mode in base_modes:
+                rendered = self._render_views_for_mode(
+                    poly,
+                    bounds,
+                    views,
+                    mode,
+                    ppu,
+                    progress_callback=progress_callback,
+                    progress_base=completed,
+                    progress_total=total_renders,
+                )
+                completed += len(views)
+
+                auxiliary_panels = {
+                    "front_outline_panel": front_outline_panel,
+                }
+
+                half_panel = None
+                if half_selected or quarter_selected:
+                    half_panel = self._half_panel_for_mode(
+                        poly,
+                        bounds,
+                        ppu,
+                        mode,
+                        section_paths_3d,
+                        outline_width_px,
+                    )
+
+                if quarter_selected:
+                    auxiliary_panels["quarter_panel"] = self._quarter_panel_for_mode(
+                        poly,
+                        bounds,
+                        ppu,
+                        mode,
+                        section_paths_3d,
+                        outline_width_px,
+                        half_panel=half_panel,
+                    )
+
+                if half_selected and half_panel is not None:
+                    auxiliary_panels["half_panel"] = half_panel
+
+                if section_selected and section_panel is not None:
+                    auxiliary_panels["section_panel"] = section_panel
+
+                if export_png_plain:
+                    path = out_dir / f"{stem}_ortho_{mode}.png"
+                    self._compose_mode(
+                        rendered,
+                        views,
+                        rects,
+                        ppu,
+                        path,
+                        scale_bar_mm,
+                        spacing_model,
+                        outlines=None,
+                        outline_width_px=outline_width_px,
+                        auxiliary_panels=auxiliary_panels,
+                        auxiliary_rects=aux_rects,
+                        png_dpi=png_dpi,
+                    )
+                    written.append(path)
+
+                if export_png_outline:
+                    path = out_dir / f"{stem}_ortho_{mode}_outline.png"
+                    self._compose_mode(
+                        rendered,
+                        views,
+                        rects,
+                        ppu,
+                        path,
+                        scale_bar_mm,
+                        spacing_model,
+                        outlines={v: outlines[v] for v in views},
+                        outline_width_px=outline_width_px,
+                        auxiliary_panels=auxiliary_panels,
+                        auxiliary_rects=aux_rects,
+                        png_dpi=png_dpi,
+                    )
+                    written.append(path)
+
+                if individual:
+                    for view in views:
+                        if export_png_plain:
+                            path = out_dir / f"{stem}_{view}_{mode}.png"
+                            self._save_individual_view(
+                                rendered[view],
+                                ppu,
+                                path,
+                                scale_bar_mm,
+                                outline_paths=None,
+                                outline_width_px=outline_width_px,
+                                png_dpi=png_dpi,
+                            )
+                            written.append(path)
+                        if export_png_outline:
+                            path = out_dir / f"{stem}_{view}_{mode}_outline.png"
+                            self._save_individual_view(
+                                rendered[view],
+                                ppu,
+                                path,
+                                scale_bar_mm,
+                                outline_paths=outlines.get(view),
+                                outline_width_px=outline_width_px,
+                                png_dpi=png_dpi,
+                            )
+                            written.append(path)
+                del rendered
+
+        # Standalone outline and section PNGs only when individual output is ON.
+        if need_png and individual:
+            front_outline_png = out_dir / f"{stem}_front_outline.png"
+            self._save_individual_view(
+                front_outline_panel,
+                ppu,
+                front_outline_png,
+                scale_bar_mm,
+                outline_paths=None,
+                outline_width_px=outline_width_px,
+                png_dpi=png_dpi,
+            )
+            written.append(front_outline_png)
+
+            if section_selected and section_panel is not None:
+                section_png = out_dir / f"{stem}_section.png"
+                self._save_individual_view(
+                    section_panel,
+                    ppu,
+                    section_png,
+                    scale_bar_mm,
+                    outline_paths=None,
+                    outline_width_px=outline_width_px,
+                    png_dpi=png_dpi,
+                )
+                written.append(section_png)
+
+
+        if progress_callback is not None:
+            progress_callback(1.0, "オルソ / 輪郭線 / 断面生成完了")
+        return written
+
+    # ---------- Error ----------
+    def _show_error(self, title: str, exc: Exception):
+        traceback.print_exc()
+        QMessageBox.critical(self, title, f"{exc}\n\n詳細はターミナル出力を確認してください。")
+        self.statusBar().showMessage(str(exc))
+
+
+def main():
+    app = QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
+    win = MainWindow()
+    win.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
