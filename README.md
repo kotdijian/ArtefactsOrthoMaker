@@ -8,6 +8,7 @@
 
 English: [README_EN.md](README_EN.md)  
 開発レポート: [docs/DEVELOPMENT_REPORT.md](docs/DEVELOPMENT_REPORT.md)  
+総合コードレビュー: [docs/CODE_REVIEW_v1.0.0.md](docs/CODE_REVIEW_v1.0.0.md)  
 Release notes: [docs/RELEASE_NOTES_v1.0.0.md](docs/RELEASE_NOTES_v1.0.0.md)
 
 Repository: https://github.com/kotdijian/ArtefactsOrthoMaker  
@@ -166,6 +167,8 @@ macOS Qt/PySide6問題：[docs/macos_qt_venv_issue.md](docs/macos_qt_venv_issue.
 v0.4.10以降：MIT License。v0.4.9以前：CC0 1.0 Universal。変更は遡及しません。詳細：[LICENSE_HISTORY.md](LICENSE_HISTORY.md)
 
 本アプリで作成した画像・計測結果・研究成果・業務成果物について制作者名のバイネーム表示は要求しません。ソフトウェア自体の再配布は各versionのlicense条件に従います。
+
+任意ですが、成果物・論文・Webページ・発表資料等に本リポジトリへのリンクと **制作者：野口 淳（@fujimicho on X）** を記載していただけると、利用事例の周知に加え、バグ報告や機能リクエストを本リポジトリへ集約するうえで役立ちます。
 
 # 開発履歴
 
