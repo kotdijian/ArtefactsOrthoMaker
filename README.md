@@ -14,6 +14,33 @@ Release notes: [docs/RELEASE_NOTES_v1.0.0.md](docs/RELEASE_NOTES_v1.0.0.md)
 Repository: https://github.com/kotdijian/ArtefactsOrthoMaker  
 制作者：**野口 淳（@fujimicho on X）**
 
+## 目次
+
+- [概要](#overview)
+- [最初に読む：`input/`・`output/`・処理キュー](#input-output)
+  - [処理対象を置く場所](#input-files)
+  - [出力先とスキップ条件](#output-skip)
+  - [CLI初心者向け：最短利用手順](#quick-start)
+- [Python 環境・実行方法](#python-environment)
+  - [macOS：初回セットアップ](#macos-setup)
+  - [Windows / PowerShell：初回セットアップ](#windows-setup)
+  - [環境確認スクリプト](#environment-check-script)
+  - [よくあるエラー](#troubleshooting)
+  - [SELF TEST](#self-test)
+  - [更新時の推奨手順](#update-procedure)
+- [共通仕様](#common)
+- [土器モード](#pottery)
+- [石器モード](#lithic)
+- [画像出力サイズ](#image-output-size)
+- [大規模メッシュ](#large-mesh)
+- [使用しているPythonモジュール](#python-modules)
+- [環境確認](#environment-check)
+- [制約](#limitations)
+- [ライセンス](#license)
+- [開発履歴](#history)
+
+
+<a id="model-size-warning"></a>
 > [!WARNING]
 > ## モデルサイズ / メッシュ数について
 >
@@ -23,6 +50,7 @@ Repository: https://github.com/kotdijian/ArtefactsOrthoMaker
 >
 > **入力ファイルが 300 MB（300,000,000 bytes）を超える場合、読み込み前に警告を表示します。処理は強制中断しません。** 続行するかどうかは利用者が判断できます。300 MB超では Normal 検証、3D表示、オルソ/曲面展開、画像生成でRAM使用量と処理時間が急増する可能性があります。v1.0.0 は大規模モデルを点群proxyやdecimated meshへ自動置換しません。
 
+<a id="overview"></a>
 ## 概要
 
 ArtefactsOrthoMaker は OBJ / PLY / GLB 形式の考古資料3Dモデルを読み込み、**土器**または**石器**として姿勢・座標系を正規化し、研究・記録・DTP用の画像、計測値、正規化モデル、Transform情報を出力する Python / PySide6 GUI アプリです。
@@ -36,6 +64,128 @@ ArtefactsOrthoMaker は OBJ / PLY / GLB 形式の考古資料3Dモデルを読�
 - 資料別計測 CSV
 - geometry / 3D model inventory
 
+<a id="input-output"></a>
+## 最初に読む：`input/`・`output/`・処理キュー
+
+> [!IMPORTANT]
+> 実際に使用するフォルダ名は **小文字の `input/` と `output/`** です。Cloneした場合もZIPを展開した場合も、**`app.py` があるフォルダを基準**にします。`Input/` や `Output/` という別名を自分で作る必要はありません。
+
+ArtefactsOrthoMaker は、起動時に `app.py` と同じ階層を作業ルートとして扱います。処理対象はその直下の `input/`、処理結果は同じ作業ルート直下の `output/` に保存します。
+
+```text
+ArtefactsOrthoMaker/
+├── app.py
+├── pose_core.py
+├── requirements.txt
+├── input/                 ← 処理したい3Dモデルを置く
+│   ├── pot001.obj
+│   ├── pot001.mtl         ← OBJが参照する場合
+│   └── pot001.jpg         ← OBJが参照する場合
+└── output/                ← 処理結果が保存される
+    └── pot001/
+        ├── pot001_rev.ply
+        ├── transform.json
+        └── ...
+```
+
+`input/` と `output/` が存在しない場合は、アプリ起動時に自動作成されます。
+
+<a id="input-files"></a>
+### 処理対象を置く場所
+
+処理したい `.obj` / `.ply` / `.glb` を、CloneまたはZIP展開した **ArtefactsOrthoMakerフォルダ内の `input/` に直接置いてください**。
+
+- `input/` のサブフォルダは再帰的には検索しません。処理対象の3Dモデル本体は `input/` 直下に置きます。
+- OBJがMTLやJPEG/PNG textureを参照する場合は、OBJからの相対パス関係を保って配置してください。典型的にはOBJ、MTL、texture画像を `input/` に一緒に置きます。
+- `.mtl`、`.jpg`、`.png` は3Dモデルの付属ファイルとして利用されますが、それ自体が処理キューへ追加されることはありません。
+- 対応3D形式は `.obj`, `.ply`, `.glb` です。STLは対象外です。
+- 入力ファイルはファイル名順でキューに並びます。
+- 同じstem（拡張子を除いたファイル名）の対応3Dファイルが複数あると、出力先が衝突するため停止します。たとえば `pot001.obj` と `pot001.ply` を同時に `input/` に置かないでください。
+
+<a id="output-skip"></a>
+### 出力先とスキップ条件
+
+入力ファイルごとに、同じstem名のフォルダを `output/` に使用します。
+
+```text
+input/pot001.obj
+        ↓
+output/pot001/
+```
+
+起動時の処理キューでは、**`output/<stem>/` がすでに存在し、かつその中に `.aom_in_progress` が存在しない入力は「完了済み」と判定してスキップ**します。
+
+つまり通常は、
+
+```text
+input/pot001.obj
+output/pot001/        ← 完了済み結果あり
+```
+
+であれば、次回起動時に `pot001.obj` は再処理されません。
+
+v1.0.0では、複数の出力を個別に作成している途中は：
+
+```text
+output/pot001/.aom_in_progress
+```
+
+というmarkerを使用します。このmarkerが残っている場合、その資料は未完了として処理キューに残ります。最後にGUIの **「次のファイルへ」** を実行するとmarkerが外れ、完了扱いになります。
+
+> [!CAUTION]
+> `output/<stem>/` を利用者が手作業で先に作成し、`.aom_in_progress` がない状態にすると、そのstemの入力は完了済みとしてスキップされます。再処理したい場合は、必要な結果を退避したうえで対応する `output/<stem>/` の扱いを確認してください。
+
+旧versionで作成された `output/<stem>/` のようにmarkerを持たない既存出力フォルダも、互換性のため完了済みとして扱います。
+
+また、`output/` 直下には資料別フォルダ以外に、`inventory-pottery.csv`、`inventory-lithic.csv` などの一覧CSVが作成される場合があります。
+
+<a id="quick-start"></a>
+### CLI初心者向け：最短利用手順
+
+初回だけ、CloneまたはZIP展開したフォルダでPython環境を準備します。macOSの例：
+
+```bash
+cd /path/to/ArtefactsOrthoMaker
+python3.13 -m venv venv
+source venv/bin/activate
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install -r requirements.txt
+python check_environment.py
+```
+
+次に、Finder等で処理対象を：
+
+```text
+ArtefactsOrthoMaker/input/
+```
+
+へ置きます。
+
+その後、ターミナルで：
+
+```bash
+python app.py
+```
+
+を実行します。処理結果は：
+
+```text
+ArtefactsOrthoMaker/output/
+```
+
+へ保存されます。
+
+2回目以降は、通常は次だけで起動できます。
+
+```bash
+cd /path/to/ArtefactsOrthoMaker
+source venv/bin/activate
+python app.py
+```
+
+すでに完了済みの `output/<stem>/` がある資料は自動的にスキップされ、未処理または処理途中の資料がキューに表示されます。Windowsの初回セットアップと起動方法は次節を参照してください。
+
+<a id="python-environment"></a>
 ## Python 環境・実行方法
 
 リポジトリ全体を **Clone** または **ZIP** で取得してください。**`app.py` だけを単独で取得しないでください。** `pose_core.py`、`requirements.txt`、環境確認・SELF TEST用スクリプトも必要です。
@@ -94,6 +244,7 @@ cd ArtefactsOrthoMaker
 
 Git を使用しない場合は、GitHub の **Code → Download ZIP** でリポジトリ全体を取得し、ZIPを展開してから、そのフォルダをターミナル / PowerShell で開いてください。
 
+<a id="macos-setup"></a>
 ### 4. macOS：初回セットアップ
 
 ターミナルでプロジェクトフォルダへ移動します。
@@ -147,6 +298,7 @@ python app.py
 python -c 'from PySide6.QtWidgets import QApplication; app=QApplication([]); print("QApplication OK"); app.quit()'
 ```
 
+<a id="windows-setup"></a>
 ### 5. Windows / PowerShell：初回セットアップ
 
 PowerShell でプロジェクトフォルダへ移動します。
@@ -215,6 +367,7 @@ Python標準ライブラリはPython本体に含まれるため、個別イン�
 
 各パッケージの用途は後述の「[使用しているPythonモジュール](#使用しているpythonモジュール)」を参照してください。
 
+<a id="environment-check-script"></a>
 ### 7. `check_environment.py`
 
 依存関係とQt起動環境を確認するスクリプトです。
@@ -233,6 +386,7 @@ ENVIRONMENT CHECK PASSED
 
 と表示します。
 
+<a id="troubleshooting"></a>
 ### 8. よくあるエラー
 
 #### `ModuleNotFoundError: No module named '...'`
@@ -289,6 +443,7 @@ python check_environment.py
 
 でQtの段階だけが失敗しているか確認してください。macOSでは [docs/macos_qt_venv_issue.md](docs/macos_qt_venv_issue.md) も参照してください。
 
+<a id="self-test"></a>
 ### 9. SELF TEST
 
 共通計算コアの簡易テスト：
@@ -305,6 +460,7 @@ SELF TEST PASSED
 
 `self_test.py` は主として姿勢・Normal・メッシュI/O等の共通計算を確認します。土器・石器のGUI操作、3Dビュー、インタラクティブ操作、オルソ・曲面展開は `app.py` を起動して実機確認してください。
 
+<a id="update-procedure"></a>
 ### 10. 更新時の推奨手順
 
 Git clone した環境を更新する場合：
@@ -328,6 +484,7 @@ Windows PowerShellでは `source venv/bin/activate` の代わりに：
 
 環境が大きく崩れた場合は、個別モジュールを継ぎ足すより `venv` を作り直し、`requirements.txt` から再構築する方が再現性があります。
 
+<a id="common"></a>
 # 共通仕様
 
 入力単位は `mm / cm / m`。自動decimationは行いません。texture / vertex colorを可能な範囲で保持し、必要に応じて表示・処理用Normalを計算します。
@@ -340,6 +497,7 @@ OBJは `v` と `vt` が独立indexを持つため、同一幾何頂点が複数U
 
 姿勢決定後、計測、展開図、PLY/Transformを独立して繰り返し出力できます。同名ファイルがある場合は **上書き / 別名で保存 / キャンセル** を確認し、「別名で保存」は出力一式へ `_01`, `_02`, … を付与します。
 
+<a id="pottery"></a>
 # 土器モード
 
 正規化後は `Z=器軸・高さ`, `X-Y=水平面`。姿勢決定は Slice / Rim / Base / Manual (3 points)。
@@ -371,10 +529,12 @@ settings JSONには `breakpoints_z_mm` と各区間の `z0_mm / z1_mm / referenc
 
 「上面」は元土器の物理的な口縁上面図ではありません。
 
+<a id="lithic"></a>
 # 石器モード
 
 正規化後は `X=幅`, `Y=長さ`, `Z=厚さ`。読込姿勢保持または明示的なminimum-volume OBB姿勢推定を選択できます。中央X-Z断面によるY軸水平化と手動X/Y/Z回転、任意断面出力に対応します。
 
+<a id="image-output-size"></a>
 # 画像出力サイズ
 
 印刷scale：150 / 300 dpi、50 / 66.6667 / 100%。
@@ -385,6 +545,7 @@ px/mm(source) = dpi / 25.4 × print_scale
 
 ファイルサイズ目標：S<=10 MB、M<=50 MB、L<=100 MB、Maximum。基本安全上限は16,384 px/辺・100 MP。大容量画像ではpreflight警告を出し、50%等の縮小出力を選択できます。
 
+<a id="large-mesh"></a>
 # 大規模メッシュ
 
 | 規模 | ASCII OBJ概算 | 位置づけ |
@@ -397,6 +558,7 @@ px/mm(source) = dpi / 25.4 × print_scale
 
 OBJサイズは `v / vt / vn`、桁数、material記述で変わるため概算です。
 
+<a id="python-modules"></a>
 # 使用しているPythonモジュール
 
 | モジュール / パッケージ | 主な用途 |
@@ -415,6 +577,7 @@ OBJサイズは `v / vt / vn`、桁数、material記述で変わるため概算�
 
 検証済みversionは [requirements.txt](requirements.txt)。
 
+<a id="environment-check"></a>
 # 環境確認
 
 ```bash
@@ -425,6 +588,7 @@ python self_test.py
 
 macOS Qt/PySide6問題：[docs/macos_qt_venv_issue.md](docs/macos_qt_venv_issue.md)
 
+<a id="limitations"></a>
 # 制約
 
 - non-watertight meshではvolume/Normal解釈に注意
@@ -435,6 +599,7 @@ macOS Qt/PySide6問題：[docs/macos_qt_venv_issue.md](docs/macos_qt_venv_issue.
 - overlap buffer付き区分展開はv1.0.0では未実装
 - 大規模モデルはRAMと処理時間に注意
 
+<a id="license"></a>
 # ライセンス
 
 v0.4.10以降：MIT License。v0.4.9以前：CC0 1.0 Universal。変更は遡及しません。詳細：[LICENSE_HISTORY.md](LICENSE_HISTORY.md)
@@ -443,6 +608,7 @@ v0.4.10以降：MIT License。v0.4.9以前：CC0 1.0 Universal。変更は遡及
 
 任意ですが、成果物・論文・Webページ・発表資料等に本リポジトリへのリンクと **制作者：野口 淳（@fujimicho on X）** を記載していただけると、利用事例の周知に加え、バグ報告や機能リクエストを本リポジトリへ集約するうえで役立ちます。
 
+<a id="history"></a>
 # 開発履歴
 
 | Version | 主な変更 |
