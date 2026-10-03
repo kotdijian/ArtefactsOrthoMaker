@@ -19,6 +19,7 @@ Repository: https://github.com/kotdijian/ArtefactsOrthoMaker
 - [概要](#overview)
 - [最初に読む：`input/`・`output/`・処理キュー](#input-output)
   - [処理対象を置く場所](#input-files)
+  - [入力対応ファイル](#supported-input-files)
   - [出力先とスキップ条件](#output-skip)
   - [CLI初心者向け：最短利用手順](#quick-start)
 - [Python 環境・実行方法](#python-environment)
@@ -101,6 +102,38 @@ ArtefactsOrthoMaker/
 - 対応3D形式は `.obj`, `.ply`, `.glb` です。STLは対象外です。
 - 入力ファイルはファイル名順でキューに並びます。
 - 同じstem（拡張子を除いたファイル名）の対応3Dファイルが複数あると、出力先が衝突するため停止します。たとえば `pot001.obj` と `pot001.ply` を同時に `input/` に置かないでください。
+
+<a id="supported-input-files"></a>
+### 入力対応ファイル
+
+処理キューへ追加される**3Dモデル本体**は次の3形式です。
+
+| 種類 | 拡張子 | 扱い |
+|---|---|---|
+| Wavefront OBJ | `.obj` | 対応。MTL・textureを参照するOBJでは、関連ファイルとの相対パスを保持してください。 |
+| Polygon File Format | `.ply` | 対応。vertex colorを含むPLYも利用できます。 |
+| glTF Binary | `.glb` | 対応。格納されているappearanceを可能な範囲で利用します。 |
+| STL | `.stl` | **非対応**。処理キューには追加されません。 |
+
+OBJで外観情報を使用する場合、次のような**付属ファイル**も `input/` に置くことがあります。
+
+| 付属ファイル | 例 | 扱い |
+|---|---|---|
+| Material file | `.mtl` | OBJから参照される場合に使用。単独では処理対象になりません。 |
+| Texture image | `.jpg`, `.jpeg`, `.png` など | MTL / OBJから参照される場合に使用。単独では処理対象になりません。 |
+
+たとえば、texture付きOBJなら次のように配置します。
+
+```text
+ArtefactsOrthoMaker/
+└── input/
+    ├── pot001.obj
+    ├── pot001.mtl
+    └── pot001.jpg
+```
+
+> [!NOTE]
+> `input/` に画像やMTLだけを置いても処理キューには表示されません。キュー判定の対象は `.obj`, `.ply`, `.glb` の3Dモデル本体です。
 
 <a id="output-skip"></a>
 ### 出力先とスキップ条件
