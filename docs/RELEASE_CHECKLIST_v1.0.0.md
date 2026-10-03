@@ -36,7 +36,7 @@
 - [x] lithic loaded pose / OBB / sections / PLY-Transform
 
 ## Publication
-- [ ] review final diff
+- [x] review final diff
 - [ ] create tag v1.0.0
 - [ ] create GitHub Release using RELEASE_NOTES_v1.0.0.md
-- [ ] record tested OS / Python / package versions
+- [x] record tested OS / Python / package versions

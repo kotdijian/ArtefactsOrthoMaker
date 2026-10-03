@@ -13,8 +13,7 @@
 - Historical apps archived; patches and tracked __pycache__ removed.
 - Current release license: MIT; pre-v0.4.10 CC0 history preserved.
 
-  
-- ## Tested environment
+## Tested environment
 
 - macOS 27.0 (Build 26A428)
 - Python 3.13.7
@@ -27,3 +26,4 @@
 - Pillow 12.3.0
 
 All v1.0.0 code checks and GUI regression tests passed in this environment.
+
