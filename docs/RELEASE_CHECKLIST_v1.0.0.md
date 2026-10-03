@@ -14,26 +14,26 @@
 - [x] macOS Qt note moved to docs/
 
 ## Code checks before tag
-- [ ] python -m py_compile app.py pose_core.py
-- [ ] python -m pip check
-- [ ] python check_environment.py
-- [ ] python self_test.py
+- [x] python -m py_compile app.py pose_core.py
+- [x] python -m pip check
+- [x] python check_environment.py
+- [x] python self_test.py
 
 ## GUI smoke test before tag
-- [ ] pottery Slice / Rim / Base / Manual
-- [ ] pottery ortho preview/export
-- [ ] OBJ UV seam texture sample
-- [ ] cylindrical one/multiple segments
-- [ ] fan one/multiple frustum segments
-- [ ] outer / inner / upper
-- [ ] 3D Z click does not rotate camera
-- [ ] overwrite / Save As _01, _02
-- [ ] settings JSON
-- [ ] 150 / 300 dpi and S/M/L
-- [ ] large-raster reduction prompt
-- [ ] >300 MB Continue / Cancel
-- [ ] pottery measurement + PLY/Transform
-- [ ] lithic loaded pose / OBB / sections / PLY-Transform
+- [x] pottery Slice / Rim / Base / Manual
+- [x] pottery ortho preview/export
+- [x] OBJ UV seam texture sample
+- [x] cylindrical one/multiple segments
+- [x] fan one/multiple frustum segments
+- [x] outer / inner / upper
+- [x] 3D Z click does not rotate camera
+- [x] overwrite / Save As _01, _02
+- [x] settings JSON
+- [x] 150 / 300 dpi and S/M/L
+- [x] large-raster reduction prompt
+- [x] >300 MB Continue / Cancel
+- [x] pottery measurement + PLY/Transform
+- [x] lithic loaded pose / OBB / sections / PLY-Transform
 
 ## Publication
 - [ ] review final diff
