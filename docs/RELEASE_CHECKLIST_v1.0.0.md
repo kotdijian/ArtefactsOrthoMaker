@@ -37,6 +37,6 @@
 
 ## Publication
 - [x] review final diff
-- [ ] create tag v1.0.0
-- [ ] create GitHub Release using RELEASE_NOTES_v1.0.0.md
+- [x] create tag v1.0.0
+- [x] create GitHub Release using RELEASE_NOTES_v1.0.0.md
 - [x] record tested OS / Python / package versions
