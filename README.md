@@ -36,24 +36,297 @@ ArtefactsOrthoMaker は OBJ / PLY / GLB 形式の考古資料3Dモデルを読�
 - 資料別計測 CSV
 - geometry / 3D model inventory
 
-## インストール
+## Python 環境・実行方法
 
-リポジトリ全体を Clone または ZIP で取得してください。**app.py だけを単独で取得しないでください。**
+リポジトリ全体を **Clone** または **ZIP** で取得してください。**`app.py` だけを単独で取得しないでください。** `pose_core.py`、`requirements.txt`、環境確認・SELF TEST用スクリプトも必要です。
 
-推奨：Python 3.13.x
+対応入力は `.obj`, `.ply`, `.glb` です。STL は対象外です。
+
+### 1. 推奨フォルダ構成
+
+```text
+ArtefactsOrthoMaker/
+├── app.py
+├── pose_core.py
+├── check_environment.py
+├── self_test.py
+├── requirements.txt
+├── README.md
+├── README_EN.md
+├── LICENSE
+├── LICENSE_HISTORY.md
+├── docs/
+├── archive/
+├── input/
+└── output/
+```
+
+`pose_core.py` は **pip でインストールするライブラリではなく、このアプリに含まれる必須ファイル**です。通常利用では `app.py` と同じリポジトリ内の配置を保ってください。
+
+`input/` と `output/` は存在しない場合、アプリ起動時に作成されます。過去版は `archive/versions/` に保存されています。
+
+### 2. 推奨 Python と最初の確認
+
+**Python 3.13.x** を推奨します。
+
+macOS：
+
+```bash
+python3.13 --version
+```
+
+Windows PowerShell：
+
+```powershell
+python --version
+```
+
+`Python 3.13.x` と表示されれば、以下の標準手順を使用できます。
+
+### 3. リポジトリの取得
+
+Git を使用する場合：
 
 ```bash
 git clone https://github.com/kotdijian/ArtefactsOrthoMaker.git
 cd ArtefactsOrthoMaker
+```
+
+Git を使用しない場合は、GitHub の **Code → Download ZIP** でリポジトリ全体を取得し、ZIPを展開してから、そのフォルダをターミナル / PowerShell で開いてください。
+
+### 4. macOS：初回セットアップ
+
+ターミナルでプロジェクトフォルダへ移動します。
+
+```bash
+cd /path/to/ArtefactsOrthoMaker
+```
+
+仮想環境 `venv` を作成・有効化します。
+
+```bash
 python3.13 -m venv venv
 source venv/bin/activate
+```
+
+pip 関係を更新し、`requirements.txt` から必要な外部パッケージをまとめて導入します。
+
+```bash
 python -m pip install --upgrade pip setuptools wheel
 python -m pip install -r requirements.txt
+```
+
+依存関係と実行環境を確認します。
+
+```bash
+python -m pip check
 python check_environment.py
+```
+
+共通計算コアのSELF TESTも実行できます。
+
+```bash
+python self_test.py
+```
+
+最後にアプリを起動します。
+
+```bash
 python app.py
 ```
 
-対応入力：`.obj`, `.ply`, `.glb`。STLは対象外です。
+#### macOS の Qt 起動エラー
+
+本プロジェクトの検証では、`.venv` という名前の環境で Qt platform plugin の file flags に関する問題が発生した例があるため、標準手順では仮想環境名を **`venv`** としています。`.venv` が一般に使用不能という意味ではありません。
+
+詳細：[docs/macos_qt_venv_issue.md](docs/macos_qt_venv_issue.md)
+
+最小 Qt 起動確認：
+
+```bash
+python -c 'from PySide6.QtWidgets import QApplication; app=QApplication([]); print("QApplication OK"); app.quit()'
+```
+
+### 5. Windows / PowerShell：初回セットアップ
+
+PowerShell でプロジェクトフォルダへ移動します。
+
+```powershell
+cd C:\path\to\ArtefactsOrthoMaker
+```
+
+仮想環境を作成します。
+
+```powershell
+python -m venv venv
+```
+
+有効化します。
+
+```powershell
+.\venv\Scripts\Activate.ps1
+```
+
+`running scripts is disabled on this system` と表示された場合だけ、現在の PowerShell セッションについて実行を許可してから再度有効化します。
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\venv\Scripts\Activate.ps1
+```
+
+必要な外部パッケージをまとめて導入します。
+
+```powershell
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install -r requirements.txt
+```
+
+確認：
+
+```powershell
+python -m pip check
+python check_environment.py
+python self_test.py
+```
+
+起動：
+
+```powershell
+python app.py
+```
+
+### 6. requirements.txt
+
+v1.0.0 の `requirements.txt` では、アプリが利用する主要な第三者パッケージをversion固定しています。
+
+```text
+numpy==2.5.2
+scipy==1.18.0
+trimesh==5.0.0
+pyvista==0.48.4
+pyvistaqt==0.12.0
+vtk==9.6.2
+PySide6==6.10.3
+QtPy==2.4.3
+Pillow==12.3.0
+```
+
+Python標準ライブラリはPython本体に含まれるため、個別インストールは不要です。また、上記パッケージが必要とする内部依存パッケージは `pip` が自動的に導入します。**個別モジュールを1つずつ追加するのではなく、原則として `requirements.txt` を使用してください。**
+
+各パッケージの用途は後述の「[使用しているPythonモジュール](#使用しているpythonモジュール)」を参照してください。
+
+### 7. `check_environment.py`
+
+依存関係とQt起動環境を確認するスクリプトです。
+
+```bash
+python check_environment.py
+```
+
+NumPy、SciPy、Trimesh、PyVista、PyVistaQt、VTK、PySide6、QtPy、Pillow、ローカル `pose_core.py`、Qt `QApplication` / platform plugin を順に確認します。
+
+正常な場合、最後に：
+
+```text
+ENVIRONMENT CHECK PASSED
+```
+
+と表示します。
+
+### 8. よくあるエラー
+
+#### `ModuleNotFoundError: No module named '...'`
+
+まず仮想環境が有効か確認します。
+
+macOS：
+
+```bash
+which python
+```
+
+`.../ArtefactsOrthoMaker/venv/bin/python` のように表示されるのが正常です。
+
+Windows PowerShell：
+
+```powershell
+Get-Command python
+```
+
+`...\ArtefactsOrthoMaker\venv\Scripts\python.exe` を指していることを確認します。
+
+その後：
+
+```bash
+python -m pip install -r requirements.txt
+python -m pip check
+python check_environment.py
+```
+
+を再実行してください。
+
+#### `No module named 'pose_core'`
+
+`pose_core.py` は pip パッケージではありません。`app.py` と `pose_core.py` が同じリポジトリ内の所定位置にあることを確認してください。
+
+#### `No module named 'scipy'`
+
+SciPy は必須です。個別追加ではなく：
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+を実行してください。
+
+#### Qt platform plugin エラー
+
+まず：
+
+```bash
+python check_environment.py
+```
+
+でQtの段階だけが失敗しているか確認してください。macOSでは [docs/macos_qt_venv_issue.md](docs/macos_qt_venv_issue.md) も参照してください。
+
+### 9. SELF TEST
+
+共通計算コアの簡易テスト：
+
+```bash
+python self_test.py
+```
+
+正常終了時：
+
+```text
+SELF TEST PASSED
+```
+
+`self_test.py` は主として姿勢・Normal・メッシュI/O等の共通計算を確認します。土器・石器のGUI操作、3Dビュー、インタラクティブ操作、オルソ・曲面展開は `app.py` を起動して実機確認してください。
+
+### 10. 更新時の推奨手順
+
+Git clone した環境を更新する場合：
+
+```bash
+git pull
+source venv/bin/activate
+python -m pip install -r requirements.txt
+python -m pip check
+python check_environment.py
+python self_test.py
+```
+
+Windows PowerShellでは `source venv/bin/activate` の代わりに：
+
+```powershell
+.\venv\Scripts\Activate.ps1
+```
+
+を使用します。
+
+環境が大きく崩れた場合は、個別モジュールを継ぎ足すより `venv` を作り直し、`requirements.txt` から再構築する方が再現性があります。
 
 # 共通仕様
 
