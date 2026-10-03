@@ -1,0 +1,2924 @@
+--- a/app.py
++++ b/app.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import csv
++import io
+ import json
+ import math
+ import shutil
+@@ -68,7 +69,7 @@
+ )
+ 
+ APP_NAME = "Artifact Pose Normalizer"
+-APP_VERSION = "0.4.9"
++APP_VERSION = "0.4.10"
+ SUPPORTED_SUFFIXES = {".obj", ".ply", ".glb"}
+ WORK_DIR = Path(__file__).resolve().parent
+ INPUT_DIR = WORK_DIR / "input"
+@@ -488,8 +489,12 @@
+         self._preview_refresh_pending = False
+         self._setting_dial = False
+         self._setting_pottery_curve_controls = False
++        self._setting_pottery_z_cursor = False
++        self.pottery_curve_z_pick_mode = False
+         self.pottery_curve_png_bpp_estimate: float | None = None
++        self.pottery_ortho_png_bpp_estimate: float | None = None
+         self._pottery_curve_size_refresh_pending = False
++        self.pottery_cylinder_breakpoints_mm: list[float] = []
+         self.queue_all: list[Path] = []
+         self.current_queue_path: Path | None = None
+ 
+@@ -676,446 +681,13 @@
+         pottery_branch_layout.addWidget(self.pottery_output_branch_combo)
+         left_layout.addWidget(self.pottery_output_branch_group)
+ 
+-        self.lithic_pose_group = QGroupBox("2. 石器姿勢（OBB + 3軸回転）")
+-        lithic_layout = QVBoxLayout(self.lithic_pose_group)
+-
+-        self.lithic_obb_label = QLabel(
+-            "石器は読込時の姿勢を保持します。必要な場合だけ自動姿勢推定を実行してください。"
+-        )
+-        self.lithic_obb_label.setWordWrap(True)
+-        self.lithic_obb_label.setTextInteractionFlags(
+-            Qt.TextInteractionFlag.TextSelectableByMouse
+-        )
+-        lithic_layout.addWidget(self.lithic_obb_label)
+-
+-        self.lithic_auto_pose_btn = QPushButton(
+-            "自動姿勢推定（OBB + 中央X-Z水平化）"
+-        )
+-        self.lithic_auto_pose_btn.clicked.connect(
+-            self._apply_lithic_oriented_bounds
+-        )
+-        lithic_layout.addWidget(self.lithic_auto_pose_btn)
+-
+-        self.lithic_input_pose_btn = QPushButton("読込姿勢に戻す")
+-        self.lithic_input_pose_btn.clicked.connect(self._use_lithic_input_pose)
+-        lithic_layout.addWidget(self.lithic_input_pose_btn)
+-
+-        self.lithic_rotation_controls = {}
+-        for axis, axis_label, meaning in [("y", "Y", "長さ"), ("x", "X", "幅"), ("z", "Z", "厚さ")]:
+-            axis_box = QGroupBox(f"{axis_label}軸回転（{meaning}）")
+-            axis_layout = QVBoxLayout(axis_box)
+-
+-            button_row = QHBoxLayout()
+-            minus90 = QPushButton("-90°")
+-            minus90.clicked.connect(
+-                lambda _=False, a=axis: self._increment_lithic_axis(a, -90.0)
+-            )
+-            zero = QPushButton("0°")
+-            zero.clicked.connect(
+-                lambda _=False, a=axis: self._set_lithic_axis_angle(a, 0.0)
+-            )
+-            plus90 = QPushButton("+90°")
+-            plus90.clicked.connect(
+-                lambda _=False, a=axis: self._increment_lithic_axis(a, 90.0)
+-            )
+-            button_row.addWidget(minus90)
+-            button_row.addWidget(zero)
+-            button_row.addWidget(plus90)
+-            axis_layout.addLayout(button_row)
+-
+-            dial = QDial()
+-            dial.setRange(-1800, 1800)
+-            dial.setNotchesVisible(True)
+-            dial.setWrapping(False)
+-            dial.valueChanged.connect(
+-                lambda value, a=axis: self._lithic_dial_changed(a, value)
+-            )
+-            axis_layout.addWidget(dial)
+-
+-            spin = QDoubleSpinBox()
+-            spin.setRange(-180.0, 180.0)
+-            spin.setDecimals(1)
+-            spin.setSingleStep(1.0)
+-            spin.setSuffix("°")
+-            spin.valueChanged.connect(
+-                lambda value, a=axis: self._lithic_spin_changed(a, value)
+-            )
+-            axis_layout.addWidget(spin)
+-
+-            self.lithic_rotation_controls[axis] = {
+-                "dial": dial,
+-                "spin": spin,
+-                "minus90": minus90,
+-                "zero": zero,
+-                "plus90": plus90,
+-            }
+-            lithic_layout.addWidget(axis_box)
+-
+-        self.lithic_reset_btn = QPushButton("基準姿勢に戻す（手動回転 0°）")
+-        self.lithic_reset_btn.clicked.connect(self._reset_lithic_rotations)
+-        lithic_layout.addWidget(self.lithic_reset_btn)
+-
+-        self.lithic_hint = QLabel(
+-            "初期状態では入力PLYの姿勢をそのまま使用します。"
+-            "「自動姿勢推定」を押した場合のみ、① minimum-volume OBBで "
+-            "X=幅 / Y=長さ / Z=厚さ、②中央X-Z断面の左右端を結ぶ線がX軸に "
+-            "平行になるようY軸回転で自動補正します。各軸の±90°ボタン、"
+-            "ダイヤル、数値入力は現在の基準姿勢に対する追加回転です。"
+-        )
+-        self.lithic_hint.setWordWrap(True)
+-        lithic_layout.addWidget(self.lithic_hint)
+-
+-        self.lithic_confirm_btn = QPushButton("姿勢決定")
+-        self.lithic_confirm_btn.clicked.connect(self._confirm_lithic_pose)
+-        lithic_layout.addWidget(self.lithic_confirm_btn)
+-        left_layout.addWidget(self.lithic_pose_group)
+-
+-        # Lithic output panel.  It becomes visible after "姿勢決定".
+-        self.lithic_output_group = QGroupBox("3. 石器 出力 / 断面設定")
+-        lithic_output_layout = QVBoxLayout(self.lithic_output_group)
+-
+-        self.lithic_return_pose_btn = QPushButton("石器姿勢に戻る")
+-        self.lithic_return_pose_btn.clicked.connect(self._return_to_lithic_pose)
+-        lithic_output_layout.addWidget(self.lithic_return_pose_btn)
+-
+-        lithic_output_layout.addWidget(QLabel("出力面（デフォルト6面）"))
+-        self.lithic_view_checks = {}
+-        for key, label in [
+-            ("front", "Front"),
+-            ("back", "Back"),
+-            ("left", "Left"),
+-            ("right", "Right"),
+-            ("top", "Top"),
+-            ("bottom", "Bottom"),
+-        ]:
+-            cb = QCheckBox(label)
+-            cb.setChecked(True)
+-            self.lithic_view_checks[key] = cb
+-            lithic_output_layout.addWidget(cb)
+-
+-        lithic_output_layout.addWidget(QLabel("表現"))
+-        self.lithic_mode_texture = QCheckBox("テクスチャ / 頂点カラー")
+-        self.lithic_mode_texture_normal = QCheckBox(
+-            "テクスチャ / 頂点カラー + Normal"
+-        )
+-        self.lithic_mode_shade = QCheckBox("Normalのみ（シェード）")
+-        for cb in (
+-            self.lithic_mode_texture,
+-            self.lithic_mode_texture_normal,
+-            self.lithic_mode_shade,
+-        ):
+-            cb.setChecked(True)
+-            lithic_output_layout.addWidget(cb)
+-
+-        lithic_spacing_row = QHBoxLayout()
+-        lithic_spacing_row.addWidget(QLabel("面間隔"))
+-        self.lithic_view_spacing = QDoubleSpinBox()
+-        self.lithic_view_spacing.setRange(0.0, 10000.0)
+-        self.lithic_view_spacing.setValue(10.0)
+-        self.lithic_view_spacing.setDecimals(1)
+-        self.lithic_view_spacing.setSuffix(" mm")
+-        lithic_spacing_row.addWidget(self.lithic_view_spacing)
+-        lithic_output_layout.addLayout(lithic_spacing_row)
+-
+-        lithic_scale_row = QHBoxLayout()
+-        lithic_scale_row.addWidget(QLabel("スケールバー"))
+-        self.lithic_scale_bar_combo = QComboBox()
+-        self.lithic_scale_bar_combo.addItems(["20 mm", "50 mm", "100 mm"])
+-        self.lithic_scale_bar_combo.setCurrentText("50 mm")
+-        lithic_scale_row.addWidget(self.lithic_scale_bar_combo)
+-        lithic_output_layout.addLayout(lithic_scale_row)
+-
+-        image_size_group = QGroupBox("画像出力サイズ")
+-        image_size_form = QFormLayout(image_size_group)
+-
+-        self.lithic_image_size_mode_combo = QComboBox()
+-        self.lithic_image_size_mode_combo.addItems([
+-            "印刷スケール指定",
+-            "ファイルサイズ指定",
+-        ])
+-        image_size_form.addRow("モード", self.lithic_image_size_mode_combo)
+-
+-        self.lithic_print_dpi_combo = QComboBox()
+-        self.lithic_print_dpi_combo.addItems(["150 dpi", "300 dpi"])
+-        self.lithic_print_dpi_combo.setCurrentText("300 dpi")
+-        image_size_form.addRow("印刷解像度", self.lithic_print_dpi_combo)
+-
+-        self.lithic_print_scale_combo = QComboBox()
+-        self.lithic_print_scale_combo.addItems(["50 %", "66.6667 %", "100 %"])
+-        self.lithic_print_scale_combo.setCurrentText("100 %")
+-        image_size_form.addRow("印刷倍率", self.lithic_print_scale_combo)
+-
+-        self.lithic_file_size_combo = QComboBox()
+-        self.lithic_file_size_combo.addItems([
+-            "S  ≤ 10 MB",
+-            "M  ≤ 50 MB",
+-            "L  ≤ 100 MB",
+-            "Maximum",
+-        ])
+-        self.lithic_file_size_combo.setCurrentText("M  ≤ 50 MB")
+-        image_size_form.addRow("PNG上限", self.lithic_file_size_combo)
+-
+-        self.lithic_output_size_label = QLabel("—")
+-        self.lithic_output_size_label.setWordWrap(True)
+-        image_size_form.addRow("出力見積", self.lithic_output_size_label)
+-        lithic_output_layout.addWidget(image_size_group)
+-
+-        for combo in (
+-            self.lithic_image_size_mode_combo,
+-            self.lithic_print_dpi_combo,
+-            self.lithic_print_scale_combo,
+-            self.lithic_file_size_combo,
+-        ):
+-            combo.currentTextChanged.connect(
+-                self._lithic_image_output_setting_changed
+-            )
+-        self._lithic_image_output_setting_changed()
+-
+-        lithic_output_layout.addWidget(QLabel("出力形式"))
+-        self.lithic_output_png = QCheckBox("PNGのみ")
+-        self.lithic_output_png.setChecked(True)
+-        self.lithic_output_svg = QCheckBox("SVG")
+-        self.lithic_output_svg.setChecked(False)
+-        self.lithic_outline_overlay = QCheckBox("PNG+輪郭（SVG由来）")
+-        self.lithic_outline_overlay.setChecked(False)
+-        lithic_output_layout.addWidget(self.lithic_output_png)
+-        lithic_output_layout.addWidget(self.lithic_output_svg)
+-        lithic_output_layout.addWidget(self.lithic_outline_overlay)
+-
+-        lithic_outline_width_row = QHBoxLayout()
+-        lithic_outline_width_row.addWidget(QLabel("PNG輪郭線太さ"))
+-        self.lithic_outline_width_combo = QComboBox()
+-        self.lithic_outline_width_combo.addItems(["1 px", "2 px", "3 px", "5 px"])
+-        self.lithic_outline_width_combo.setCurrentText("2 px")
+-        lithic_outline_width_row.addWidget(self.lithic_outline_width_combo)
+-        lithic_output_layout.addLayout(lithic_outline_width_row)
+-
+-        self.lithic_export_individual = QCheckBox(
+-            "各面・断面を個別ファイルでも出力"
+-        )
+-        self.lithic_export_individual.setChecked(False)
+-        lithic_output_layout.addWidget(self.lithic_export_individual)
+-
+-        for cb in (
+-            *self.lithic_view_checks.values(),
+-            self.lithic_mode_texture,
+-            self.lithic_mode_texture_normal,
+-            self.lithic_mode_shade,
+-            self.lithic_output_png,
+-            self.lithic_output_svg,
+-            self.lithic_outline_overlay,
+-            self.lithic_export_individual,
+-        ):
+-            cb.stateChanged.connect(self._schedule_lithic_output_size_update)
+-        self.lithic_view_spacing.valueChanged.connect(
+-            self._schedule_lithic_output_size_update
+-        )
+-        self.lithic_scale_bar_combo.currentTextChanged.connect(
+-            self._schedule_lithic_output_size_update
+-        )
+-
+-        lithic_output_layout.addWidget(QLabel("断面設定"))
+-        section_buttons = QHBoxLayout()
+-        self.lithic_add_section_x_btn = QPushButton("断面追加（X）")
+-        self.lithic_add_section_x_btn.clicked.connect(
+-            lambda: self._add_lithic_section("X")
+-        )
+-        self.lithic_add_section_y_btn = QPushButton("断面追加（Y）")
+-        self.lithic_add_section_y_btn.clicked.connect(
+-            lambda: self._add_lithic_section("Y")
+-        )
+-        self.lithic_delete_section_btn = QPushButton("削除")
+-        self.lithic_delete_section_btn.clicked.connect(
+-            self._delete_selected_lithic_section
+-        )
+-        section_buttons.addWidget(self.lithic_add_section_x_btn)
+-        section_buttons.addWidget(self.lithic_add_section_y_btn)
+-        section_buttons.addWidget(self.lithic_delete_section_btn)
+-        lithic_output_layout.addLayout(section_buttons)
+-
+-        self.lithic_section_status_label = QLabel(
+-            "初期断面: X=Y長さ1/2（X-Z断面） / "
+-            "Y=X幅1/2（Y-Z断面）"
+-        )
+-        self.lithic_section_status_label.setWordWrap(True)
+-        lithic_output_layout.addWidget(self.lithic_section_status_label)
+-
+-        self.lithic_preview_btn = QPushButton("プレビュー確認")
+-        self.lithic_preview_btn.clicked.connect(self._show_lithic_output_preview)
+-        lithic_output_layout.addWidget(self.lithic_preview_btn)
+-
+-        # Split lithic export into independent products. This allows a
+-        # normalized *_rev.ply to be re-opened only to regenerate orthographic
+-        # drawings without redundantly writing measurement data or another PLY.
+-        self.lithic_measurement_export_btn = QPushButton("計測データ出力")
+-        self.lithic_measurement_export_btn.clicked.connect(
+-            self._export_lithic_measurements
+-        )
+-        self.lithic_ortho_export_btn = QPushButton("展開図出力")
+-        self.lithic_ortho_export_btn.clicked.connect(
+-            self._export_lithic_orthographic_files
+-        )
+-        self.lithic_ply_export_btn = QPushButton("PLY / Transform出力")
+-        self.lithic_ply_export_btn.clicked.connect(
+-            self._export_lithic_ply_files
+-        )
+-        self.lithic_next_btn = QPushButton("次のファイルへ")
+-        self.lithic_next_btn.clicked.connect(self._finish_lithic_and_next)
+-
+-        self.lithic_export_stage_label = QLabel("待機")
+-        self.lithic_export_progress = QProgressBar()
+-        self.lithic_export_progress.setRange(0, 100)
+-        self.lithic_export_progress.setValue(0)
+-
+-        lithic_output_layout.addWidget(QLabel("出力"))
+-        lithic_output_layout.addWidget(self.lithic_measurement_export_btn)
+-        lithic_output_layout.addWidget(self.lithic_ortho_export_btn)
+-        lithic_output_layout.addWidget(self.lithic_ply_export_btn)
+-        lithic_output_layout.addWidget(QLabel(
+-            "展開図 / PLY は計測データ未保存でも出力できます。"
+-            "未保存の場合は確認メッセージを表示します。"
+-        ))
+-        lithic_output_layout.addWidget(self.lithic_next_btn)
+-        lithic_output_layout.addWidget(self.lithic_export_stage_label)
+-        lithic_output_layout.addWidget(self.lithic_export_progress)
+-        left_layout.addWidget(self.lithic_output_group)
+-
+-        self.ortho_group = QGroupBox("4. オルソ画像 / 輪郭線")
+-        ortho_layout = QVBoxLayout(self.ortho_group)
+-        ortho_layout.addWidget(QLabel("出力面（デフォルト6面）"))
+-        self.view_checks = {}
+-        for key, label in [
+-            ("front", "Front"), ("back", "Back"), ("left", "Left"),
+-            ("right", "Right"), ("top", "Top"), ("bottom", "Bottom")
+-        ]:
+-            cb = QCheckBox(label)
+-            cb.setChecked(True)
+-            self.view_checks[key] = cb
+-            ortho_layout.addWidget(cb)
+-
+-        ortho_layout.addWidget(QLabel("表現（基本3種はデフォルトON、特殊図はデフォルトOFF）"))
+-        self.mode_texture = QCheckBox("テクスチャ / 頂点カラー")
+-        self.mode_texture_normal = QCheckBox("テクスチャ / 頂点カラー + Normal")
+-        self.mode_shade = QCheckBox("Normalのみ（シェード）")
+-        self.mode_section = QCheckBox("縦断面")
+-        self.mode_half_section = QCheckBox("半截")
+-        self.mode_quarter_half = QCheckBox("1/4半截")
+-        for cb in (self.mode_texture, self.mode_texture_normal, self.mode_shade):
+-            cb.setChecked(True)
+-            ortho_layout.addWidget(cb)
+-        for cb in (self.mode_section, self.mode_half_section, self.mode_quarter_half):
+-            cb.setChecked(False)
+-            ortho_layout.addWidget(cb)
+-
+-        spacing_row = QHBoxLayout()
+-        spacing_row.addWidget(QLabel("面間隔"))
+-        self.view_spacing = QDoubleSpinBox()
+-        self.view_spacing.setRange(0.0, 10000.0)
+-        self.view_spacing.setValue(10.0)
+-        self.view_spacing.setDecimals(1)
+-        self.view_spacing.setSuffix(" mm")
+-        spacing_row.addWidget(self.view_spacing)
+-        ortho_layout.addLayout(spacing_row)
+-
+-        scale_row = QHBoxLayout()
+-        scale_row.addWidget(QLabel("スケールバー"))
+-        self.scale_bar_combo = QComboBox()
+-        self.scale_bar_combo.addItems(["20 mm", "50 mm", "100 mm"])
+-        self.scale_bar_combo.setCurrentText("50 mm")
+-        scale_row.addWidget(self.scale_bar_combo)
+-        ortho_layout.addLayout(scale_row)
+-
+-        ortho_layout.addWidget(QLabel("出力形式"))
+-        self.output_png = QCheckBox("PNGのみ")
+-        self.output_png.setChecked(True)
+-        self.output_svg = QCheckBox("SVG")
+-        self.output_svg.setChecked(False)
+-        self.outline_overlay = QCheckBox("PNG+輪郭（SVG由来）")
+-        self.outline_overlay.setChecked(False)
+-        ortho_layout.addWidget(self.output_png)
+-        ortho_layout.addWidget(self.output_svg)
+-        ortho_layout.addWidget(self.outline_overlay)
+-
+-        outline_width_row = QHBoxLayout()
+-        outline_width_row.addWidget(QLabel("PNG輪郭線太さ"))
+-        self.outline_width_combo = QComboBox()
+-        self.outline_width_combo.addItems(["1 px", "2 px", "3 px", "5 px"])
+-        self.outline_width_combo.setCurrentText("2 px")
+-        outline_width_row.addWidget(self.outline_width_combo)
+-        ortho_layout.addLayout(outline_width_row)
+-
+-        self.export_individual = QCheckBox("各面を個別ファイルでも出力")
+-        self.export_individual.setChecked(False)
+-        ortho_layout.addWidget(self.export_individual)
+-        left_layout.addWidget(self.ortho_group)
+-
+-        self.pottery_curve_group = QGroupBox("5. 土器 曲面展開")
+-        curve_layout = QVBoxLayout(self.pottery_curve_group)
+-
+-        curve_layout.addWidget(QLabel(
+-            "共通座標: Z=器軸 / X-Y=水平面 / Back側を展開シームとします。"
+-        ))
+-        curve_render_form = QFormLayout()
+-        self.pottery_curve_render_combo = QComboBox()
+-        self.pottery_curve_render_combo.addItems([
+-            "テクスチャ / 頂点カラー",
+-            "テクスチャ / 頂点カラー + Normal",
+-            "Normalのみ（シェード）",
+-        ])
+-        curve_render_form.addRow("表現", self.pottery_curve_render_combo)
+-        curve_layout.addLayout(curve_render_form)
+-
+-        self.pottery_cylinder_group = QGroupBox("円筒展開: 基準外径")
+-        cylinder_form = QFormLayout(self.pottery_cylinder_group)
+-        self.pottery_cylinder_z_spin = QDoubleSpinBox()
+-        self.pottery_cylinder_z_spin.setRange(-1.0e9, 1.0e9)
+-        self.pottery_cylinder_z_spin.setDecimals(3)
+-        self.pottery_cylinder_z_spin.setSuffix(" mm")
+-        self.pottery_cylinder_z_spin.valueChanged.connect(
+-            self._pottery_cylinder_z_changed
+-        )
+-        self.pottery_cylinder_d_spin = QDoubleSpinBox()
+-        self.pottery_cylinder_d_spin.setRange(0.001, 1.0e9)
+-        self.pottery_cylinder_d_spin.setDecimals(3)
+-        self.pottery_cylinder_d_spin.setSuffix(" mm")
+-        self.pottery_cylinder_measure_btn = QPushButton("指定Zで外径を再計測")
+-        self.pottery_cylinder_measure_btn.clicked.connect(
+-            self._pottery_measure_cylinder_diameter
+-        )
+-        cylinder_form.addRow("基準Z", self.pottery_cylinder_z_spin)
+-        cylinder_form.addRow("外径D", self.pottery_cylinder_d_spin)
+-        cylinder_form.addRow(self.pottery_cylinder_measure_btn)
+-        curve_layout.addWidget(self.pottery_cylinder_group)
+-
+-        self.pottery_fan_group = QGroupBox("扇形展開: Z区分点 / 外径")
+-        fan_layout = QVBoxLayout(self.pottery_fan_group)
+-        fan_layout.addWidget(QLabel(
+-            "基本は底部と口縁の2点です。途中で傾斜が変わる場合は区分点を追加します。"
+-        ))
+-        self.pottery_fan_table = QTableWidget(0, 2)
+-        self.pottery_fan_table.setHorizontalHeaderLabels(["Z (mm)", "外径D (mm)"])
+-        self.pottery_fan_table.horizontalHeader().setSectionResizeMode(
+-            QHeaderView.ResizeMode.Stretch
+-        )
+-        self.pottery_fan_table.itemChanged.connect(
+-            self._pottery_fan_table_changed
+-        )
+-        fan_layout.addWidget(self.pottery_fan_table)
+-        fan_buttons = QHBoxLayout()
+-        self.pottery_fan_add_btn = QPushButton("区分点追加")
+-        self.pottery_fan_add_btn.clicked.connect(self._pottery_add_fan_breakpoint)
+-        self.pottery_fan_delete_btn = QPushButton("選択区分点削除")
+-        self.pottery_fan_delete_btn.clicked.connect(self._pottery_delete_fan_breakpoint)
+-        self.pottery_fan_measure_btn = QPushButton("全外径を再計測")
+-        self.pottery_fan_measure_btn.clicked.connect(self._pottery_remeasure_fan_diameters)
+-        fan_buttons.addWidget(self.pottery_fan_add_btn)
+-        fan_buttons.addWidget(self.pottery_fan_delete_btn)
+-        fan_layout.addLayout(fan_buttons)
+-        fan_layout.addWidget(self.pottery_fan_measure_btn)
+-        curve_layout.addWidget(self.pottery_fan_group)
+-
+-        curve_size_group = QGroupBox("画像サイズ")
+-        curve_size_form = QFormLayout(curve_size_group)
++        # Common raster-output sizing for every pottery branch.  Keeping this
++        # outside the orthographic/curved branch panels makes the same DPI or
++        # target-file-size policy visible regardless of the selected output.
++        self.pottery_image_size_group = QGroupBox(
++            "5. 画像出力サイズ（オルソ / 円筒 / 扇形 共通）"
++        )
++        pottery_size_form = QFormLayout(self.pottery_image_size_group)
+         self.pottery_curve_image_size_mode_combo = QComboBox()
+         self.pottery_curve_image_size_mode_combo.addItems([
+             "印刷スケール指定",
+@@ -1138,46 +710,565 @@
+             self.pottery_curve_file_size_combo,
+         ):
+             w.currentTextChanged.connect(self._pottery_curve_output_setting_changed)
+-        curve_size_form.addRow("モード", self.pottery_curve_image_size_mode_combo)
+-        curve_size_form.addRow("印刷解像度", self.pottery_curve_print_dpi_combo)
+-        curve_size_form.addRow("印刷倍率", self.pottery_curve_print_scale_combo)
+-        curve_size_form.addRow("容量上限", self.pottery_curve_file_size_combo)
+-        self.pottery_curve_output_size_label = QLabel("姿勢決定後に出力サイズを計算します。")
++        pottery_size_form.addRow("モード", self.pottery_curve_image_size_mode_combo)
++        pottery_size_form.addRow("印刷解像度", self.pottery_curve_print_dpi_combo)
++        pottery_size_form.addRow("印刷倍率", self.pottery_curve_print_scale_combo)
++        pottery_size_form.addRow("容量上限", self.pottery_curve_file_size_combo)
++        self.pottery_curve_output_size_label = QLabel(
++            "姿勢決定後に出力サイズを計算します。"
++        )
+         self.pottery_curve_output_size_label.setWordWrap(True)
+-        curve_size_form.addRow(self.pottery_curve_output_size_label)
+-        curve_layout.addWidget(curve_size_group)
++        pottery_size_form.addRow(self.pottery_curve_output_size_label)
++        left_layout.addWidget(self.pottery_image_size_group)
++
++        self.lithic_pose_group = QGroupBox("2. 石器姿勢（OBB + 3軸回転）")
++        lithic_layout = QVBoxLayout(self.lithic_pose_group)
++
++        self.lithic_obb_label = QLabel(
++            "石器は読込時の姿勢を保持します。必要な場合だけ自動姿勢推定を実行してください。"
++        )
++        self.lithic_obb_label.setWordWrap(True)
++        self.lithic_obb_label.setTextInteractionFlags(
++            Qt.TextInteractionFlag.TextSelectableByMouse
++        )
++        lithic_layout.addWidget(self.lithic_obb_label)
++
++        self.lithic_auto_pose_btn = QPushButton(
++            "自動姿勢推定（OBB + 中央X-Z水平化）"
++        )
++        self.lithic_auto_pose_btn.clicked.connect(
++            self._apply_lithic_oriented_bounds
++        )
++        lithic_layout.addWidget(self.lithic_auto_pose_btn)
++
++        self.lithic_input_pose_btn = QPushButton("読込姿勢に戻す")
++        self.lithic_input_pose_btn.clicked.connect(self._use_lithic_input_pose)
++        lithic_layout.addWidget(self.lithic_input_pose_btn)
++
++        self.lithic_rotation_controls = {}
++        for axis, axis_label, meaning in [("y", "Y", "長さ"), ("x", "X", "幅"), ("z", "Z", "厚さ")]:
++            axis_box = QGroupBox(f"{axis_label}軸回転（{meaning}）")
++            axis_layout = QVBoxLayout(axis_box)
++
++            button_row = QHBoxLayout()
++            minus90 = QPushButton("-90°")
++            minus90.clicked.connect(
++                lambda _=False, a=axis: self._increment_lithic_axis(a, -90.0)
++            )
++            zero = QPushButton("0°")
++            zero.clicked.connect(
++                lambda _=False, a=axis: self._set_lithic_axis_angle(a, 0.0)
++            )
++            plus90 = QPushButton("+90°")
++            plus90.clicked.connect(
++                lambda _=False, a=axis: self._increment_lithic_axis(a, 90.0)
++            )
++            button_row.addWidget(minus90)
++            button_row.addWidget(zero)
++            button_row.addWidget(plus90)
++            axis_layout.addLayout(button_row)
++
++            dial = QDial()
++            dial.setRange(-1800, 1800)
++            dial.setNotchesVisible(True)
++            dial.setWrapping(False)
++            dial.valueChanged.connect(
++                lambda value, a=axis: self._lithic_dial_changed(a, value)
++            )
++            axis_layout.addWidget(dial)
++
++            spin = QDoubleSpinBox()
++            spin.setRange(-180.0, 180.0)
++            spin.setDecimals(1)
++            spin.setSingleStep(1.0)
++            spin.setSuffix("°")
++            spin.valueChanged.connect(
++                lambda value, a=axis: self._lithic_spin_changed(a, value)
++            )
++            axis_layout.addWidget(spin)
++
++            self.lithic_rotation_controls[axis] = {
++                "dial": dial,
++                "spin": spin,
++                "minus90": minus90,
++                "zero": zero,
++                "plus90": plus90,
++            }
++            lithic_layout.addWidget(axis_box)
++
++        self.lithic_reset_btn = QPushButton("基準姿勢に戻す（手動回転 0°）")
++        self.lithic_reset_btn.clicked.connect(self._reset_lithic_rotations)
++        lithic_layout.addWidget(self.lithic_reset_btn)
++
++        self.lithic_hint = QLabel(
++            "初期状態では入力PLYの姿勢をそのまま使用します。"
++            "「自動姿勢推定」を押した場合のみ、① minimum-volume OBBで "
++            "X=幅 / Y=長さ / Z=厚さ、②中央X-Z断面の左右端を結ぶ線がX軸に "
++            "平行になるようY軸回転で自動補正します。各軸の±90°ボタン、"
++            "ダイヤル、数値入力は現在の基準姿勢に対する追加回転です。"
++        )
++        self.lithic_hint.setWordWrap(True)
++        lithic_layout.addWidget(self.lithic_hint)
++
++        self.lithic_confirm_btn = QPushButton("姿勢決定")
++        self.lithic_confirm_btn.clicked.connect(self._confirm_lithic_pose)
++        lithic_layout.addWidget(self.lithic_confirm_btn)
++        left_layout.addWidget(self.lithic_pose_group)
++
++        # Lithic output panel.  It becomes visible after "姿勢決定".
++        self.lithic_output_group = QGroupBox("3. 石器 出力 / 断面設定")
++        lithic_output_layout = QVBoxLayout(self.lithic_output_group)
++
++        self.lithic_return_pose_btn = QPushButton("石器姿勢に戻る")
++        self.lithic_return_pose_btn.clicked.connect(self._return_to_lithic_pose)
++        lithic_output_layout.addWidget(self.lithic_return_pose_btn)
++
++        lithic_output_layout.addWidget(QLabel("出力面（デフォルト6面）"))
++        self.lithic_view_checks = {}
++        for key, label in [
++            ("front", "Front"),
++            ("back", "Back"),
++            ("left", "Left"),
++            ("right", "Right"),
++            ("top", "Top"),
++            ("bottom", "Bottom"),
++        ]:
++            cb = QCheckBox(label)
++            cb.setChecked(True)
++            self.lithic_view_checks[key] = cb
++            lithic_output_layout.addWidget(cb)
++
++        lithic_output_layout.addWidget(QLabel("表現"))
++        self.lithic_mode_texture = QCheckBox("テクスチャ / 頂点カラー")
++        self.lithic_mode_texture_normal = QCheckBox(
++            "テクスチャ / 頂点カラー + Normal"
++        )
++        self.lithic_mode_shade = QCheckBox("Normalのみ（シェード）")
++        for cb in (
++            self.lithic_mode_texture,
++            self.lithic_mode_texture_normal,
++            self.lithic_mode_shade,
++        ):
++            cb.setChecked(True)
++            lithic_output_layout.addWidget(cb)
++
++        lithic_spacing_row = QHBoxLayout()
++        lithic_spacing_row.addWidget(QLabel("面間隔"))
++        self.lithic_view_spacing = QDoubleSpinBox()
++        self.lithic_view_spacing.setRange(0.0, 10000.0)
++        self.lithic_view_spacing.setValue(10.0)
++        self.lithic_view_spacing.setDecimals(1)
++        self.lithic_view_spacing.setSuffix(" mm")
++        lithic_spacing_row.addWidget(self.lithic_view_spacing)
++        lithic_output_layout.addLayout(lithic_spacing_row)
++
++        lithic_scale_row = QHBoxLayout()
++        lithic_scale_row.addWidget(QLabel("スケールバー"))
++        self.lithic_scale_bar_combo = QComboBox()
++        self.lithic_scale_bar_combo.addItems(["20 mm", "50 mm", "100 mm"])
++        self.lithic_scale_bar_combo.setCurrentText("50 mm")
++        lithic_scale_row.addWidget(self.lithic_scale_bar_combo)
++        lithic_output_layout.addLayout(lithic_scale_row)
++
++        image_size_group = QGroupBox("画像出力サイズ")
++        image_size_form = QFormLayout(image_size_group)
++
++        self.lithic_image_size_mode_combo = QComboBox()
++        self.lithic_image_size_mode_combo.addItems([
++            "印刷スケール指定",
++            "ファイルサイズ指定",
++        ])
++        image_size_form.addRow("モード", self.lithic_image_size_mode_combo)
++
++        self.lithic_print_dpi_combo = QComboBox()
++        self.lithic_print_dpi_combo.addItems(["150 dpi", "300 dpi"])
++        self.lithic_print_dpi_combo.setCurrentText("300 dpi")
++        image_size_form.addRow("印刷解像度", self.lithic_print_dpi_combo)
++
++        self.lithic_print_scale_combo = QComboBox()
++        self.lithic_print_scale_combo.addItems(["50 %", "66.6667 %", "100 %"])
++        self.lithic_print_scale_combo.setCurrentText("100 %")
++        image_size_form.addRow("印刷倍率", self.lithic_print_scale_combo)
++
++        self.lithic_file_size_combo = QComboBox()
++        self.lithic_file_size_combo.addItems([
++            "S  ≤ 10 MB",
++            "M  ≤ 50 MB",
++            "L  ≤ 100 MB",
++            "Maximum",
++        ])
++        self.lithic_file_size_combo.setCurrentText("M  ≤ 50 MB")
++        image_size_form.addRow("PNG上限", self.lithic_file_size_combo)
++
++        self.lithic_output_size_label = QLabel("—")
++        self.lithic_output_size_label.setWordWrap(True)
++        image_size_form.addRow("出力見積", self.lithic_output_size_label)
++        lithic_output_layout.addWidget(image_size_group)
++
++        for combo in (
++            self.lithic_image_size_mode_combo,
++            self.lithic_print_dpi_combo,
++            self.lithic_print_scale_combo,
++            self.lithic_file_size_combo,
++        ):
++            combo.currentTextChanged.connect(
++                self._lithic_image_output_setting_changed
++            )
++        self._lithic_image_output_setting_changed()
++
++        lithic_output_layout.addWidget(QLabel("出力形式"))
++        self.lithic_output_png = QCheckBox("PNGのみ")
++        self.lithic_output_png.setChecked(True)
++        self.lithic_output_svg = QCheckBox("SVG")
++        self.lithic_output_svg.setChecked(False)
++        self.lithic_outline_overlay = QCheckBox("PNG+輪郭（SVG由来）")
++        self.lithic_outline_overlay.setChecked(False)
++        lithic_output_layout.addWidget(self.lithic_output_png)
++        lithic_output_layout.addWidget(self.lithic_output_svg)
++        lithic_output_layout.addWidget(self.lithic_outline_overlay)
++
++        lithic_outline_width_row = QHBoxLayout()
++        lithic_outline_width_row.addWidget(QLabel("PNG輪郭線太さ"))
++        self.lithic_outline_width_combo = QComboBox()
++        self.lithic_outline_width_combo.addItems(["1 px", "2 px", "3 px", "5 px"])
++        self.lithic_outline_width_combo.setCurrentText("2 px")
++        lithic_outline_width_row.addWidget(self.lithic_outline_width_combo)
++        lithic_output_layout.addLayout(lithic_outline_width_row)
++
++        self.lithic_export_individual = QCheckBox(
++            "各面・断面を個別ファイルでも出力"
++        )
++        self.lithic_export_individual.setChecked(False)
++        lithic_output_layout.addWidget(self.lithic_export_individual)
++
++        for cb in (
++            *self.lithic_view_checks.values(),
++            self.lithic_mode_texture,
++            self.lithic_mode_texture_normal,
++            self.lithic_mode_shade,
++            self.lithic_output_png,
++            self.lithic_output_svg,
++            self.lithic_outline_overlay,
++            self.lithic_export_individual,
++        ):
++            cb.stateChanged.connect(self._schedule_lithic_output_size_update)
++        self.lithic_view_spacing.valueChanged.connect(
++            self._schedule_lithic_output_size_update
++        )
++        self.lithic_scale_bar_combo.currentTextChanged.connect(
++            self._schedule_lithic_output_size_update
++        )
++
++        lithic_output_layout.addWidget(QLabel("断面設定"))
++        section_buttons = QHBoxLayout()
++        self.lithic_add_section_x_btn = QPushButton("断面追加（X）")
++        self.lithic_add_section_x_btn.clicked.connect(
++            lambda: self._add_lithic_section("X")
++        )
++        self.lithic_add_section_y_btn = QPushButton("断面追加（Y）")
++        self.lithic_add_section_y_btn.clicked.connect(
++            lambda: self._add_lithic_section("Y")
++        )
++        self.lithic_delete_section_btn = QPushButton("削除")
++        self.lithic_delete_section_btn.clicked.connect(
++            self._delete_selected_lithic_section
++        )
++        section_buttons.addWidget(self.lithic_add_section_x_btn)
++        section_buttons.addWidget(self.lithic_add_section_y_btn)
++        section_buttons.addWidget(self.lithic_delete_section_btn)
++        lithic_output_layout.addLayout(section_buttons)
++
++        self.lithic_section_status_label = QLabel(
++            "初期断面: X=Y長さ1/2（X-Z断面） / "
++            "Y=X幅1/2（Y-Z断面）"
++        )
++        self.lithic_section_status_label.setWordWrap(True)
++        lithic_output_layout.addWidget(self.lithic_section_status_label)
++
++        self.lithic_preview_btn = QPushButton("プレビュー確認")
++        self.lithic_preview_btn.clicked.connect(self._show_lithic_output_preview)
++        lithic_output_layout.addWidget(self.lithic_preview_btn)
++
++        # Split lithic export into independent products. This allows a
++        # normalized *_rev.ply to be re-opened only to regenerate orthographic
++        # drawings without redundantly writing measurement data or another PLY.
++        self.lithic_measurement_export_btn = QPushButton("計測データ出力")
++        self.lithic_measurement_export_btn.clicked.connect(
++            self._export_lithic_measurements
++        )
++        self.lithic_ortho_export_btn = QPushButton("展開図出力")
++        self.lithic_ortho_export_btn.clicked.connect(
++            self._export_lithic_orthographic_files
++        )
++        self.lithic_ply_export_btn = QPushButton("PLY / Transform出力")
++        self.lithic_ply_export_btn.clicked.connect(
++            self._export_lithic_ply_files
++        )
++        self.lithic_next_btn = QPushButton("次のファイルへ")
++        self.lithic_next_btn.clicked.connect(self._finish_lithic_and_next)
++
++        self.lithic_export_stage_label = QLabel("待機")
++        self.lithic_export_progress = QProgressBar()
++        self.lithic_export_progress.setRange(0, 100)
++        self.lithic_export_progress.setValue(0)
++
++        lithic_output_layout.addWidget(QLabel("出力"))
++        lithic_output_layout.addWidget(self.lithic_measurement_export_btn)
++        lithic_output_layout.addWidget(self.lithic_ortho_export_btn)
++        lithic_output_layout.addWidget(self.lithic_ply_export_btn)
++        lithic_output_layout.addWidget(QLabel(
++            "展開図 / PLY は計測データ未保存でも出力できます。"
++            "未保存の場合は確認メッセージを表示します。"
++        ))
++        lithic_output_layout.addWidget(self.lithic_next_btn)
++        lithic_output_layout.addWidget(self.lithic_export_stage_label)
++        lithic_output_layout.addWidget(self.lithic_export_progress)
++        left_layout.addWidget(self.lithic_output_group)
++
++        self.ortho_group = QGroupBox("6A. オルソ画像 / 輪郭線")
++        ortho_layout = QVBoxLayout(self.ortho_group)
++        ortho_layout.addWidget(QLabel("出力面（デフォルト6面）"))
++        self.view_checks = {}
++        for key, label in [
++            ("front", "Front"), ("back", "Back"), ("left", "Left"),
++            ("right", "Right"), ("top", "Top"), ("bottom", "Bottom")
++        ]:
++            cb = QCheckBox(label)
++            cb.setChecked(True)
++            self.view_checks[key] = cb
++            ortho_layout.addWidget(cb)
++
++        ortho_layout.addWidget(QLabel("表現（基本3種はデフォルトON、特殊図はデフォルトOFF）"))
++        self.mode_texture = QCheckBox("テクスチャ / 頂点カラー")
++        self.mode_texture_normal = QCheckBox("テクスチャ / 頂点カラー + Normal")
++        self.mode_shade = QCheckBox("Normalのみ（シェード）")
++        self.mode_section = QCheckBox("縦断面")
++        self.mode_half_section = QCheckBox("半截")
++        self.mode_quarter_half = QCheckBox("1/4半截")
++        for cb in (self.mode_texture, self.mode_texture_normal, self.mode_shade):
++            cb.setChecked(True)
++            ortho_layout.addWidget(cb)
++        for cb in (self.mode_section, self.mode_half_section, self.mode_quarter_half):
++            cb.setChecked(False)
++            ortho_layout.addWidget(cb)
++
++        spacing_row = QHBoxLayout()
++        spacing_row.addWidget(QLabel("面間隔"))
++        self.view_spacing = QDoubleSpinBox()
++        self.view_spacing.setRange(0.0, 10000.0)
++        self.view_spacing.setValue(10.0)
++        self.view_spacing.setDecimals(1)
++        self.view_spacing.setSuffix(" mm")
++        spacing_row.addWidget(self.view_spacing)
++        ortho_layout.addLayout(spacing_row)
++
++        scale_row = QHBoxLayout()
++        scale_row.addWidget(QLabel("スケールバー"))
++        self.scale_bar_combo = QComboBox()
++        self.scale_bar_combo.addItems(["20 mm", "50 mm", "100 mm"])
++        self.scale_bar_combo.setCurrentText("50 mm")
++        scale_row.addWidget(self.scale_bar_combo)
++        ortho_layout.addLayout(scale_row)
++
++        ortho_layout.addWidget(QLabel("出力形式"))
++        self.output_png = QCheckBox("PNGのみ")
++        self.output_png.setChecked(True)
++        self.output_svg = QCheckBox("SVG")
++        self.output_svg.setChecked(False)
++        self.outline_overlay = QCheckBox("PNG+輪郭（SVG由来）")
++        self.outline_overlay.setChecked(False)
++        ortho_layout.addWidget(self.output_png)
++        ortho_layout.addWidget(self.output_svg)
++        ortho_layout.addWidget(self.outline_overlay)
++
++        outline_width_row = QHBoxLayout()
++        outline_width_row.addWidget(QLabel("PNG輪郭線太さ"))
++        self.outline_width_combo = QComboBox()
++        self.outline_width_combo.addItems(["1 px", "2 px", "3 px", "5 px"])
++        self.outline_width_combo.setCurrentText("2 px")
++        outline_width_row.addWidget(self.outline_width_combo)
++        ortho_layout.addLayout(outline_width_row)
++
++        self.export_individual = QCheckBox("各面を個別ファイルでも出力")
++        self.export_individual.setChecked(False)
++        ortho_layout.addWidget(self.export_individual)
++        left_layout.addWidget(self.ortho_group)
++
++        self.pottery_curve_group = QGroupBox("6B. 土器 曲面展開")
++        curve_layout = QVBoxLayout(self.pottery_curve_group)
++
++        curve_layout.addWidget(QLabel(
++            "共通座標: Z=器軸 / X-Y=水平面 / Back側を展開シームとします。"
++        ))
++        curve_render_form = QFormLayout()
++        self.pottery_curve_render_combo = QComboBox()
++        self.pottery_curve_render_combo.addItems([
++            "テクスチャ / 頂点カラー",
++            "テクスチャ / 頂点カラー + Normal",
++            "Normalのみ（シェード）",
++        ])
++        curve_render_form.addRow("表現", self.pottery_curve_render_combo)
++        curve_layout.addLayout(curve_render_form)
++
++        self.pottery_curve_z_group = QGroupBox("Z位置 / 区分点指定")
++        z_layout = QVBoxLayout(self.pottery_curve_z_group)
++        z_form = QFormLayout()
++        self.pottery_curve_z_cursor_spin = QDoubleSpinBox()
++        self.pottery_curve_z_cursor_spin.setRange(-1.0e9, 1.0e9)
++        self.pottery_curve_z_cursor_spin.setDecimals(3)
++        self.pottery_curve_z_cursor_spin.setSuffix(" mm")
++        self.pottery_curve_z_cursor_spin.valueChanged.connect(
++            self._pottery_curve_z_cursor_spin_changed
++        )
++        z_form.addRow("現在Z", self.pottery_curve_z_cursor_spin)
++        z_layout.addLayout(z_form)
++
++        self.pottery_curve_z_slider = QSlider(Qt.Orientation.Horizontal)
++        self.pottery_curve_z_slider.setRange(0, 10000)
++        self.pottery_curve_z_slider.setSingleStep(10)
++        self.pottery_curve_z_slider.setPageStep(250)
++        self.pottery_curve_z_slider.valueChanged.connect(
++            self._pottery_curve_z_slider_changed
++        )
++        z_layout.addWidget(self.pottery_curve_z_slider)
++
++        self.pottery_curve_pick_z_btn = QPushButton("3D画面をクリックしてZを指定")
++        self.pottery_curve_pick_z_btn.clicked.connect(
++            self._start_pottery_curve_z_pick
++        )
++        z_layout.addWidget(self.pottery_curve_pick_z_btn)
++        self.pottery_curve_z_hint = QLabel(
++            "スライダー、数値入力、または3D画面上の1点クリックでZ位置を指定します。"
++            "赤線=現在Z、青線=現在の区分点です。"
++        )
++        self.pottery_curve_z_hint.setWordWrap(True)
++        z_layout.addWidget(self.pottery_curve_z_hint)
++        curve_layout.addWidget(self.pottery_curve_z_group)
++
++        self.pottery_cylinder_group = QGroupBox("円筒展開: Z区分 / 基準外径")
++        cylinder_layout = QVBoxLayout(self.pottery_cylinder_group)
++        cylinder_layout.addWidget(QLabel(
++            "底部〜口縁を1区間とするのが初期状態です。"
++            "現在Zを区分点として追加すると、各区間を別々の基準外径で円筒展開します。"
++        ))
++        self.pottery_cylinder_break_table = QTableWidget(0, 1)
++        self.pottery_cylinder_break_table.setHorizontalHeaderLabels(["区分Z (mm)"])
++        self.pottery_cylinder_break_table.horizontalHeader().setSectionResizeMode(
++            QHeaderView.ResizeMode.Stretch
++        )
++        cylinder_layout.addWidget(self.pottery_cylinder_break_table)
++
++        cylinder_break_buttons = QHBoxLayout()
++        self.pottery_cylinder_add_break_btn = QPushButton("現在Zを区分点追加")
++        self.pottery_cylinder_add_break_btn.clicked.connect(
++            self._pottery_add_cylinder_breakpoint
++        )
++        self.pottery_cylinder_delete_break_btn = QPushButton("選択区分点削除")
++        self.pottery_cylinder_delete_break_btn.clicked.connect(
++            self._pottery_delete_cylinder_breakpoint
++        )
++        cylinder_break_buttons.addWidget(self.pottery_cylinder_add_break_btn)
++        cylinder_break_buttons.addWidget(self.pottery_cylinder_delete_break_btn)
++        cylinder_layout.addLayout(cylinder_break_buttons)
++
++        self.pottery_cylinder_segment_table = QTableWidget(0, 4)
++        self.pottery_cylinder_segment_table.setHorizontalHeaderLabels([
++            "Z下端 (mm)", "Z上端 (mm)", "基準Z (mm)", "外径D (mm)"
++        ])
++        self.pottery_cylinder_segment_table.horizontalHeader().setSectionResizeMode(
++            QHeaderView.ResizeMode.Stretch
++        )
++        self.pottery_cylinder_segment_table.itemChanged.connect(
++            self._pottery_cylinder_segment_table_changed
++        )
++        cylinder_layout.addWidget(self.pottery_cylinder_segment_table)
++
++        cylinder_segment_buttons = QHBoxLayout()
++        self.pottery_cylinder_set_ref_btn = QPushButton("選択区間の基準Z=現在Z")
++        self.pottery_cylinder_set_ref_btn.clicked.connect(
++            self._pottery_set_cylinder_reference_from_cursor
++        )
++        self.pottery_cylinder_measure_btn = QPushButton("全外径を再計測")
++        self.pottery_cylinder_measure_btn.clicked.connect(
++            self._pottery_remeasure_cylinder_diameters
++        )
++        cylinder_segment_buttons.addWidget(self.pottery_cylinder_set_ref_btn)
++        cylinder_segment_buttons.addWidget(self.pottery_cylinder_measure_btn)
++        cylinder_layout.addLayout(cylinder_segment_buttons)
++        curve_layout.addWidget(self.pottery_cylinder_group)
++
++        self.pottery_fan_group = QGroupBox("扇形展開: Z区分点 / 外径")
++        fan_layout = QVBoxLayout(self.pottery_fan_group)
++        fan_layout.addWidget(QLabel(
++            "基本は底部と口縁の2点です。途中で傾斜が変わる場合は、"
++            "スライダーまたは3Dクリックで現在Zを指定して区分点を追加します。"
++        ))
++        self.pottery_fan_table = QTableWidget(0, 2)
++        self.pottery_fan_table.setHorizontalHeaderLabels(["Z (mm)", "外径D (mm)"])
++        self.pottery_fan_table.horizontalHeader().setSectionResizeMode(
++            QHeaderView.ResizeMode.Stretch
++        )
++        self.pottery_fan_table.itemChanged.connect(
++            self._pottery_fan_table_changed
++        )
++        fan_layout.addWidget(self.pottery_fan_table)
++        fan_buttons = QHBoxLayout()
++        self.pottery_fan_add_btn = QPushButton("現在Zを区分点追加")
++        self.pottery_fan_add_btn.clicked.connect(self._pottery_add_fan_breakpoint)
++        self.pottery_fan_delete_btn = QPushButton("選択区分点削除")
++        self.pottery_fan_delete_btn.clicked.connect(self._pottery_delete_fan_breakpoint)
++        self.pottery_fan_measure_btn = QPushButton("全外径を再計測")
++        self.pottery_fan_measure_btn.clicked.connect(self._pottery_remeasure_fan_diameters)
++        fan_buttons.addWidget(self.pottery_fan_add_btn)
++        fan_buttons.addWidget(self.pottery_fan_delete_btn)
++        fan_layout.addLayout(fan_buttons)
++        fan_layout.addWidget(self.pottery_fan_measure_btn)
++        curve_layout.addWidget(self.pottery_fan_group)
+ 
+         self.pottery_curve_info_label = QLabel(
+-            "円筒展開は指定Zの外径を基準とします。扇形展開は隣接するZ区分点間を独立した円錐台として展開します。"
++            "円筒展開は各Z区間ごとに基準Z・外径を指定します。扇形展開は隣接するZ区分点間を独立した円錐台として展開します。"
+         )
+         self.pottery_curve_info_label.setWordWrap(True)
+         curve_layout.addWidget(self.pottery_curve_info_label)
+         left_layout.addWidget(self.pottery_curve_group)
+ 
+-        self.export_group = QGroupBox("6. 保存 / 次のファイル")
++        self.export_group = QGroupBox("7. 出力 / 次のファイル")
+         export_layout = QVBoxLayout(self.export_group)
+         self.preview_btn = QPushButton("オルソ画像プレビューを開く")
+         self.preview_btn.clicked.connect(self.open_pottery_output_preview)
+-        self.save_next_btn = QPushButton("保存して次へ")
+-        self.save_next_btn.clicked.connect(self.save_current_and_next)
+-        self.inventory_btn = QPushButton("計測一覧出力")
+-        self.inventory_btn.clicked.connect(self.export_measurement_inventory)
++
++        self.pottery_measurement_export_btn = QPushButton("計測データ出力")
++        self.pottery_measurement_export_btn.clicked.connect(
++            self._export_pottery_measurements
++        )
++        self.pottery_layout_export_btn = QPushButton("オルソ展開図を出力")
++        self.pottery_layout_export_btn.clicked.connect(
++            self._export_pottery_current_layout
++        )
++        self.pottery_ply_export_btn = QPushButton("PLY / Transform出力")
++        self.pottery_ply_export_btn.clicked.connect(
++            self._export_pottery_ply_files
++        )
++        self.pottery_next_btn = QPushButton("次のファイルへ")
++        self.pottery_next_btn.clicked.connect(self._finish_pottery_and_next)
++
+         self.export_stage_label = QLabel("待機")
+         self.export_progress = QProgressBar()
+         self.export_progress.setRange(0, 100)
+         self.export_progress.setValue(0)
++
+         export_layout.addWidget(self.preview_btn)
+-        export_layout.addWidget(self.inventory_btn)
++        export_layout.addWidget(QLabel("個別出力"))
++        export_layout.addWidget(self.pottery_measurement_export_btn)
++        export_layout.addWidget(self.pottery_layout_export_btn)
++        export_layout.addWidget(self.pottery_ply_export_btn)
+         export_layout.addWidget(QLabel(
+-            "計測一覧出力: geometry inventory と 3D model inventory を更新します。"
+-            "「保存して次へ」の前に実行してください。"
++            "出力方式を切り替えて、オルソ・円筒・扇形を同じ資料について連続して書き出せます。"
++            "展開図 / PLY は計測データ未保存でも確認後に出力できます。"
+         ))
+-        export_layout.addWidget(self.save_next_btn)
++        export_layout.addWidget(self.pottery_next_btn)
+         export_layout.addWidget(self.export_stage_label)
+         export_layout.addWidget(self.export_progress)
+-        export_layout.addWidget(QLabel(
+-            "output/<元ファイル名>/ に _revモデル、transform、合成オルソPNGを保存します。"
+-        ))
+         left_layout.addWidget(self.export_group)
+ 
+         scroll = QScrollArea()
+@@ -1288,10 +1379,20 @@
+             self.output_png, self.output_svg, self.outline_overlay, self.export_individual,
+             self.view_mode_combo, self.viewer_scale_combo,
+             self.zoom_out_btn, self.zoom_reset_btn, self.zoom_in_btn, self.zoom_slider,
+-            self.preview_btn, self.save_next_btn, self.inventory_btn,
++            self.preview_btn,
++            self.pottery_measurement_export_btn,
++            self.pottery_layout_export_btn,
++            self.pottery_ply_export_btn,
++            self.pottery_next_btn,
+             self.pottery_output_branch_combo,
+             self.pottery_curve_render_combo,
+-            self.pottery_cylinder_z_spin, self.pottery_cylinder_d_spin,
++            self.pottery_curve_z_cursor_spin, self.pottery_curve_z_slider,
++            self.pottery_curve_pick_z_btn,
++            self.pottery_cylinder_break_table,
++            self.pottery_cylinder_segment_table,
++            self.pottery_cylinder_add_break_btn,
++            self.pottery_cylinder_delete_break_btn,
++            self.pottery_cylinder_set_ref_btn,
+             self.pottery_cylinder_measure_btn,
+             self.pottery_fan_table, self.pottery_fan_add_btn,
+             self.pottery_fan_delete_btn, self.pottery_fan_measure_btn,
+@@ -1325,6 +1426,7 @@
+             self._update_artifact_type_ui()
+             if hasattr(self, "pottery_output_branch_group") and not self._is_lithic():
+                 self.pottery_output_branch_group.setEnabled(bool(self.posture_done))
++                self.pottery_image_size_group.setEnabled(bool(self.posture_done))
+             if hasattr(self, "lithic_image_size_mode_combo"):
+                 self._lithic_image_output_setting_changed()
+             if hasattr(self, "pottery_curve_image_size_mode_combo"):
+@@ -1346,10 +1448,14 @@
+             *self.view_checks.values(),
+         ]:
+             cb.stateChanged.connect(self._schedule_preview_refresh)
++            cb.stateChanged.connect(self._schedule_pottery_curve_size_update)
+ 
+         self.view_spacing.valueChanged.connect(self._schedule_preview_refresh)
++        self.view_spacing.valueChanged.connect(self._schedule_pottery_curve_size_update)
+         self.scale_bar_combo.currentTextChanged.connect(self._schedule_preview_refresh)
++        self.scale_bar_combo.currentTextChanged.connect(self._schedule_pottery_curve_size_update)
+         self.outline_width_combo.currentTextChanged.connect(self._schedule_preview_refresh)
++        self.outline_width_combo.currentTextChanged.connect(self._schedule_pottery_curve_size_update)
+         self.view_mode_combo.currentTextChanged.connect(self._schedule_preview_refresh)
+         self.viewer_scale_combo.currentTextChanged.connect(self._schedule_preview_refresh)
+ 
+@@ -1375,6 +1481,12 @@
+         if self._is_lithic():
+             return
+         branch = self._pottery_output_branch_key()
++        if branch == "ortho" and self.pottery_curve_z_pick_mode:
++            self.pottery_curve_z_pick_mode = False
++            try:
++                self.plotter.disable_picking()
++            except Exception:
++                pass
+         self.ortho_group.setVisible(branch == "ortho")
+         self.pottery_curve_group.setVisible(branch != "ortho")
+         self.pottery_cylinder_group.setVisible(branch == "cylindrical")
+@@ -1384,8 +1496,14 @@
+             if branch == "ortho"
+             else "曲面展開プレビューを開く"
+         )
+-        if branch != "ortho":
+-            self._schedule_pottery_curve_size_update()
++        if hasattr(self, "pottery_layout_export_btn"):
++            self.pottery_layout_export_btn.setText({
++                "ortho": "オルソ展開図を出力",
++                "cylindrical": "円筒展開図を出力",
++                "fan": "扇形展開図を出力",
++            }[branch])
++        self._schedule_pottery_curve_size_update()
++        self._refresh_pottery_curve_z_guides()
+ 
+     def open_pottery_output_preview(self):
+         if self._pottery_output_branch_key() == "ortho":
+@@ -1552,6 +1670,7 @@
+         self.pottery_posture_group.setVisible(not lithic)
+         self.pottery_front_group.setVisible(not lithic)
+         self.pottery_output_branch_group.setVisible(not lithic)
++        self.pottery_image_size_group.setVisible(not lithic)
+         self.export_group.setVisible(not lithic)
+         if not lithic:
+             self._pottery_output_branch_changed()
+@@ -1625,6 +1744,7 @@
+         else:
+             self.pose_label.setText("姿勢未確定")
+             self.pottery_output_branch_group.setEnabled(False)
++            self.pottery_image_size_group.setEnabled(False)
+             self.refresh_view(reset_camera=True)
+ 
+     @staticmethod
+@@ -3109,6 +3229,10 @@
+             self.lithic_obb_extents = None
+             self.lithic_obb_elapsed_sec = None
+             self.lithic_png_bpp_estimate = None
++            self.pottery_curve_png_bpp_estimate = None
++            self.pottery_ortho_png_bpp_estimate = None
++            self.pottery_cylinder_breakpoints_mm = []
++            self.pottery_curve_z_pick_mode = False
+             self.lithic_section_level_angle_deg = 0.0
+             self.lithic_section_level_residual_deg = None
+             self.lithic_section_left_point = None
+@@ -3373,6 +3497,8 @@
+ 
+             self._update_viewer_scale_overlay(render=False)
+             self.plotter.render()
++            if self.posture_done and self._pottery_output_branch_key() != "ortho":
++                self._refresh_pottery_curve_z_guides()
+             self._report_gui_shading_state(gui_lighting)
+         except Exception as e:
+             self.statusBar().showMessage(f"表示更新エラー: {e}")
+@@ -3678,6 +3804,7 @@
+             self.set_front_angle(0.0)
+             self._initialize_pottery_curve_controls()
+             self.pottery_output_branch_group.setEnabled(True)
++            self.pottery_image_size_group.setEnabled(True)
+ 
+             axis_angle = angle_between_deg(self.center_axis_after_pose.direction, np.array([0.0, 0.0, 1.0]))
+             ref_text = ""
+@@ -5756,6 +5883,167 @@
+         radius = float(np.quantile(radii, 0.995))
+         return 2.0 * radius * scale
+ 
++    def _pottery_curve_z_range_mm(self) -> tuple[float, float]:
++        if not self.asset or not self.posture_done:
++            raise RuntimeError("姿勢決定後にZ範囲を取得できます。")
++        vertices = self._pottery_curve_final_vertices()
++        scale = float(self.asset.unit_to_mm)
++        zmin_mm = float(np.min(vertices[:, 2]) * scale)
++        zmax_mm = float(np.max(vertices[:, 2]) * scale)
++        if not math.isfinite(zmin_mm + zmax_mm) or zmax_mm <= zmin_mm:
++            raise RuntimeError("土器のZ範囲を取得できません。")
++        return zmin_mm, zmax_mm
++
++    def _set_pottery_curve_z_cursor(self, z_mm: float, refresh: bool = True):
++        if not hasattr(self, "pottery_curve_z_cursor_spin"):
++            return
++        try:
++            zmin, zmax = self._pottery_curve_z_range_mm()
++        except Exception:
++            return
++        z = float(max(zmin, min(zmax, float(z_mm))))
++        frac = (z - zmin) / max(zmax - zmin, 1.0e-12)
++        self._setting_pottery_z_cursor = True
++        try:
++            self.pottery_curve_z_cursor_spin.setRange(zmin, zmax)
++            self.pottery_curve_z_cursor_spin.setValue(z)
++            self.pottery_curve_z_slider.setValue(int(round(frac * 10000.0)))
++        finally:
++            self._setting_pottery_z_cursor = False
++        if refresh:
++            self._refresh_pottery_curve_z_guides()
++
++    def _pottery_curve_z_cursor_spin_changed(self, value: float):
++        if self._setting_pottery_z_cursor:
++            return
++        self._set_pottery_curve_z_cursor(float(value), refresh=True)
++
++    def _pottery_curve_z_slider_changed(self, value: int):
++        if self._setting_pottery_z_cursor:
++            return
++        try:
++            zmin, zmax = self._pottery_curve_z_range_mm()
++        except Exception:
++            return
++        frac = max(0.0, min(1.0, float(value) / 10000.0))
++        self._set_pottery_curve_z_cursor(
++            zmin + frac * (zmax - zmin), refresh=True
++        )
++
++    def _start_pottery_curve_z_pick(self):
++        if not self.asset or not self.posture_done or self._is_lithic():
++            return
++        self.pottery_curve_z_pick_mode = True
++        try:
++            self.plotter.disable_picking()
++        except Exception:
++            pass
++        self.plotter.enable_surface_point_picking(
++            callback=self._pottery_curve_picked_z,
++            left_clicking=True,
++            show_message=True,
++            show_point=True,
++            pickable_window=False,
++        )
++        self.statusBar().showMessage(
++            "土器表面の任意点をクリックしてください。その点のZを現在Zに設定します。"
++        )
++
++    def _pottery_curve_picked_z(self, point):
++        if not self.pottery_curve_z_pick_mode or not self.asset:
++            return
++        p = np.asarray(point, dtype=float)
++        if p.shape != (3,) or not np.isfinite(p).all():
++            return
++        self.pottery_curve_z_pick_mode = False
++        try:
++            self.plotter.disable_picking()
++        except Exception:
++            pass
++        self._set_pottery_curve_z_cursor(
++            float(p[2]) * float(self.asset.unit_to_mm), refresh=True
++        )
++        self.statusBar().showMessage(
++            f"Z = {self.pottery_curve_z_cursor_spin.value():.3f} mm を選択しました。"
++        )
++
++    def _pottery_curve_breakpoint_zs_mm(self) -> list[float]:
++        branch = self._pottery_output_branch_key()
++        if branch == "cylindrical":
++            return list(self.pottery_cylinder_breakpoints_mm)
++        if branch == "fan":
++            try:
++                return [z for z, _d in self._pottery_fan_profile_mm()]
++            except Exception:
++                return []
++        return []
++
++    def _refresh_pottery_curve_z_guides(self):
++        if not hasattr(self, "plotter"):
++            return
++        try:
++            # Remove only our named guide actors; refresh_view may already have
++            # cleared the renderer, so failures are harmless.
++            self.plotter.remove_actor("pottery_curve_z_cursor", render=False)
++            for i in range(128):
++                self.plotter.remove_actor(
++                    f"pottery_curve_z_break_{i}", render=False
++                )
++        except Exception:
++            pass
++        if (
++            not self.asset
++            or not self.posture_done
++            or self._is_lithic()
++            or self._pottery_output_branch_key() == "ortho"
++        ):
++            try:
++                self.plotter.render()
++            except Exception:
++                pass
++            return
++        try:
++            vertices = self._pottery_curve_final_vertices()
++            scale = float(self.asset.unit_to_mm)
++            xmin = float(np.min(vertices[:, 0]))
++            xmax = float(np.max(vertices[:, 0]))
++            ymin = float(np.min(vertices[:, 1]))
++            ymax = float(np.max(vertices[:, 1]))
++            y = 0.5 * (ymin + ymax)
++            span = max(xmax - xmin, ymax - ymin, 1.0e-9)
++            xmin -= span * 0.04
++            xmax += span * 0.04
++
++            for i, zmm in enumerate(self._pottery_curve_breakpoint_zs_mm()):
++                z = float(zmm) / scale
++                self.plotter.add_mesh(
++                    pv.Line((xmin, y, z), (xmax, y, z)),
++                    color="dodgerblue",
++                    line_width=3.0,
++                    lighting=False,
++                    name=f"pottery_curve_z_break_{i}",
++                    render=False,
++                )
++
++            zcursor = float(self.pottery_curve_z_cursor_spin.value()) / scale
++            self.plotter.add_mesh(
++                pv.Line((xmin, y, zcursor), (xmax, y, zcursor)),
++                color="red",
++                line_width=5.0,
++                lighting=False,
++                name="pottery_curve_z_cursor",
++                render=False,
++            )
++            self.plotter.render()
++        except Exception as e:
++            self.statusBar().showMessage(f"Z区分線表示エラー: {e}")
++
++    @staticmethod
++    def _readonly_table_item(text: str) -> QTableWidgetItem:
++        item = QTableWidgetItem(text)
++        item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
++        return item
++
+     def _initialize_pottery_curve_controls(self):
+         if not self.asset or not self.posture_done or self._is_lithic():
+             return
+@@ -5768,33 +6056,28 @@
+ 
+         self._setting_pottery_curve_controls = True
+         try:
+-            self.pottery_cylinder_z_spin.setRange(zmin_mm, zmax_mm)
+-            zmid = 0.5 * (zmin_mm + zmax_mm)
+-            self.pottery_cylinder_z_spin.setValue(zmid)
+-            try:
+-                self.pottery_cylinder_d_spin.setValue(
+-                    self._pottery_outer_diameter_at_z_mm(zmid)
+-                )
+-            except Exception:
+-                radii = np.hypot(vertices[:, 0], vertices[:, 1])
+-                self.pottery_cylinder_d_spin.setValue(
+-                    2.0 * float(np.quantile(radii, 0.995)) * scale
+-                )
++            self.pottery_curve_z_cursor_spin.setRange(zmin_mm, zmax_mm)
++            self.pottery_cylinder_breakpoints_mm = [zmin_mm, zmax_mm]
++            self._set_pottery_curve_z_cursor(
++                0.5 * (zmin_mm + zmax_mm), refresh=False
++            )
+ 
+             self.pottery_fan_table.setRowCount(0)
+             for zmm in (zmin_mm, zmax_mm):
+                 try:
+                     dmm = self._pottery_outer_diameter_at_z_mm(zmm)
+                 except Exception:
+-                    # For exact bbox endpoints use a nearby section.
+                     nudge = max((zmax_mm - zmin_mm) * 0.005, 1.0e-6)
+                     probe = zmm + nudge if zmm == zmin_mm else zmm - nudge
+                     dmm = self._pottery_outer_diameter_at_z_mm(probe)
+                 self._append_pottery_fan_row(zmm, dmm)
+         finally:
+             self._setting_pottery_curve_controls = False
++
++        self._rebuild_pottery_cylinder_tables(preserve=False)
+         self._pottery_output_branch_changed()
+         self._pottery_curve_output_setting_changed()
++        self._refresh_pottery_curve_z_guides()
+ 
+     def _append_pottery_fan_row(self, z_mm: float, d_mm: float):
+         row = self.pottery_fan_table.rowCount()
+@@ -5806,29 +6089,206 @@
+             row, 1, QTableWidgetItem(f"{float(d_mm):.6f}")
+         )
+ 
+-    def _pottery_cylinder_z_changed(self, *_args):
+-        if self._setting_pottery_curve_controls or not self.posture_done:
+-            return
++    def _cylinder_existing_segment_data(self) -> dict[tuple[float, float], tuple[float, float]]:
++        data: dict[tuple[float, float], tuple[float, float]] = {}
++        if not hasattr(self, "pottery_cylinder_segment_table"):
++            return data
++        for row in range(self.pottery_cylinder_segment_table.rowCount()):
++            items = [self.pottery_cylinder_segment_table.item(row, c) for c in range(4)]
++            if any(item is None for item in items):
++                continue
++            try:
++                z0, z1, ref, dia = [float(item.text()) for item in items]
++            except Exception:
++                continue
++            data[(round(z0, 6), round(z1, 6))] = (ref, dia)
++        return data
++
++    def _rebuild_pottery_cylinder_tables(self, preserve: bool = True):
++        if not self.asset or not self.posture_done:
++            return
++        old = self._cylinder_existing_segment_data() if preserve else {}
++        points = sorted(float(z) for z in self.pottery_cylinder_breakpoints_mm)
++        self.pottery_cylinder_breakpoints_mm = points
++
++        self._setting_pottery_curve_controls = True
+         try:
+-            self._setting_pottery_curve_controls = True
+-            self.pottery_cylinder_d_spin.setValue(
+-                self._pottery_outer_diameter_at_z_mm(
+-                    self.pottery_cylinder_z_spin.value()
++            self.pottery_cylinder_break_table.setRowCount(0)
++            for z in points:
++                row = self.pottery_cylinder_break_table.rowCount()
++                self.pottery_cylinder_break_table.insertRow(row)
++                self.pottery_cylinder_break_table.setItem(
++                    row, 0, self._readonly_table_item(f"{z:.6f}")
+                 )
+-            )
+-        except Exception as e:
+-            self.statusBar().showMessage(f"円筒基準外径の更新エラー: {e}")
++
++            self.pottery_cylinder_segment_table.setRowCount(0)
++            for z0, z1 in zip(points[:-1], points[1:]):
++                row = self.pottery_cylinder_segment_table.rowCount()
++                self.pottery_cylinder_segment_table.insertRow(row)
++                key = (round(z0, 6), round(z1, 6))
++                if key in old:
++                    ref, dia = old[key]
++                    if not (z0 <= ref <= z1):
++                        ref = 0.5 * (z0 + z1)
++                        dia = self._pottery_outer_diameter_at_z_mm(ref)
++                else:
++                    ref = 0.5 * (z0 + z1)
++                    try:
++                        dia = self._pottery_outer_diameter_at_z_mm(ref)
++                    except Exception:
++                        vertices = self._pottery_curve_final_vertices()
++                        radii = np.hypot(vertices[:, 0], vertices[:, 1])
++                        dia = 2.0 * float(np.quantile(radii, 0.995)) * float(
++                            self.asset.unit_to_mm
++                        )
++                self.pottery_cylinder_segment_table.setItem(
++                    row, 0, self._readonly_table_item(f"{z0:.6f}")
++                )
++                self.pottery_cylinder_segment_table.setItem(
++                    row, 1, self._readonly_table_item(f"{z1:.6f}")
++                )
++                self.pottery_cylinder_segment_table.setItem(
++                    row, 2, QTableWidgetItem(f"{ref:.6f}")
++                )
++                self.pottery_cylinder_segment_table.setItem(
++                    row, 3, QTableWidgetItem(f"{dia:.6f}")
++                )
+         finally:
+             self._setting_pottery_curve_controls = False
+         self._schedule_pottery_curve_size_update()
+-
+-    def _pottery_measure_cylinder_diameter(self):
+-        self._pottery_cylinder_z_changed()
++        self._refresh_pottery_curve_z_guides()
++
++    def _pottery_cylinder_segments_mm(self) -> list[dict]:
++        segments: list[dict] = []
++        table = self.pottery_cylinder_segment_table
++        for row in range(table.rowCount()):
++            vals = []
++            for col in range(4):
++                item = table.item(row, col)
++                if item is None:
++                    raise ValueError("円筒区間表に未入力セルがあります。")
++                try:
++                    vals.append(float(item.text()))
++                except ValueError as e:
++                    raise ValueError("円筒区間のZ / 外径には数値を入力してください。") from e
++            z0, z1, ref, dia = vals
++            if z1 <= z0:
++                raise ValueError("円筒区間のZ上端はZ下端より大きくしてください。")
++            if ref < z0 - 1.0e-9 or ref > z1 + 1.0e-9:
++                raise ValueError("円筒区間の基準Zはその区間内に指定してください。")
++            if dia <= 0 or not math.isfinite(dia):
++                raise ValueError("円筒区間の外径は正の有限値にしてください。")
++            segments.append({
++                "z0_mm": z0,
++                "z1_mm": z1,
++                "reference_z_mm": ref,
++                "diameter_mm": dia,
++            })
++        if not segments:
++            raise ValueError("円筒展開には1区間以上が必要です。")
++        return segments
++
++    def _pottery_add_cylinder_breakpoint(self):
++        try:
++            z = float(self.pottery_curve_z_cursor_spin.value())
++            points = sorted(self.pottery_cylinder_breakpoints_mm)
++            if len(points) < 2:
++                raise RuntimeError("円筒区分の端点がありません。")
++            tol = max((points[-1] - points[0]) * 1.0e-8, 1.0e-6)
++            if z <= points[0] + tol or z >= points[-1] - tol:
++                raise ValueError("底部・口縁の端点以外のZを指定してください。")
++            if any(abs(z - p) <= tol for p in points):
++                raise ValueError("同じZの区分点がすでにあります。")
++            self.pottery_cylinder_breakpoints_mm.append(z)
++            self._rebuild_pottery_cylinder_tables(preserve=True)
++        except Exception as e:
++            self._show_error("円筒区分点追加エラー", e)
++
++    def _pottery_delete_cylinder_breakpoint(self):
++        row = self.pottery_cylinder_break_table.currentRow()
++        count = self.pottery_cylinder_break_table.rowCount()
++        if row < 0:
++            QMessageBox.information(self, "区分点未選択", "削除する区分点を選択してください。")
++            return
++        if row in (0, count - 1):
++            QMessageBox.information(self, "端点は保持", "底部・口縁の端点は削除できません。")
++            return
++        del self.pottery_cylinder_breakpoints_mm[row]
++        self._rebuild_pottery_cylinder_tables(preserve=True)
++
++    def _pottery_cylinder_segment_table_changed(self, item=None, *_args):
++        if self._setting_pottery_curve_controls:
++            return
++        if item is not None and getattr(item, "column", lambda: -1)() == 2:
++            try:
++                row = int(item.row())
++                z0 = float(self.pottery_cylinder_segment_table.item(row, 0).text())
++                z1 = float(self.pottery_cylinder_segment_table.item(row, 1).text())
++                ref = float(item.text())
++                if not (z0 <= ref <= z1):
++                    raise ValueError("基準Zは円筒区間内に指定してください。")
++                dia = self._pottery_outer_diameter_at_z_mm(ref)
++                self._setting_pottery_curve_controls = True
++                try:
++                    self.pottery_cylinder_segment_table.item(row, 3).setText(
++                        f"{dia:.6f}"
++                    )
++                finally:
++                    self._setting_pottery_curve_controls = False
++            except Exception as e:
++                self.statusBar().showMessage(f"円筒基準外径の更新エラー: {e}")
++        self._schedule_pottery_curve_size_update()
++
++    def _pottery_set_cylinder_reference_from_cursor(self):
++        row = self.pottery_cylinder_segment_table.currentRow()
++        z = float(self.pottery_curve_z_cursor_spin.value())
++        if row < 0:
++            # Select the interval containing the cursor if possible.
++            for i, segment in enumerate(self._pottery_cylinder_segments_mm()):
++                if segment["z0_mm"] <= z <= segment["z1_mm"]:
++                    row = i
++                    self.pottery_cylinder_segment_table.selectRow(i)
++                    break
++        if row < 0:
++            QMessageBox.information(self, "区間未選択", "基準Zを設定する円筒区間を選択してください。")
++            return
++        try:
++            z0 = float(self.pottery_cylinder_segment_table.item(row, 0).text())
++            z1 = float(self.pottery_cylinder_segment_table.item(row, 1).text())
++            if not (z0 <= z <= z1):
++                raise ValueError("現在Zが選択した円筒区間の外側です。")
++            dia = self._pottery_outer_diameter_at_z_mm(z)
++            self._setting_pottery_curve_controls = True
++            try:
++                self.pottery_cylinder_segment_table.item(row, 2).setText(f"{z:.6f}")
++                self.pottery_cylinder_segment_table.item(row, 3).setText(f"{dia:.6f}")
++            finally:
++                self._setting_pottery_curve_controls = False
++            self._schedule_pottery_curve_size_update()
++        except Exception as e:
++            self._show_error("円筒基準Z設定エラー", e)
++
++    def _pottery_remeasure_cylinder_diameters(self):
++        try:
++            self._setting_pottery_curve_controls = True
++            try:
++                for row in range(self.pottery_cylinder_segment_table.rowCount()):
++                    ref = float(self.pottery_cylinder_segment_table.item(row, 2).text())
++                    dia = self._pottery_outer_diameter_at_z_mm(ref)
++                    self.pottery_cylinder_segment_table.item(row, 3).setText(
++                        f"{dia:.6f}"
++                    )
++            finally:
++                self._setting_pottery_curve_controls = False
++            self._schedule_pottery_curve_size_update()
++        except Exception as e:
++            self._show_error("円筒外径再計測エラー", e)
+ 
+     def _pottery_fan_table_changed(self, *_args):
+         if self._setting_pottery_curve_controls:
+             return
+         self._schedule_pottery_curve_size_update()
++        self._refresh_pottery_curve_z_guides()
+ 
+     def _pottery_fan_profile_mm(self) -> list[tuple[float, float]]:
+         rows: list[tuple[float, float]] = []
+@@ -5861,13 +6321,18 @@
+                 self._append_pottery_fan_row(z, d)
+         finally:
+             self._setting_pottery_curve_controls = False
++        self._refresh_pottery_curve_z_guides()
+ 
+     def _pottery_add_fan_breakpoint(self):
+         try:
+             rows = self._pottery_fan_profile_mm()
+-            gaps = [rows[i + 1][0] - rows[i][0] for i in range(len(rows) - 1)]
+-            i = int(np.argmax(gaps))
+-            z = 0.5 * (rows[i][0] + rows[i + 1][0])
++            z = float(self.pottery_curve_z_cursor_spin.value())
++            zmin, zmax = rows[0][0], rows[-1][0]
++            tol = max((zmax - zmin) * 1.0e-8, 1.0e-6)
++            if z <= zmin + tol or z >= zmax - tol:
++                raise ValueError("底部・口縁の端点以外のZを指定してください。")
++            if any(abs(z - old_z) <= tol for old_z, _d in rows):
++                raise ValueError("同じZの区分点がすでにあります。")
+             d = self._pottery_outer_diameter_at_z_mm(z)
+             rows.append((z, d))
+             self._pottery_sort_fan_table(rows)
+@@ -5888,6 +6353,7 @@
+             return
+         self.pottery_fan_table.removeRow(row)
+         self._schedule_pottery_curve_size_update()
++        self._refresh_pottery_curve_z_guides()
+ 
+     def _pottery_remeasure_fan_diameters(self):
+         try:
+@@ -5902,30 +6368,43 @@
+             self._show_error("扇形外径再計測エラー", e)
+ 
+     def _rescale_pottery_curve_ui(self, ratio: float):
+-        if not hasattr(self, "pottery_cylinder_z_spin"):
++        if not hasattr(self, "pottery_curve_z_cursor_spin"):
+             return
+         ratio = float(ratio)
+         if not math.isfinite(ratio) or ratio <= 0:
+             return
+         self._setting_pottery_curve_controls = True
++        self._setting_pottery_z_cursor = True
+         try:
+-            self.pottery_cylinder_z_spin.setRange(
+-                self.pottery_cylinder_z_spin.minimum() * ratio,
+-                self.pottery_cylinder_z_spin.maximum() * ratio,
+-            )
+-            self.pottery_cylinder_z_spin.setValue(
+-                self.pottery_cylinder_z_spin.value() * ratio
+-            )
+-            self.pottery_cylinder_d_spin.setValue(
+-                self.pottery_cylinder_d_spin.value() * ratio
+-            )
++            self.pottery_curve_z_cursor_spin.setRange(
++                self.pottery_curve_z_cursor_spin.minimum() * ratio,
++                self.pottery_curve_z_cursor_spin.maximum() * ratio,
++            )
++            self.pottery_curve_z_cursor_spin.setValue(
++                self.pottery_curve_z_cursor_spin.value() * ratio
++            )
++            self.pottery_cylinder_breakpoints_mm = [
++                float(z) * ratio for z in self.pottery_cylinder_breakpoints_mm
++            ]
++            for row in range(self.pottery_cylinder_segment_table.rowCount()):
++                for col in range(4):
++                    item = self.pottery_cylinder_segment_table.item(row, col)
++                    if item is not None:
++                        item.setText(f"{float(item.text()) * ratio:.6f}")
++            for row in range(self.pottery_cylinder_break_table.rowCount()):
++                item = self.pottery_cylinder_break_table.item(row, 0)
++                if item is not None:
++                    item.setText(f"{float(item.text()) * ratio:.6f}")
+             for row in range(self.pottery_fan_table.rowCount()):
+                 for col in (0, 1):
+                     item = self.pottery_fan_table.item(row, col)
+                     if item is not None:
+                         item.setText(f"{float(item.text()) * ratio:.6f}")
+         finally:
++            self._setting_pottery_z_cursor = False
+             self._setting_pottery_curve_controls = False
++        self._schedule_pottery_curve_size_update()
++        self._refresh_pottery_curve_z_guides()
+ 
+     def _pottery_curve_output_setting_changed(self, *_args):
+         if not hasattr(self, "pottery_curve_image_size_mode_combo"):
+@@ -6004,10 +6483,20 @@
+             raise RuntimeError("姿勢未決定です。")
+         scale = float(self.asset.unit_to_mm)
+         if kind == "cylindrical":
+-            radius = self.pottery_cylinder_d_spin.value() / (2.0 * scale)
+-            vertices = self._pottery_curve_final_vertices()
+-            height = float(np.ptp(vertices[:, 2]))
+-            return 2.0 * math.pi * radius, max(height, 1.0e-9)
++            segments = self._pottery_cylinder_segments_mm()
++            widths = [
++                math.pi * float(seg["diameter_mm"]) / scale
++                for seg in segments
++            ]
++            heights = [
++                (float(seg["z1_mm"]) - float(seg["z0_mm"])) / scale
++                for seg in segments
++            ]
++            gap = 10.0 / scale
++            return (
++                max(max(widths), 1.0e-9),
++                max(sum(heights) + gap * max(0, len(heights) - 1), 1.0e-9),
++            )
+ 
+         profile = [
+             (z / scale, d / (2.0 * scale))
+@@ -6090,38 +6579,334 @@
+         )
+         return float(lo), metrics
+ 
++    def _build_pottery_ortho_layout_context(
++        self,
++        views: list[str],
++        modes: list[str],
++        spacing_mm: float,
++    ) -> dict:
++        if not self.asset or not self.posture_done:
++            raise RuntimeError("姿勢未決定です。")
++        if not views:
++            raise RuntimeError("オルソ出力面が未選択です。")
++        final_m = self._current_final_matrix()
++        poly = self._make_polydata(final_m)
++        pts = np.asarray(poly.points)
++        bounds = np.array([
++            pts[:, 0].min(), pts[:, 0].max(),
++            pts[:, 1].min(), pts[:, 1].max(),
++            pts[:, 2].min(), pts[:, 2].max(),
++        ], dtype=float)
++        spacing_model = float(spacing_mm) / float(self.asset.unit_to_mm)
++        rects, aux_rects = self._layout_with_auxiliary_panels(
++            bounds,
++            spacing_model,
++            views,
++            include_quarter="quarter_half_section" in modes,
++            include_half="half_section" in modes,
++            include_section="section" in modes,
++        )
++        all_rects = [rects[v] for v in views] + list(aux_rects.values())
++        return {
++            "poly": poly,
++            "bounds": bounds,
++            "spacing_model": spacing_model,
++            "rects": rects,
++            "aux_rects": aux_rects,
++            "sheet_w": max(r[2] for r in all_rects) - min(r[0] for r in all_rects),
++            "sheet_h": max(r[3] for r in all_rects) - min(r[1] for r in all_rects),
++        }
++
++    def _pottery_ortho_canvas_metrics(
++        self,
++        context: dict,
++        views: list[str],
++        ppu: float,
++        scale_bar_mm: float,
++    ) -> dict:
++        rects = context["rects"]
++        aux_rects = context["aux_rects"]
++        spacing_model = float(context["spacing_model"])
++        all_rects = [rects[v] for v in views] + list(aux_rects.values())
++        min_x = min(r[0] for r in all_rects)
++        min_y = min(r[1] for r in all_rects)
++        max_x = max(r[2] for r in all_rects)
++        max_y = max(r[3] for r in all_rects)
++
++        tick_extent = max(0.0, spacing_model * 0.75)
++        if "front" in views:
++            min_y = min(min_y, rects["front"][1] - tick_extent)
++            max_y = max(max_y, rects["front"][3] + tick_extent)
++        if "top" in views:
++            min_x = min(min_x, rects["top"][0] - tick_extent)
++            max_x = max(max_x, rects["top"][2] + tick_extent)
++
++        ppu = max(float(ppu), 1.0e-12)
++        content_w = max(1, int(round((max_x - min_x) * ppu)))
++        content_h = max(1, int(round((max_y - min_y) * ppu)))
++        margin = 36
++        scale_block_h = 120
++        bar_px = int(round((scale_bar_mm / self.asset.unit_to_mm) * ppu))
++        canvas_w = max(content_w + 2 * margin, bar_px + 2 * margin)
++        canvas_h = content_h + 2 * margin + scale_block_h
++        return {
++            "canvas_w_px": int(canvas_w),
++            "canvas_h_px": int(canvas_h),
++            "pixels": int(canvas_w * canvas_h),
++        }
++
++    def _pottery_default_ortho_bpp_estimate(self) -> float:
++        if self.pottery_ortho_png_bpp_estimate is not None:
++            return float(max(0.02, min(4.0, self.pottery_ortho_png_bpp_estimate)))
++        modes = self._selected_render_modes()
++        if "texture" in modes or "texture_normal" in modes:
++            return 2.2
++        if "shade" in modes:
++            return 0.8
++        return 0.25
++
++    def _find_pottery_ortho_ppu_for_limit(
++        self,
++        context: dict,
++        views: list[str],
++        bpp: float,
++        target_mb: float | None,
++    ) -> tuple[float, dict]:
++        if target_mb is None:
++            byte_limit = float("inf")
++        else:
++            byte_limit = target_mb * 1_000_000.0 / PNG_FILESIZE_SAFETY_FACTOR
++
++        def ok(ppu: float) -> tuple[bool, dict]:
++            m = self._pottery_ortho_canvas_metrics(
++                context, views, ppu, self._selected_scale_bar_mm()
++            )
++            hard = (
++                m["canvas_w_px"] > MAX_PNG_DIMENSION_PX
++                or m["canvas_h_px"] > MAX_PNG_DIMENSION_PX
++                or m["pixels"] > MAX_PNG_PIXELS
++            )
++            estimated = m["pixels"] * max(float(bpp), 0.01)
++            return (not hard and estimated <= byte_limit), m
++
++        lo = 0.01
++        hi = 1.0
++        while hi < 1.0e6:
++            good, _m = ok(hi)
++            if not good:
++                break
++            hi *= 2.0
++        for _ in range(60):
++            mid = 0.5 * (lo + hi)
++            good, _m = ok(mid)
++            if good:
++                lo = mid
++            else:
++                hi = mid
++        return lo, self._pottery_ortho_canvas_metrics(
++            context, views, lo, self._selected_scale_bar_mm()
++        )
++
++    def _sample_pottery_ortho_png_bpp(
++        self,
++        context: dict,
++        views: list[str],
++        modes: list[str],
++    ) -> float:
++        base_modes = [m for m in modes if m in ("texture", "texture_normal", "shade")]
++        if not base_modes:
++            return self._pottery_default_ortho_bpp_estimate()
++        sample_ppu = PNG_FILESIZE_SAMPLE_LONG_EDGE_PX / max(
++            float(context["sheet_w"]), float(context["sheet_h"]), 1.0e-9
++        )
++        sample_modes = [base_modes[0]] + [
++            m for m in modes
++            if m in ("section", "half_section", "quarter_half_section")
++        ]
++        tmp = Path(tempfile.mkdtemp(prefix="pottery_ortho_size_sample_"))
++        try:
++            written = self.export_orthos(
++                tmp,
++                views=views,
++                modes=sample_modes,
++                spacing_mm=float(self.view_spacing.value()),
++                scale_bar_mm=self._selected_scale_bar_mm(),
++                outline_width_px=self._selected_outline_width_px(),
++                individual=False,
++                export_png_plain=True,
++                export_svg=False,
++                export_png_outline=False,
++                progress_callback=None,
++                pixels_per_model_unit=sample_ppu,
++                png_dpi=None,
++                layout_context=context,
++            )
++            pngs = [x for x in written if x.suffix.lower() == ".png"]
++            if not pngs:
++                return self._pottery_default_ortho_bpp_estimate()
++            from PIL import Image
++            with Image.open(pngs[0]) as im:
++                pixels = max(1, int(im.width) * int(im.height))
++            bpp = float(pngs[0].stat().st_size) / pixels
++            self.pottery_ortho_png_bpp_estimate = float(max(0.02, min(4.0, bpp)))
++            return self.pottery_ortho_png_bpp_estimate
++        finally:
++            shutil.rmtree(tmp, ignore_errors=True)
++
++    def _resolve_pottery_ortho_resolution(
++        self,
++        views: list[str],
++        modes: list[str],
++        preflight: bool = True,
++    ) -> dict | None:
++        context = self._build_pottery_ortho_layout_context(
++            views, modes, float(self.view_spacing.value())
++        )
++        mode = self.pottery_curve_image_size_mode_combo.currentText()
++        dpi = None
++        target_mb = None
++        if mode == "印刷スケール指定":
++            dpi = self._selected_pottery_curve_dpi()
++            print_scale = self._selected_pottery_curve_scale()
++            ppu = dpi / 25.4 * print_scale * float(self.asset.unit_to_mm)
++            bpp = self._pottery_default_ortho_bpp_estimate()
++            metrics = self._pottery_ortho_canvas_metrics(
++                context, views, ppu, self._selected_scale_bar_mm()
++            )
++        else:
++            print_scale = None
++            bpp = self._sample_pottery_ortho_png_bpp(context, views, modes)
++            target_mb = self._selected_pottery_curve_target_mb()
++            ppu, metrics = self._find_pottery_ortho_ppu_for_limit(
++                context, views, bpp, target_mb
++            )
++
++        hard = (
++            metrics["canvas_w_px"] > MAX_PNG_DIMENSION_PX
++            or metrics["canvas_h_px"] > MAX_PNG_DIMENSION_PX
++            or metrics["pixels"] > MAX_PNG_PIXELS
++        )
++        estimated = metrics["pixels"] * bpp * PNG_FILESIZE_SAFETY_FACTOR
++        working = metrics["pixels"] * PNG_WORKING_BYTES_PER_PIXEL
++        warning = (
++            metrics["pixels"] >= PNG_WARNING_PIXELS
++            or estimated >= PNG_WARNING_ESTIMATED_MB * 1_000_000.0
++            or working >= 1_200_000_000.0
++        )
++        lines = []
++        if dpi is not None:
++            print_w = metrics["canvas_w_px"] / dpi * 25.4
++            print_h = metrics["canvas_h_px"] / dpi * 25.4
++            lines.append(
++                f"印刷: {dpi:g} dpi / {print_scale * 100.0:.4g}% / "
++                f"約 {print_w:.1f} × {print_h:.1f} mm"
++            )
++        elif target_mb is not None:
++            lines.append(f"PNG目標上限: {target_mb:g} MB / 1ファイル")
++        else:
++            lines.append("Maximum: 現在の安全上限まで")
++        lines.extend([
++            f"画像: {metrics['canvas_w_px']:,} × {metrics['canvas_h_px']:,} px",
++            f"総画素数: {metrics['pixels'] / 1_000_000.0:.1f} MP",
++            f"推定PNG: {estimated / 1_000_000.0:.1f} MB",
++            f"処理時メモリ目安: {working / 1_000_000_000.0:.2f} GB",
++        ])
++        text = "\n".join(lines)
++        self.pottery_curve_output_size_label.setText(text.replace("\n", "<br>"))
++        if preflight and hard:
++            QMessageBox.critical(self, "画像サイズ上限超過", text)
++            return None
++        if preflight and warning:
++            answer = QMessageBox.question(
++                self,
++                "大容量画像の確認",
++                text + "\n\nこの設定で書き出しますか？",
++                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
++                QMessageBox.StandardButton.No,
++            )
++            if answer != QMessageBox.StandardButton.Yes:
++                return None
++        return {
++            "ppu": float(ppu),
++            "png_dpi": dpi,
++            "target_mb": target_mb,
++            "bpp": float(bpp),
++            "metrics": metrics,
++            "mode": mode,
++            "context": context,
++        }
++
+     def _update_pottery_curve_output_size_label(self):
+         self._pottery_curve_size_refresh_pending = False
+-        if (
+-            not self.asset or not self.posture_done or self._is_lithic()
+-            or self._pottery_output_branch_key() == "ortho"
+-        ):
++        if not hasattr(self, "pottery_curve_output_size_label"):
++            return
++        if not self.asset or not self.posture_done or self._is_lithic():
++            self.pottery_curve_output_size_label.setText(
++                "姿勢決定後に出力サイズを計算します。"
++            )
+             return
+         try:
+-            kind = self._pottery_output_branch_key()
+-            width_model, height_model = self._pottery_curve_nominal_size_model(kind)
++            branch = self._pottery_output_branch_key()
+             mode = self.pottery_curve_image_size_mode_combo.currentText()
+-            bpp = self.pottery_curve_png_bpp_estimate or 1.5
+-            if mode == "印刷スケール指定":
+-                dpi = self._selected_pottery_curve_dpi()
+-                scale = self._selected_pottery_curve_scale()
+-                ppu = dpi / 25.4 * scale * float(self.asset.unit_to_mm)
+-                target = None
+-                lead = f"{dpi:g} dpi / {scale * 100.0:.4g}%"
++            if branch == "ortho":
++                views = [k for k, cb in self.view_checks.items() if cb.isChecked()]
++                modes = self._selected_render_modes()
++                if not views:
++                    self.pottery_curve_output_size_label.setText("出力面が未選択です。")
++                    return
++                context = self._build_pottery_ortho_layout_context(
++                    views, modes, float(self.view_spacing.value())
++                )
++                bpp = self._pottery_default_ortho_bpp_estimate()
++                if mode == "印刷スケール指定":
++                    dpi = self._selected_pottery_curve_dpi()
++                    scale = self._selected_pottery_curve_scale()
++                    ppu = dpi / 25.4 * scale * float(self.asset.unit_to_mm)
++                    target = None
++                    lead = f"オルソ / {dpi:g} dpi / {scale * 100.0:.4g}%"
++                else:
++                    dpi = None
++                    target = self._selected_pottery_curve_target_mb()
++                    ppu, _ = self._find_pottery_ortho_ppu_for_limit(
++                        context, views, bpp, target
++                    )
++                    lead = (
++                        f"オルソ / 目標 ≤ {target:g} MB / 1 PNG"
++                        if target is not None else "オルソ / Maximum"
++                    )
++                metrics = self._pottery_ortho_canvas_metrics(
++                    context, views, ppu, self._selected_scale_bar_mm()
++                )
+             else:
+-                dpi = None
+-                target = self._selected_pottery_curve_target_mb()
+-                ppu, _ = self._find_curve_ppu_for_limit(
+-                    width_model, height_model, bpp, target
++                width_model, height_model = self._pottery_curve_nominal_size_model(branch)
++                bpp = self.pottery_curve_png_bpp_estimate or 1.5
++                if mode == "印刷スケール指定":
++                    dpi = self._selected_pottery_curve_dpi()
++                    scale = self._selected_pottery_curve_scale()
++                    ppu = dpi / 25.4 * scale * float(self.asset.unit_to_mm)
++                    target = None
++                    lead = (
++                        f"{'円筒' if branch == 'cylindrical' else '扇形'} / "
++                        f"{dpi:g} dpi / {scale * 100.0:.4g}%"
++                    )
++                else:
++                    dpi = None
++                    target = self._selected_pottery_curve_target_mb()
++                    ppu, _ = self._find_curve_ppu_for_limit(
++                        width_model, height_model, bpp, target
++                    )
++                    lead = (
++                        f"{'円筒' if branch == 'cylindrical' else '扇形'} / "
++                        + (
++                            f"目標 ≤ {target:g} MB / 1 PNG"
++                            if target is not None else "Maximum"
++                        )
++                    )
++                metrics = self._curve_canvas_metrics(
++                    width_model, height_model, ppu,
++                    self._selected_scale_bar_mm(), float(self.asset.unit_to_mm)
+                 )
+-                lead = (
+-                    f"目標 ≤ {target:g} MB / 1 PNG"
+-                    if target is not None else "Maximum"
+-                )
+-            metrics = self._curve_canvas_metrics(
+-                width_model, height_model, ppu,
+-                self._selected_scale_bar_mm(), float(self.asset.unit_to_mm)
+-            )
++
+             est = metrics["pixels"] * bpp * PNG_FILESIZE_SAFETY_FACTOR
+             raw = metrics["pixels"] * 3.0
+             self.pottery_curve_output_size_label.setText(
+@@ -6181,27 +6966,77 @@
+         scale = float(self.asset.unit_to_mm)
+ 
+         if kind == "cylindrical":
+-            radius = self.pottery_cylinder_d_spin.value() / (2.0 * scale)
+-            if radius <= 0:
+-                raise ValueError("円筒展開の基準外径を正の値にしてください。")
+-            mapped = np.column_stack([
+-                radius * theta,
+-                rho,
+-                vertices[:, 2],
+-            ])
+-            poly = self._poly_from_mapped_faces(mapped, faces[seam_ok])
+-            b = poly.bounds
+-            bounds2d = (float(b[0]), float(b[1]), float(b[4]), float(b[5]))
++            segments = self._pottery_cylinder_segments_mm()
++            gap = 10.0 / scale
++            polys: list[pv.PolyData] = []
++            segment_diags: list[dict] = []
++            cursor = 0.0
++            scene_xmin = float("inf")
++            scene_xmax = float("-inf")
++            scene_zmin = float("inf")
++            scene_zmax = float("-inf")
++            epsz = max(float(np.ptp(vertices[:, 2])) * 1.0e-9, 1.0e-10)
++            face_z = vertices[faces, 2]
++            face_z_center = np.mean(face_z, axis=1)
++
++            for index, segment in enumerate(segments, start=1):
++                z0 = float(segment["z0_mm"]) / scale
++                z1 = float(segment["z1_mm"]) / scale
++                radius = float(segment["diameter_mm"]) / (2.0 * scale)
++                if radius <= 0.0 or z1 <= z0:
++                    raise ValueError(f"円筒区間{index}の設定が不正です。")
++
++                upper = (
++                    face_z_center <= z1 + epsz
++                    if index == len(segments)
++                    else face_z_center < z1
++                )
++                within = (face_z_center >= z0 - epsz) & upper
++                selected = faces[seam_ok & within]
++                if len(selected) == 0:
++                    raise RuntimeError(f"円筒区間{index}に三角形がありません。")
++
++                mapped = np.column_stack([
++                    radius * theta,
++                    rho,
++                    np.clip(vertices[:, 2], z0, z1) - z0,
++                ])
++                poly = self._poly_from_mapped_faces(mapped, selected)
++                b = poly.bounds
++                local_mid_x = 0.5 * (float(b[0]) + float(b[1]))
++                local_zmin = float(b[4])
++                local_h = float(b[5] - b[4])
++                pts = np.asarray(poly.points).copy()
++                pts[:, 0] -= local_mid_x
++                pts[:, 2] += cursor - local_zmin
++                poly.points = pts
++                b = poly.bounds
++                polys.append(poly)
++                scene_xmin = min(scene_xmin, float(b[0]))
++                scene_xmax = max(scene_xmax, float(b[1]))
++                scene_zmin = min(scene_zmin, float(b[4]))
++                scene_zmax = max(scene_zmax, float(b[5]))
++                segment_diags.append({
++                    "segment": index,
++                    "z0_mm": float(segment["z0_mm"]),
++                    "z1_mm": float(segment["z1_mm"]),
++                    "reference_z_mm": float(segment["reference_z_mm"]),
++                    "reference_diameter_mm": float(segment["diameter_mm"]),
++                    "reference_radius_mm": float(segment["diameter_mm"]) / 2.0,
++                    "mapping": "u=Rref*theta; v=z-z0; depth=rho",
++                })
++                cursor += local_h + gap
++
+             diag = {
+-                "projection": "cylindrical",
++                "projection": "piecewise_cylindrical",
+                 "axis": "Z",
+                 "seam": "Back (+Y)",
+-                "reference_z_mm": float(self.pottery_cylinder_z_spin.value()),
+-                "reference_diameter_mm": float(self.pottery_cylinder_d_spin.value()),
+-                "reference_radius_mm": float(self.pottery_cylinder_d_spin.value() / 2.0),
+-                "mapping": "u=Rref*theta; v=z; depth=rho for outer-surface visibility",
++                "segments": segment_diags,
++                "segment_layout": (
++                    "independent cylindrical strips stacked with 10 mm gaps"
++                ),
+             }
+-            return [poly], bounds2d, diag
++            return polys, (scene_xmin, scene_xmax, scene_zmin, scene_zmax), diag
+ 
+         profile_mm = self._pottery_fan_profile_mm()
+         profile = [(z / scale, d / (2.0 * scale)) for z, d in profile_mm]
+@@ -6215,14 +7050,18 @@
+         scene_zmax = float("-inf")
+         epsz = max(float(np.ptp(vertices[:, 2])) * 1.0e-9, 1.0e-10)
+ 
+-        for index, ((z0, r0), (z1, r1)) in enumerate(zip(profile[:-1], profile[1:]), start=1):
++        face_z = vertices[faces, 2]
++        face_z_center = np.mean(face_z, axis=1)
++        fan_pairs = list(zip(profile[:-1], profile[1:]))
++        for index, ((z0, r0), (z1, r1)) in enumerate(fan_pairs, start=1):
+             if z1 <= z0:
+                 raise ValueError("扇形区分点はZ昇順で指定してください。")
+-            face_z = vertices[faces, 2]
+-            within = (
+-                (np.min(face_z, axis=1) >= z0 - epsz)
+-                & (np.max(face_z, axis=1) <= z1 + epsz)
+-            )
++            upper = (
++                face_z_center <= z1 + epsz
++                if index == len(fan_pairs)
++                else face_z_center < z1
++            )
++            within = (face_z_center >= z0 - epsz) & upper
+             selected = faces[seam_ok & within]
+             if len(selected) == 0:
+                 raise RuntimeError(f"扇形区間{index}に三角形がありません。")
+@@ -6471,10 +7310,7 @@
+             "image_size_mode": self.pottery_curve_image_size_mode_combo.currentText(),
+         }
+         if kind == "cylindrical":
+-            data.update({
+-                "reference_z_mm": float(self.pottery_cylinder_z_spin.value()),
+-                "reference_diameter_mm": float(self.pottery_cylinder_d_spin.value()),
+-            })
++            data["segments"] = self._pottery_cylinder_segments_mm()
+         else:
+             data["breakpoints"] = [
+                 {"z_mm": z, "diameter_mm": d}
+@@ -6856,6 +7692,22 @@
+                 "view_spacing_mm": self.view_spacing.value(),
+                 "projection": "parallel/orthographic",
+                 "render_modes": self._selected_render_modes(),
++                "image_size_mode": self.pottery_curve_image_size_mode_combo.currentText(),
++                "print_dpi": (
++                    self._selected_pottery_curve_dpi()
++                    if self.pottery_curve_image_size_mode_combo.currentText()
++                    == "印刷スケール指定" else None
++                ),
++                "print_scale": (
++                    self._selected_pottery_curve_scale()
++                    if self.pottery_curve_image_size_mode_combo.currentText()
++                    == "印刷スケール指定" else None
++                ),
++                "target_png_mb": (
++                    self._selected_pottery_curve_target_mb()
++                    if self.pottery_curve_image_size_mode_combo.currentText()
++                    == "ファイルサイズ指定" else None
++                ),
+                 "composite": True,
+                 "individual_views": self.export_individual.isChecked(),
+                 "scale_bar_mm": self._selected_scale_bar_mm(),
+@@ -7673,134 +8525,253 @@
+         )
+         self.scan_queue_and_load()
+ 
+-    def save_current_and_next(self):
+-        if self._is_lithic():
+-            # Lithic export is split into measurement / orthographic / PLY
+-            # products in v0.4.7. This legacy entry point is retained only for
+-            # compatibility with older UI bindings.
++    def _require_confirmed_pottery_pose(self) -> bool:
++        if not self.asset or self._is_lithic() or not self.posture_done:
++            QMessageBox.warning(
++                self, "姿勢未決定", "先に土器の姿勢と正面を確定してください。"
++            )
++            return False
++        return True
++
++    def _confirm_pottery_export_without_measurements(
++        self,
++        product_label: str,
++    ) -> bool:
++        if not self._require_confirmed_pottery_pose():
++            return False
++        final_matrix = np.asarray(self._current_final_matrix(), dtype=float)
++        if self._inventory_is_current(final_matrix):
++            return True
++        answer = QMessageBox.question(
++            self,
++            "計測データ未保存",
++            "現在の姿勢・単位に対応する計測データが保存されていません。\n\n"
++            f"計測データを保存せずに「{product_label}」を実行しますか？",
++            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
++            QMessageBox.StandardButton.No,
++        )
++        return answer == QMessageBox.StandardButton.Yes
++
++    def _pottery_final_output_dir(self) -> Path:
++        if not self.asset:
++            raise RuntimeError("モデルが読み込まれていません。")
++        final_dir = OUTPUT_DIR / self.asset.source_path.stem
++        final_dir.mkdir(parents=True, exist_ok=True)
++        (final_dir / SPLIT_EXPORT_IN_PROGRESS_MARKER).touch(exist_ok=True)
++        return final_dir
++
++    def _pottery_component_staging_dir(self, component: str) -> Path:
++        if not self.asset:
++            raise RuntimeError("モデルが読み込まれていません。")
++        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
++        staging = OUTPUT_DIR / (
++            f"{self.asset.source_path.stem}.__working_pottery_{component}__"
++        )
++        if staging.exists():
++            shutil.rmtree(staging)
++        staging.mkdir(parents=True, exist_ok=False)
++        return staging
++
++    def _remove_existing_pottery_layout_files(
++        self,
++        final_dir: Path,
++        branch: str,
++    ) -> None:
++        if not self.asset or not final_dir.exists():
++            return
++        stem = self.asset.source_path.stem
++        for path in list(final_dir.iterdir()):
++            if not path.is_file():
++                continue
++            name = path.name
++            if branch == "cylindrical":
++                if name.startswith(f"{stem}_cylindrical_"):
++                    path.unlink()
++                continue
++            if branch == "fan":
++                if name.startswith(f"{stem}_fan_"):
++                    path.unlink()
++                continue
++            if path.suffix.lower() not in (".png", ".svg"):
++                continue
++            ortho_tokens = (
++                f"{stem}_ortho_",
++                f"{stem}_front_",
++                f"{stem}_back_",
++                f"{stem}_left_",
++                f"{stem}_right_",
++                f"{stem}_top_",
++                f"{stem}_bottom_",
++                f"{stem}_section",
++            )
++            if name.startswith(ortho_tokens):
++                path.unlink()
++
++    def _export_pottery_measurements(self):
++        if not self._require_confirmed_pottery_pose():
++            return
++        staging = None
++        try:
++            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
++            self.pottery_measurement_export_btn.setEnabled(False)
++            self._set_export_progress(5, "土器 計測データを書き出し中")
++            final_m = np.asarray(self._current_final_matrix(), dtype=float)
++            staging = self._pottery_component_staging_dir("measurements")
++            self._write_individual_measurement_csv(staging, final_m)
++            if not self.export_measurement_inventory(show_message=False):
++                raise RuntimeError("計測一覧の更新に失敗しました。")
++            final_dir = self._pottery_final_output_dir()
++            merged = self._merge_component_files(staging, final_dir)
++            self._set_export_progress(100, f"計測データ出力完了: {final_dir}")
+             QMessageBox.information(
+                 self,
+-                "石器出力",
+-                "石器は「計測データ出力」「展開図出力」"
+-                "「PLY / Transform出力」を個別に使用してください。",
+-            )
+-            return
+-        if not self.asset or not self.posture_done:
+-            QMessageBox.warning(self, "未確定", "先に姿勢と正面を確定してください。")
+-            return
+-
+-        final_inventory_matrix = np.asarray(
+-            self._current_final_matrix(),
+-            dtype=float,
+-        )
+-        if not self._inventory_is_current(final_inventory_matrix):
+-            QMessageBox.warning(
++                "計測データ出力",
++                f"計測データを書き出しました。\n保存先: {final_dir}\n"
++                f"個体別CSV: {len(merged)} ファイル\n"
++                "あわせて geometry / 3D model inventory を更新しました。",
++            )
++        except Exception as e:
++            if staging is not None and staging.exists():
++                shutil.rmtree(staging, ignore_errors=True)
++            self._set_export_progress(0, "計測データ出力失敗")
++            self._show_error("土器 計測データ出力エラー", e)
++        finally:
++            QApplication.restoreOverrideCursor()
++            if self.asset is not None:
++                self.pottery_measurement_export_btn.setEnabled(True)
++
++    def _export_pottery_ply_files(self):
++        if not self._confirm_pottery_export_without_measurements(
++            "PLY / Transform出力"
++        ):
++            return
++        staging = None
++        try:
++            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
++            self.pottery_ply_export_btn.setEnabled(False)
++            staging = self._pottery_component_staging_dir("ply")
++            final_m = np.asarray(self._current_final_matrix(), dtype=float)
++            stem = self.asset.source_path.stem
++            mesh_path = staging / f"{stem}_rev.ply"
++            self._set_export_progress(10, f"正規化PLYを書き出し中: {mesh_path.name}")
++            export_normalized_mesh(self.asset, final_m, mesh_path)
++            self._set_export_progress(65, "Transform情報を書き出し中")
++            export_transform_json(staging / "transform.json", self._metadata(final_m))
++            export_matrix_csv(staging / "transform_matrix.csv", final_m)
++            export_matrix_txt(staging / "transform_matrix_cloudcompare.txt", final_m)
++            final_dir = self._pottery_final_output_dir()
++            merged = self._merge_component_files(staging, final_dir)
++            self._set_export_progress(100, f"PLY / Transform出力完了: {final_dir}")
++            QMessageBox.information(
+                 self,
+-                "計測一覧未出力",
+-                "「保存して次へ」の前に「計測一覧出力」を実行してください。\n"
+-                "姿勢・正面・単位を変更した場合は、計測一覧を再出力してください。",
+-            )
+-            return
+-
+-        branch = self._pottery_output_branch_key()
++                "PLY / Transform出力",
++                f"PLYとTransform情報を書き出しました。\n保存先: {final_dir}\n"
++                f"出力ファイル: {len(merged)}",
++            )
++        except Exception as e:
++            if staging is not None and staging.exists():
++                shutil.rmtree(staging, ignore_errors=True)
++            self._set_export_progress(0, "PLY / Transform出力失敗")
++            self._show_error("土器 PLY / Transform出力エラー", e)
++        finally:
++            QApplication.restoreOverrideCursor()
++            if self.asset is not None:
++                self.pottery_ply_export_btn.setEnabled(True)
++
++    def _validate_pottery_ortho_selection(self) -> tuple[list[str], list[str]] | None:
+         views = [k for k, cb in self.view_checks.items() if cb.isChecked()]
+         modes = self._selected_render_modes()
+         export_png_plain = self.output_png.isChecked()
+         export_svg = self.output_svg.isChecked()
+         export_png_outline = self.outline_overlay.isChecked()
+-
+-        if branch == "ortho":
+-            if not views:
+-                QMessageBox.warning(self, "未選択", "少なくとも1つのオルソ面を選択してください。")
+-                return
+-            if not export_png_plain and not export_svg and not export_png_outline:
+-                QMessageBox.warning(
+-                    self,
+-                    "未選択",
+-                    "PNGのみ / SVG / PNG+輪郭 の少なくとも1つを選択してください。",
+-                )
+-                return
+-            if (export_png_plain or export_png_outline) and not modes:
+-                QMessageBox.warning(
+-                    self,
+-                    "未選択",
+-                    "PNG出力では少なくとも1つのオルソ表現を選択してください。",
+-                )
+-                return
+-
+-            base_modes = [m for m in modes if m in ("texture", "texture_normal", "shade")]
+-            if (
+-                (export_png_plain or export_png_outline)
+-                and any(m in modes for m in ("section", "half_section", "quarter_half_section"))
+-                and not base_modes
+-            ):
+-                QMessageBox.warning(
+-                    self,
+-                    "未選択",
+-                    "縦断面・半截・1/4半截をPNGへ配置する場合は、"
+-                    "テクスチャ / Normal / シェードのいずれか1つ以上を選択してください。",
+-                )
+-                return
+-        else:
+-            try:
+-                if branch == "cylindrical":
+-                    if self.pottery_cylinder_d_spin.value() <= 0:
+-                        raise ValueError("円筒展開の外径を指定してください。")
++        if not views:
++            QMessageBox.warning(self, "未選択", "少なくとも1つのオルソ面を選択してください。")
++            return None
++        if not export_png_plain and not export_svg and not export_png_outline:
++            QMessageBox.warning(
++                self,
++                "未選択",
++                "PNGのみ / SVG / PNG+輪郭 の少なくとも1つを選択してください。",
++            )
++            return None
++        if (export_png_plain or export_png_outline) and not modes:
++            QMessageBox.warning(
++                self,
++                "未選択",
++                "PNG出力では少なくとも1つのオルソ表現を選択してください。",
++            )
++            return None
++        base_modes = [m for m in modes if m in ("texture", "texture_normal", "shade")]
++        if (
++            (export_png_plain or export_png_outline)
++            and any(m in modes for m in ("section", "half_section", "quarter_half_section"))
++            and not base_modes
++        ):
++            QMessageBox.warning(
++                self,
++                "未選択",
++                "縦断面・半截・1/4半截をPNGへ配置する場合は、"
++                "テクスチャ / Normal / シェードのいずれか1つ以上を選択してください。",
++            )
++            return None
++        return views, modes
++
++    def _export_pottery_current_layout(self):
++        branch = self._pottery_output_branch_key()
++        label = {
++            "ortho": "オルソ展開図出力",
++            "cylindrical": "円筒展開図出力",
++            "fan": "扇形展開図出力",
++        }[branch]
++        if not self._confirm_pottery_export_without_measurements(label):
++            return
++
++        staging = None
++        try:
++            if branch == "ortho":
++                selection = self._validate_pottery_ortho_selection()
++                if selection is None:
++                    return
++                views, modes = selection
++            elif branch == "cylindrical":
++                self._pottery_cylinder_segments_mm()
++            else:
++                self._pottery_fan_profile_mm()
++
++            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
++            self.pottery_layout_export_btn.setEnabled(False)
++            staging = self._pottery_component_staging_dir(branch)
++
++            if branch == "ortho":
++                export_png_plain = self.output_png.isChecked()
++                export_svg = self.output_svg.isChecked()
++                export_png_outline = self.outline_overlay.isChecked()
++                if export_png_plain or export_png_outline:
++                    resolution = self._resolve_pottery_ortho_resolution(
++                        views, modes, preflight=True
++                    )
++                    if resolution is None:
++                        shutil.rmtree(staging, ignore_errors=True)
++                        return
+                 else:
+-                    self._pottery_fan_profile_mm()
+-            except Exception as e:
+-                QMessageBox.warning(self, "曲面展開設定エラー", str(e))
+-                return
+-
+-        stem = self.asset.source_path.stem
+-        final_dir = OUTPUT_DIR / stem
+-        if final_dir.exists():
+-            QMessageBox.warning(self, "処理済み", f"{final_dir} が存在するため処理済みです。再処理する場合はこのフォルダを削除してください。")
+-            self.scan_queue_and_load()
+-            return
+-        staging = OUTPUT_DIR / f"{stem}.__working__"
+-        try:
+-            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+-            self._set_export_progress(2, f"保存準備中: {self.asset.source_path.name}")
+-            self.save_next_btn.setEnabled(False)
+-            if staging.exists():
+-                shutil.rmtree(staging)
+-            staging.mkdir(parents=True, exist_ok=False)
+-
+-            final_m = self._current_final_matrix()
+-            # The normalized geometry is always exported as PLY, regardless of
+-            # the input mesh container/format.
+-            mesh_path = staging / f"{stem}_rev.ply"
+-
+-            self._set_export_progress(10, f"正規化PLYを書き出し中: {mesh_path.name}")
+-            export_normalized_mesh(self.asset, final_m, mesh_path)
+-
+-            self._set_export_progress(22, "Transform情報を書き出し中")
+-            export_transform_json(staging / "transform.json", self._metadata(final_m))
+-            self._set_export_progress(23, "計測CSVを書き出し中")
+-            self._write_individual_measurement_csv(
+-                staging,
+-                final_m,
+-            )
+-            export_matrix_csv(staging / "transform_matrix.csv", final_m)
+-            export_matrix_txt(staging / "transform_matrix_cloudcompare.txt", final_m)
+-
+-            if branch == "ortho":
++                    context = self._build_pottery_ortho_layout_context(
++                        views, modes, float(self.view_spacing.value())
++                    )
++                    resolution = {
++                        "ppu": ORTHO_COMPOSITE_LONG_EDGE_PX / max(
++                            float(context["sheet_w"]),
++                            float(context["sheet_h"]),
++                            1.0e-9,
++                        ),
++                        "png_dpi": None,
++                        "target_mb": None,
++                        "context": context,
++                    }
++
+                 def ortho_progress(frac: float, message: str):
+-                    self._set_export_progress(25 + int(68 * float(frac)), message)
+-
+-                selected_formats = []
+-                if export_png_plain:
+-                    selected_formats.append("PNGのみ")
+-                if export_svg:
+-                    selected_formats.append("SVG")
+-                if export_png_outline:
+-                    selected_formats.append("PNG+輪郭")
+-                self._set_export_progress(
+-                    25,
+-                    f"オルソ / 輪郭線生成を開始: {', '.join(selected_formats)}",
+-                )
+-                ortho_written = self.export_orthos(
++                    self._set_export_progress(5 + int(88 * float(frac)), message)
++
++                written = self.export_orthos(
+                     staging,
+                     views=views,
+                     modes=modes,
+@@ -7812,76 +8783,119 @@
+                     export_svg=export_svg,
+                     export_png_outline=export_png_outline,
+                     progress_callback=ortho_progress,
++                    pixels_per_model_unit=float(resolution["ppu"]),
++                    png_dpi=resolution.get("png_dpi"),
++                    layout_context=resolution["context"],
+                 )
+ 
+-                png_files = [p for p in ortho_written if p.suffix.lower() == ".png"]
+-                svg_files = [p for p in ortho_written if p.suffix.lower() == ".svg"]
+-                if export_png_plain:
+-                    plain_pngs = [p for p in png_files if not p.stem.endswith("_outline")]
+-                    if not plain_pngs:
+-                        raise RuntimeError("「PNGのみ」がONですが、PNGファイルが生成されませんでした。")
+-                if export_png_outline:
+-                    outlined_pngs = [p for p in png_files if p.stem.endswith("_outline")]
+-                    if not outlined_pngs:
+-                        raise RuntimeError("「PNG+輪郭」がONですが、輪郭付きPNGが生成されませんでした。")
+-                if export_svg and not svg_files:
+-                    raise RuntimeError("「SVG」がONですが、SVGファイルが生成されませんでした。")
+-                for p in png_files:
++                target_mb = resolution.get("target_mb")
++                png_files = [p for p in written if p.suffix.lower() == ".png"]
++                if target_mb is not None and png_files:
++                    largest = max(p.stat().st_size for p in png_files)
++                    target_bytes = float(target_mb) * 1_000_000.0
++                    if largest > target_bytes:
++                        ratio = math.sqrt(target_bytes / max(largest, 1)) * 0.97
++                        corrected_ppu = max(0.01, float(resolution["ppu"]) * ratio)
++                        shutil.rmtree(staging)
++                        staging.mkdir(parents=True, exist_ok=False)
++                        written = self.export_orthos(
++                            staging,
++                            views=views,
++                            modes=modes,
++                            spacing_mm=float(self.view_spacing.value()),
++                            scale_bar_mm=self._selected_scale_bar_mm(),
++                            outline_width_px=self._selected_outline_width_px(),
++                            individual=self.export_individual.isChecked(),
++                            export_png_plain=export_png_plain,
++                            export_svg=export_svg,
++                            export_png_outline=export_png_outline,
++                            progress_callback=ortho_progress,
++                            pixels_per_model_unit=corrected_ppu,
++                            png_dpi=None,
++                            layout_context=resolution["context"],
++                        )
++                for p in [x for x in written if x.suffix.lower() == ".png"]:
+                     self._verify_png_file(p)
+-                for p in svg_files:
++                for p in [x for x in written if x.suffix.lower() == ".svg"]:
+                     self._verify_svg_file(p)
+             else:
+-                label = "円筒展開" if branch == "cylindrical" else "扇形展開"
+-                self._set_export_progress(25, f"{label}を生成中")
+-                curve_written = self.export_pottery_curved_unwrap(
++                self._set_export_progress(5, f"{label}を生成中")
++                written = self.export_pottery_curved_unwrap(
+                     staging,
+                     kind=branch,
+                     preview_long_edge_px=None,
+                     preflight=True,
+                 )
+-                if not curve_written:
+-                    raise RuntimeError(f"{label}はキャンセルされました。")
+-                png_files = [p for p in curve_written if p.suffix.lower() == ".png"]
+-                svg_files = []
+-                if not png_files:
+-                    raise RuntimeError(f"{label}PNGが生成されませんでした。")
+-                for p in png_files:
++                if not written:
++                    shutil.rmtree(staging, ignore_errors=True)
++                    return
++                for p in [x for x in written if x.suffix.lower() == ".png"]:
+                     self._verify_png_file(p)
+ 
+-            self._set_export_progress(96, "出力フォルダを確定中")
+-            # Folder existence is the completion flag. Only expose the final folder
+-            # after every model/transform/PNG/SVG export succeeded.
+-            staging.rename(final_dir)
+-
+-            final_outputs = sorted(
+-                p for p in final_dir.iterdir()
+-                if p.is_file()
+-            )
+-            png_count = sum(p.suffix.lower() == ".png" for p in final_outputs)
+-            svg_count = sum(p.suffix.lower() == ".svg" for p in final_outputs)
+-
+-            summary = (
+-                f"保存完了: {final_dir} "
+-                f"(PNG {png_count} / SVG {svg_count} / 全{len(final_outputs)}ファイル)"
+-            )
+-            self._set_export_progress(100, summary)
+-            print(summary)
+-            for p in final_outputs:
+-                print(f"  - {p.name}")
+-
+-            self.scan_queue_and_load()
++            final_dir = self._pottery_final_output_dir()
++            self._remove_existing_pottery_layout_files(final_dir, branch)
++            merged = self._merge_component_files(staging, final_dir)
++            self._set_export_progress(100, f"{label}完了: {final_dir}")
++            QMessageBox.information(
++                self,
++                label,
++                f"書き出しが完了しました。\n保存先: {final_dir}\n"
++                f"出力ファイル: {len(merged)}\n\n"
++                "出力方式を切り替えると、同じ資料について別の展開図を続けて出力できます。",
++            )
+         except Exception as e:
+-            try:
+-                if staging.exists():
+-                    shutil.rmtree(staging)
+-            except Exception:
+-                pass
+-            self._set_export_progress(0, "保存失敗")
+-            self._show_error("保存エラー", e)
++            if staging is not None and staging.exists():
++                shutil.rmtree(staging, ignore_errors=True)
++            self._set_export_progress(0, f"{label}失敗")
++            self._show_error(f"土器 {label}エラー", e)
+         finally:
+             QApplication.restoreOverrideCursor()
+             if self.asset is not None:
+-                self.save_next_btn.setEnabled(True)
++                self.pottery_layout_export_btn.setEnabled(True)
++
++    def _finish_pottery_and_next(self):
++        if not self.asset or self._is_lithic():
++            return
++        final_dir = OUTPUT_DIR / self.asset.source_path.stem
++        if not final_dir.exists():
++            answer = QMessageBox.question(
++                self,
++                "出力なし",
++                "この資料ではまだ出力ファイルが作成されていません。\n"
++                "出力なしで完了扱いにして次のファイルへ進みますか？",
++                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
++                QMessageBox.StandardButton.No,
++            )
++            if answer != QMessageBox.StandardButton.Yes:
++                return
++            final_dir.mkdir(parents=True, exist_ok=True)
++        marker = final_dir / SPLIT_EXPORT_IN_PROGRESS_MARKER
++        if marker.exists():
++            marker.unlink()
++        self.statusBar().showMessage(
++            f"完了: {self.asset.source_path.name} — 次のファイルへ進みます。"
++        )
++        self.scan_queue_and_load()
++
++    def save_current_and_next(self):
++        """Legacy compatibility entry point.
++
++        v0.4.10 separates pottery outputs so that orthographic, cylindrical,
++        and fan developments can be exported consecutively before advancing.
++        """
++        if self._is_lithic():
++            QMessageBox.information(
++                self,
++                "石器出力",
++                "石器は個別の出力ボタンを使用してください。",
++            )
++            return
++        QMessageBox.information(
++            self,
++            "土器出力",
++            "v0.4.10では「計測データ出力」「現在の展開図を出力」"
++            "「PLY / Transform出力」を個別に使用し、最後に「次のファイルへ」を押します。",
++        )
+ 
+     @staticmethod
+     def _verify_png_file(path: Path) -> None:
+@@ -9241,6 +10255,7 @@
+         outline_width_px: int = OUTLINE_PNG_WIDTH_PX,
+         auxiliary_panels: dict[str, np.ndarray] | None = None,
+         auxiliary_rects: dict[str, tuple[float, float, float, float]] | None = None,
++        png_dpi: float | None = None,
+     ) -> None:
+         from PIL import Image
+ 
+@@ -9313,7 +10328,7 @@
+ 
+         baseline = canvas_h - 34
+         self._draw_scale_bar(canvas, ppu, scale_bar_mm, margin, baseline)
+-        canvas.convert("RGB").save(out_path, format="PNG")
++        self._save_png_image(canvas, out_path, dpi=png_dpi)
+ 
+     def _save_individual_view(
+         self,
+@@ -9359,43 +10374,35 @@
+         export_svg: bool = False,
+         export_png_outline: bool = False,
+         progress_callback=None,
++        pixels_per_model_unit: float | None = None,
++        png_dpi: float | None = None,
++        layout_context: dict | None = None,
+     ) -> list[Path]:
+         out_dir.mkdir(parents=True, exist_ok=True)
+-        final_m = self._current_final_matrix()
+-        poly = self._make_polydata(final_m)
+-        pts = np.asarray(poly.points)
+-        bounds = np.array([
+-            pts[:, 0].min(), pts[:, 0].max(),
+-            pts[:, 1].min(), pts[:, 1].max(),
+-            pts[:, 2].min(), pts[:, 2].max(),
+-        ], dtype=float)
+-
+-        spacing_model = float(spacing_mm) / float(self.asset.unit_to_mm)
++        context = (
++            layout_context
++            if layout_context is not None
++            else self._build_pottery_ortho_layout_context(views, modes, spacing_mm)
++        )
++        poly = context["poly"]
++        bounds = np.asarray(context["bounds"], dtype=float)
++        spacing_model = float(context["spacing_model"])
++        rects = context["rects"]
++        aux_rects = context["aux_rects"]
++
+         base_modes = [m for m in modes if m in ("texture", "texture_normal", "shade")]
+         section_selected = "section" in modes
+         half_selected = "half_section" in modes
+         quarter_selected = "quarter_half_section" in modes
+ 
+-        # Layout rule:
+-        #   front_outline - [selected ortho views]
+-        # with special raster panels inserted immediately after front:
+-        #   ... front - quarter - half - right ...
+-        # Example, six views + quarter + half + section:
+-        #   front_outline - left - front - quarter - half - right - back - section
+-        # and section is always at the far right.
+-        rects, aux_rects = self._layout_with_auxiliary_panels(
+-            bounds,
+-            spacing_model,
+-            views,
+-            include_quarter=quarter_selected,
+-            include_half=half_selected,
+-            include_section=section_selected,
+-        )
+-
+-        all_layout_rects = [rects[v] for v in views] + list(aux_rects.values())
+-        sheet_w = max(r[2] for r in all_layout_rects) - min(r[0] for r in all_layout_rects)
+-        sheet_h = max(r[3] for r in all_layout_rects) - min(r[1] for r in all_layout_rects)
+-        ppu = ORTHO_COMPOSITE_LONG_EDGE_PX / max(float(sheet_w), float(sheet_h), 1e-9)
++        if pixels_per_model_unit is None:
++            ppu = ORTHO_COMPOSITE_LONG_EDGE_PX / max(
++                float(context["sheet_w"]), float(context["sheet_h"]), 1e-9
++            )
++        else:
++            ppu = float(pixels_per_model_unit)
++        if not math.isfinite(ppu) or ppu <= 0.0:
++            raise RuntimeError("画像解像度 (pixels/model-unit) が不正です。")
+ 
+         stem = self.asset.source_path.stem
+         written: list[Path] = []
+@@ -9580,6 +10587,7 @@
+                         outline_width_px=outline_width_px,
+                         auxiliary_panels=auxiliary_panels,
+                         auxiliary_rects=aux_rects,
++                        png_dpi=png_dpi,
+                     )
+                     written.append(path)
+ 
+@@ -9597,6 +10605,7 @@
+                         outline_width_px=outline_width_px,
+                         auxiliary_panels=auxiliary_panels,
+                         auxiliary_rects=aux_rects,
++                        png_dpi=png_dpi,
+                     )
+                     written.append(path)
+ 
+@@ -9611,6 +10620,7 @@
+                                 scale_bar_mm,
+                                 outline_paths=None,
+                                 outline_width_px=outline_width_px,
++                                png_dpi=png_dpi,
+                             )
+                             written.append(path)
+                         if export_png_outline:
+@@ -9622,6 +10632,7 @@
+                                 scale_bar_mm,
+                                 outline_paths=outlines.get(view),
+                                 outline_width_px=outline_width_px,
++                                png_dpi=png_dpi,
+                             )
+                             written.append(path)
+                 del rendered
+@@ -9636,6 +10647,7 @@
+                 scale_bar_mm,
+                 outline_paths=None,
+                 outline_width_px=outline_width_px,
++                png_dpi=png_dpi,
+             )
+             written.append(front_outline_png)
+ 
+@@ -9648,6 +10660,7 @@
+                     scale_bar_mm,
+                     outline_paths=None,
+                     outline_width_px=outline_width_px,
++                    png_dpi=png_dpi,
+                 )
+                 written.append(section_png)
+ 
