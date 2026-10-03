@@ -7,7 +7,8 @@
 > **License:** v0.4.10 and later use the MIT License. Releases through v0.4.9 published under CC0 1.0 Universal retain their original terms.
 
 Japanese: [README.md](README.md)  
-Development report: [docs/DEVELOPMENT_REPORT.md](docs/DEVELOPMENT_REPORT.md)
+Development report: [docs/DEVELOPMENT_REPORT.md](docs/DEVELOPMENT_REPORT.md)  
+Code review: [docs/CODE_REVIEW_v1.0.0.md](docs/CODE_REVIEW_v1.0.0.md)
 
 > [!WARNING]
 > **Model size / triangle count:** v1.0.0 does not automatically decimate meshes. About 0.7–1.0 M faces is a comfortable range, 1–2 M faces is recommended, and ~2.5 M faces is a practical upper guide. For broadly comparable ASCII OBJ files, ~2 M faces may be around 150 MB and ~2.5 M around 200 MB, but actual size varies. Inputs larger than **300 MB (300,000,000 bytes)** trigger an advisory warning before load; the user may still continue.
