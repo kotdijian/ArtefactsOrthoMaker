@@ -2,9 +2,20 @@
 
 **考古資料3Dモデルの姿勢正規化・オルソ展開・曲面展開・計測出力を行うデスクトップGUI**
 
-> **Stable release:** **v1.0.0** は通常利用を想定した安定版です。
+> **現行バージョン:** **v2.0.0**
 >
 > **License:** v0.4.10 以降のリリースは **MIT License** です。v0.4.9 以前に **CC0 1.0 Universal** として公開された旧版への適用条件は遡及して変更しません。
+
+<a id="migration-v2"></a>
+## v1系列からv2系列への変更
+
+v2.0.0では、AOMを3Dデータのデジタルアーカイブ工程で使う資料出力モジュールとして位置づけました。姿勢確定後の **「資料を書き出す」** で、選択した図版、正規化PLY、変換情報、計測CSV、品質管理JSON、入出力マニフェストを、資料ごとにまとめて保存します。土器ではオルソ・円筒・扇形を複数選択できます。出力方式の切り替え欄で各方式の設定とプレビューを確認し、出力パネルで今回保存する図版を選択してください。
+
+**「一覧表にデータを追加」** は独立した操作です。書き出した処理版のQAと計測値を、`output/inventory-qa-measurements.csv` に1行追記します。初回はCSVを作成し、2回目以降は既存行を保持します。同じ処理版を再度追加するともう1行増えます。石器の断面計測は `sections_json` 列にまとめます。
+
+BagItやレポート生成への受け渡しには `item_manifest.json` を使います。入力の依存関係・SHA-256、出力ファイル別の役割・SHA-256、資料ID・処理版IDを収録します。初期実装の資料IDは入力ファイルの拡張子を除いた名前です。OBJの宣言参照を記録し、外部参照を持つGLBは未対応として記録します。BagItパッケージと人間可読レポートの作成は下流工程で行います。
+
+旧版は [v1.0.0アーカイブ](archive/v1.0.0/README.md) から利用できます。
 
 English: [README_EN.md](README_EN.md)  
 開発レポート: [docs/DEVELOPMENT_REPORT.md](docs/DEVELOPMENT_REPORT.md)  
@@ -16,6 +27,7 @@ Repository: https://github.com/kotdijian/ArtefactsOrthoMaker
 
 ## 目次
 
+- [v1系列からv2系列への変更](#migration-v2)
 - [概要](#overview)
 - [はじめて使う方へ](#python-environment)
   - [1. Pythonのインストール](#python-install)
@@ -47,11 +59,11 @@ Repository: https://github.com/kotdijian/ArtefactsOrthoMaker
 > [!WARNING]
 > ## モデルサイズ / メッシュ数について
 >
-> v1.0.0 は自動 decimation を行わず、入力したフルメッシュをそのまま処理します。実用上の目安は、**70万〜100万 faces は余裕の大きい範囲、100万〜200万 faces 程度を推奨範囲、約250万 faces 程度を実用上限の目安**とします。
+> AOMは自動 decimation を行わず、入力したフルメッシュをそのまま処理します。実用上の目安は、**70万〜100万 faces は余裕の大きい範囲、100万〜200万 faces 程度を推奨範囲、約250万 faces 程度を実用上限の目安**とします。
 >
 > ASCII OBJ では属性数や数値精度に左右されますが、概ね **200万 faces ≈ 150 MB前後、250万 faces ≈ 200 MB前後**が参考値です。これは厳密な換算ではありません。
 >
-> **入力ファイルが 300 MB（300,000,000 bytes）を超える場合、読み込み前に警告を表示します。処理は強制中断しません。** 続行するかどうかは利用者が判断できます。300 MB超では Normal 検証、3D表示、オルソ/曲面展開、画像生成でRAM使用量と処理時間が急増する可能性があります。v1.0.0 は大規模モデルを点群proxyやdecimated meshへ自動置換しません。
+> **入力ファイルが 300 MB（300,000,000 bytes）を超える場合、読み込み前に警告を表示します。処理は強制中断しません。** 続行するかどうかは利用者が判断できます。300 MB超では Normal 検証、3D表示、オルソ/曲面展開、画像生成でRAM使用量と処理時間が急増する可能性があります。AOMは大規模モデルを点群proxyやdecimated meshへ自動置換しません。
 
 <a id="overview"></a>
 ## 概要
@@ -65,7 +77,8 @@ ArtefactsOrthoMaker は OBJ / PLY / GLB 形式の考古資料3Dモデルを読�
 - 土器円筒展開図 / 扇形展開図
 - 曲面展開 settings JSON
 - 資料別計測 CSV
-- geometry / 3D model inventory
+- 品質管理JSON、入出力マニフェスト
+- QA・計測一覧CSV（専用ボタンで追記）
 
 <a id="python-environment"></a>
 <a id="quick-start"></a>
@@ -200,31 +213,11 @@ input/pot001.obj
 output/pot001/
 ```
 
-起動時の処理キューでは、**`output/<stem>/` がすでに存在し、かつその中に `.aom_in_progress` が存在しない入力は「完了済み」と判定してスキップ**します。
+書き出しが完了すると、資料フォルダに `item_manifest.json` が保存されます。初回は `output/<stem>/` に、すでに資料フォルダがある状態で書き出すと `output/<stem>/revisions/<処理版ID>/` に一式を保存します。**「次のファイルへ」** を押すと次の未処理資料に進みます。
 
-つまり通常は、
+起動時、確定済みマニフェストがある資料は処理済みとしてスキップします。旧版との互換のため、資料フォルダが存在して `.aom_in_progress` がない場合も処理済み扱いです。再処理する場合は、既存の資料フォルダを退避してから起動してください。
 
-```text
-input/pot001.obj
-output/pot001/        ← 完了済み結果あり
-```
-
-であれば、次回起動時に `pot001.obj` は再処理されません。
-
-v1.0.0では、複数の出力を個別に作成している途中は：
-
-```text
-output/pot001/.aom_in_progress
-```
-
-というmarkerを使用します。このmarkerが残っている場合、その資料は未完了として処理キューに残ります。最後にGUIの **「次のファイルへ」** を実行するとmarkerが外れ、完了扱いになります。
-
-> [!CAUTION]
-> `output/<stem>/` を利用者が手作業で先に作成し、`.aom_in_progress` がない状態にすると、そのstemの入力は完了済みとしてスキップされます。再処理したい場合は、必要な結果を退避したうえで対応する `output/<stem>/` の扱いを確認してください。
-
-旧versionで作成された `output/<stem>/` のようにmarkerを持たない既存出力フォルダも、互換性のため完了済みとして扱います。
-
-また、`output/` 直下には資料別フォルダ以外に、`inventory-pottery.csv`、`inventory-lithic.csv` などの一覧CSVが作成される場合があります。
+一覧は `output/inventory-qa-measurements.csv` に保存されます。資料を書き出した後、一覧に登録する場合は次の資料に進む前に **「一覧表にデータを追加」** を押してください。
 
 <a id="initial-setup"></a>
 ### 3. 初期設定と起動
@@ -330,7 +323,7 @@ python app.py
 
 #### requirements.txt
 
-v1.0.0 の `requirements.txt` では、アプリが利用する主要な第三者パッケージをversion固定しています。
+`requirements.txt` では、アプリが利用する主要な第三者パッケージをversion固定しています。
 
 ```text
 numpy==2.5.2
@@ -497,7 +490,7 @@ OBJは `v` と `vt` が独立indexを持つため、同一幾何頂点が複数U
 
 ## 出力ワークフロー
 
-姿勢決定後、計測、展開図、PLY/Transformを独立して繰り返し出力できます。同名ファイルがある場合は **上書き / 別名で保存 / キャンセル** を確認し、「別名で保存」は出力一式へ `_01`, `_02`, … を付与します。
+姿勢決定後は **「資料を書き出す」** で、図版、PLY/Transform、計測、品質管理、マニフェストをまとめて保存します。同じ資料を続けて書き出すと、別の処理版として保存されます。
 
 <a id="pottery"></a>
 # 土器モード
@@ -598,7 +591,7 @@ macOS Qt/PySide6問題：[docs/macos_qt_venv_issue.md](docs/macos_qt_venv_issue.
 - 多段扇形展開はpiecewise frustum approximation
 - 強い非回転対称形・把手・複雑なconcavityでは厳密等長展開ではない
 - 区分境界faceは現状、face重心判定とclippingを使用
-- overlap buffer付き区分展開はv1.0.0では未実装
+- overlap buffer付き区分展開は未実装
 - 大規模モデルはRAMと処理時間に注意
 
 <a id="license"></a>
@@ -624,5 +617,6 @@ v0.4.10以降：MIT License。v0.4.9以前：CC0 1.0 Universal。変更は遡及
 | v0.4.9 | 土器円筒・扇形展開 |
 | v0.4.10 | 曲面展開workflow、manual Z breakpoints |
 | **v1.0.0** | OBJ UV seam修正、外面/内面/上面、円筒区分点、Zクリック時camera回転抑制、上書き確認と`_01`連番、settings JSON強化、300 MB超警告、raster縮小preflight、stable repository整理 |
+| **v2.0.0** | 資料一括出力、品質管理JSON、入出力マニフェスト、QA・計測一覧の独立追記 |
 
 通常利用はルートの **`app.py`**。過去版は `archive/versions/` に退避しています。

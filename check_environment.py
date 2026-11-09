@@ -9,7 +9,7 @@ def ver(name):
     except metadata.PackageNotFoundError: return "unknown"
 
 def main():
-    print("ArtefactsOrthoMaker v1.0.0 - environment check")
+    print("ArtefactsOrthoMaker v2.0.0 - environment check")
     print("Python:",sys.version.split()[0]); print("Executable:",sys.executable)
     failed=False
     for label,module,dist in REQUIRED:

@@ -8,14 +8,16 @@ import shutil
 import sys
 import tempfile
 import traceback
+from uuid import uuid4
 from pathlib import Path
 
 import numpy as np
 import pyvista as pv
 import trimesh
 import pose_core as _pose_core
+import item_output
 from pyvistaqt import QtInteractor
-from PySide6.QtCore import Qt, QEvent, QTimer
+from PySide6.QtCore import Qt, QEvent, QLockFile, QTimer
 from PySide6.QtGui import QAction, QColor, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -69,7 +71,7 @@ from pose_core import (
 )
 
 APP_NAME = "ArtefactsOrthoMaker"
-APP_VERSION = "1.0.0"
+APP_VERSION = "2.0.0"
 SUPPORTED_SUFFIXES = {".obj", ".ply", ".glb"}
 WORK_DIR = Path(__file__).resolve().parent
 INPUT_DIR = WORK_DIR / "input"
@@ -97,7 +99,34 @@ POTTERY_CURVE_SURFACE_LABELS = {
 }
 
 
-def load_mesh_asset(path: str | Path, input_unit: str) -> MeshAsset:
+class ObjInputResolver(trimesh.resolvers.FilePathResolver):
+    """Record the bytes that Trimesh actually reads for OBJ sidecars."""
+
+    def __init__(self, path: Path, reads: list[dict]):
+        super().__init__(str(path))
+        self.reads = reads
+        self.last_path = None
+
+    def absolute(self, name: str) -> Path:
+        path = super().absolute(name)
+        self.last_path = path
+        return path
+
+    def get(self, name: str):
+        self.last_path = None
+        try:
+            data = super().get(name)
+        except (OSError, ValueError):
+            self.reads.append({"reference": name, "status": "unresolved"})
+            raise
+        path = self.last_path.relative_to(Path(self.parent).resolve()).as_posix()
+        self.reads.append(item_output.obj_read_record(name, path, data))
+        return data
+
+
+def load_mesh_asset(
+    path: str | Path, input_unit: str, obj_reads: list[dict] | None = None
+) -> MeshAsset:
     """Load an artifact mesh, preserving OBJ UV seams correctly.
 
     OBJ stores geometry-vertex indices (v) and texture-coordinate indices (vt)
@@ -125,6 +154,7 @@ def load_mesh_asset(path: str | Path, input_unit: str) -> MeshAsset:
         path,
         process=False,
         maintain_order=False,
+        resolver=ObjInputResolver(path, obj_reads) if obj_reads is not None else None,
     )
 
     source_scene = None
@@ -1094,23 +1124,12 @@ class MainWindow(QMainWindow):
         self.lithic_preview_btn.clicked.connect(self._show_lithic_output_preview)
         lithic_output_layout.addWidget(self.lithic_preview_btn)
 
-        # Split lithic export into independent products. This allows a
-        # normalized *_rev.ply to be re-opened only to regenerate orthographic
-        # drawings without redundantly writing measurement data or another PLY.
-        self.lithic_measurement_export_btn = QPushButton("計測データ出力")
-        self.lithic_measurement_export_btn.clicked.connect(
-            self._export_lithic_measurements
-        )
-        self.lithic_ortho_export_btn = QPushButton("展開図出力")
-        self.lithic_ortho_export_btn.clicked.connect(
-            self._export_lithic_orthographic_files
-        )
-        self.lithic_ply_export_btn = QPushButton("PLY / Transform出力")
-        self.lithic_ply_export_btn.clicked.connect(
-            self._export_lithic_ply_files
-        )
+        self.lithic_item_export_btn = QPushButton("資料を書き出す")
+        self.lithic_item_export_btn.clicked.connect(self._export_item)
+        self.lithic_inventory_btn = QPushButton("一覧表にデータを追加")
+        self.lithic_inventory_btn.clicked.connect(self._append_item_inventory)
         self.lithic_next_btn = QPushButton("次のファイルへ")
-        self.lithic_next_btn.clicked.connect(self._finish_lithic_and_next)
+        self.lithic_next_btn.clicked.connect(self._advance_item)
 
         self.lithic_export_stage_label = QLabel("待機")
         self.lithic_export_progress = QProgressBar()
@@ -1118,13 +1137,8 @@ class MainWindow(QMainWindow):
         self.lithic_export_progress.setValue(0)
 
         lithic_output_layout.addWidget(QLabel("出力"))
-        lithic_output_layout.addWidget(self.lithic_measurement_export_btn)
-        lithic_output_layout.addWidget(self.lithic_ortho_export_btn)
-        lithic_output_layout.addWidget(self.lithic_ply_export_btn)
-        lithic_output_layout.addWidget(QLabel(
-            "展開図 / PLY は計測データ未保存でも出力できます。"
-            "未保存の場合は確認メッセージを表示します。"
-        ))
+        lithic_output_layout.addWidget(self.lithic_item_export_btn)
+        lithic_output_layout.addWidget(self.lithic_inventory_btn)
         lithic_output_layout.addWidget(self.lithic_next_btn)
         lithic_output_layout.addWidget(self.lithic_export_stage_label)
         lithic_output_layout.addWidget(self.lithic_export_progress)
@@ -1361,20 +1375,21 @@ class MainWindow(QMainWindow):
         self.preview_btn = QPushButton("オルソ画像プレビューを開く")
         self.preview_btn.clicked.connect(self.open_pottery_output_preview)
 
-        self.pottery_measurement_export_btn = QPushButton("計測データ出力")
-        self.pottery_measurement_export_btn.clicked.connect(
-            self._export_pottery_measurements
-        )
-        self.pottery_layout_export_btn = QPushButton("オルソ展開図を出力")
-        self.pottery_layout_export_btn.clicked.connect(
-            self._export_pottery_current_layout
-        )
-        self.pottery_ply_export_btn = QPushButton("PLY / Transform出力")
-        self.pottery_ply_export_btn.clicked.connect(
-            self._export_pottery_ply_files
-        )
+        self.pottery_export_layouts = {}
+        for key, label in (
+            ("ortho", "オルソ展開図"),
+            ("cylindrical", "円筒展開図"),
+            ("fan", "扇形展開図"),
+        ):
+            checkbox = QCheckBox(label)
+            checkbox.setChecked(key == "ortho")
+            self.pottery_export_layouts[key] = checkbox
+        self.pottery_item_export_btn = QPushButton("資料を書き出す")
+        self.pottery_item_export_btn.clicked.connect(self._export_item)
+        self.pottery_inventory_btn = QPushButton("一覧表にデータを追加")
+        self.pottery_inventory_btn.clicked.connect(self._append_item_inventory)
         self.pottery_next_btn = QPushButton("次のファイルへ")
-        self.pottery_next_btn.clicked.connect(self._finish_pottery_and_next)
+        self.pottery_next_btn.clicked.connect(self._advance_item)
 
         self.export_stage_label = QLabel("待機")
         self.export_progress = QProgressBar()
@@ -1382,14 +1397,11 @@ class MainWindow(QMainWindow):
         self.export_progress.setValue(0)
 
         export_layout.addWidget(self.preview_btn)
-        export_layout.addWidget(QLabel("個別出力"))
-        export_layout.addWidget(self.pottery_measurement_export_btn)
-        export_layout.addWidget(self.pottery_layout_export_btn)
-        export_layout.addWidget(self.pottery_ply_export_btn)
-        export_layout.addWidget(QLabel(
-            "出力方式を切り替えて、オルソ・円筒・扇形を同じ資料について連続して書き出せます。"
-            "展開図 / PLY は計測データ未保存でも確認後に出力できます。"
-        ))
+        export_layout.addWidget(QLabel("資料に含める図版（複数選択可）"))
+        for checkbox in self.pottery_export_layouts.values():
+            export_layout.addWidget(checkbox)
+        export_layout.addWidget(self.pottery_item_export_btn)
+        export_layout.addWidget(self.pottery_inventory_btn)
         export_layout.addWidget(self.pottery_next_btn)
         export_layout.addWidget(self.export_stage_label)
         export_layout.addWidget(self.export_progress)
@@ -1486,6 +1498,7 @@ class MainWindow(QMainWindow):
     def _build_menu(self):
         file_menu = self.menuBar().addMenu("File")
         reload_action = QAction("Reload input queue", self)
+        self.reload_action = reload_action
         reload_action.triggered.connect(self.scan_queue_and_load)
         file_menu.addAction(reload_action)
         quit_action = QAction("Quit", self)
@@ -1504,9 +1517,8 @@ class MainWindow(QMainWindow):
             self.view_mode_combo, self.viewer_scale_combo,
             self.zoom_out_btn, self.zoom_reset_btn, self.zoom_in_btn, self.zoom_slider,
             self.preview_btn,
-            self.pottery_measurement_export_btn,
-            self.pottery_layout_export_btn,
-            self.pottery_ply_export_btn,
+            self.pottery_item_export_btn,
+            self.pottery_inventory_btn,
             self.pottery_next_btn,
             self.pottery_output_branch_combo,
             self.pottery_curve_render_combo,
@@ -1530,9 +1542,8 @@ class MainWindow(QMainWindow):
             self.lithic_auto_pose_btn, self.lithic_input_pose_btn,
             self.lithic_reset_btn, self.lithic_confirm_btn,
             self.lithic_return_pose_btn, self.lithic_preview_btn,
-            self.lithic_measurement_export_btn,
-            self.lithic_ortho_export_btn,
-            self.lithic_ply_export_btn,
+            self.lithic_item_export_btn,
+            self.lithic_inventory_btn,
             self.lithic_next_btn,
             self.lithic_view_spacing, self.lithic_scale_bar_combo,
             self.lithic_image_size_mode_combo, self.lithic_print_dpi_combo,
@@ -1545,6 +1556,7 @@ class MainWindow(QMainWindow):
             self.lithic_add_section_x_btn, self.lithic_add_section_y_btn,
             self.lithic_delete_section_btn,
         ] + list(self.view_checks.values()) + list(self.lithic_view_checks.values())
+        widgets.extend(self.pottery_export_layouts.values())
         for controls in self.lithic_rotation_controls.values():
             widgets.extend(controls.values())
         for w in widgets:
@@ -1627,12 +1639,6 @@ class MainWindow(QMainWindow):
             if branch == "ortho"
             else "曲面展開プレビューを開く"
         )
-        if hasattr(self, "pottery_layout_export_btn"):
-            self.pottery_layout_export_btn.setText({
-                "ortho": "オルソ展開図を出力",
-                "cylindrical": "円筒展開図を出力",
-                "fan": "扇形展開図を出力",
-            }[branch])
         self._schedule_pottery_curve_size_update()
         self._refresh_pottery_curve_z_guides()
 
@@ -2986,12 +2992,12 @@ class MainWindow(QMainWindow):
         modes = []
         if (
             self.lithic_mode_texture.isChecked()
-            and self.lithic_mode_texture.isEnabled()
+            and self.lithic_mode_texture.isEnabledTo(self.centralWidget())
         ):
             modes.append("texture")
         if (
             self.lithic_mode_texture_normal.isChecked()
-            and self.lithic_mode_texture_normal.isEnabled()
+            and self.lithic_mode_texture_normal.isEnabledTo(self.centralWidget())
         ):
             modes.append("texture_normal")
         if self.lithic_mode_shade.isChecked():
@@ -3306,8 +3312,12 @@ class MainWindow(QMainWindow):
         completion flags.
         """
         out_dir = OUTPUT_DIR / path.stem
-        if not out_dir.exists():
+        if not out_dir.is_dir():
             return False
+        if (out_dir / item_output.MANIFEST).is_file() or any(
+            out_dir.glob(f"revisions/*/{item_output.MANIFEST}")
+        ):
+            return True
         return not (out_dir / SPLIT_EXPORT_IN_PROGRESS_MARKER).exists()
 
     def scan_queue_and_load(self):
@@ -3398,7 +3408,22 @@ class MainWindow(QMainWindow):
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
             self.statusBar().showMessage(f"読み込み・Normal検証中: {path.name}")
             QApplication.processEvents()
-            self.asset = load_mesh_asset(path, self.unit_combo.currentText())
+            source = path.resolve()
+            initial_stamp = item_output.file_stamp(source)
+            dependencies = item_output.source_dependencies(source, INPUT_DIR)
+            obj_reads = []
+            asset = load_mesh_asset(path, self.unit_combo.currentText(), obj_reads)
+            if (
+                item_output.file_stamp(source) != initial_stamp
+                or any(item_output.file_stamp(dep) != stamp
+                       for dep, stamp in dependencies[2].items())
+            ):
+                raise RuntimeError("読み込み中に入力ファイルが変更されました。再読み込みしてください。")
+            self.item_source = item_output.source_manifest(
+                source, INPUT_DIR, asset.source_sha256, dependencies, obj_reads
+            )
+            self.asset = asset
+            self.last_item_output = None
             self.current_queue_path = path
             self.initial_axis = None
             self.reference_plane = None
@@ -4239,7 +4264,7 @@ class MainWindow(QMainWindow):
                 self.refresh_view()
         self._schedule_preview_refresh()
 
-    # ---------- Measurement CSV / inventory ----------
+    # ---------- Item measurements ----------
     def _measurement_final_matrix(self) -> np.ndarray:
         if not self.asset:
             raise RuntimeError("モデルが読み込まれていません。")
@@ -4340,12 +4365,9 @@ class MainWindow(QMainWindow):
                 rows.append(row)
                 continue
 
-            points = np.vstack(
-                [
-                    np.asarray(path, dtype=float)
-                    for path in paths
-                    if len(path) >= 2
-                ]
+            points = np.asarray(
+                [point for path in paths if len(path) >= 2 for point in path],
+                dtype=float,
             )
             if len(points) == 0:
                 row["status"] = "no_intersection"
@@ -4407,199 +4429,28 @@ class MainWindow(QMainWindow):
 
         return rows
 
-    @staticmethod
-    def _measurement_csv_fieldnames() -> list[str]:
-        return [
-            "artifact_type",
-            "source_file",
-            "source_stem",
-            "source_sha256",
-            "input_unit",
-            "record_type",
-            "record_id",
-            "section_axis",
-            "section_plane",
-            "section_position",
-            "section_position_percent",
-            "section_coordinate",
-            "section_coordinate_mm",
-            "bbox_x",
-            "bbox_y",
-            "bbox_z",
-            "bbox_x_mm",
-            "bbox_y_mm",
-            "bbox_z_mm",
-            "status",
-        ]
-
-    def _write_individual_measurement_csv(
-        self,
-        out_dir: Path,
-        final_matrix: np.ndarray,
-    ) -> Path:
-        if not self.asset:
-            raise RuntimeError("モデルが読み込まれていません。")
-
-        out_dir.mkdir(parents=True, exist_ok=True)
-        path = out_dir / f"{self.asset.source_path.stem}_measurements.csv"
-        artifact_type = "lithic" if self._is_lithic() else "pottery"
-
-        rows = self._measurement_rows(final_matrix)
-        fieldnames = self._measurement_csv_fieldnames()
-
-        with path.open(
-            "w",
-            encoding="utf-8-sig",
-            newline="",
-        ) as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            for row in rows:
-                common = {
-                    "artifact_type": artifact_type,
-                    "source_file": self.asset.source_path.name,
-                    "source_stem": self.asset.source_path.stem,
-                    "source_sha256": self.asset.source_sha256,
-                    "input_unit": self.asset.input_unit,
-                }
-                writer.writerow({**common, **row})
-
-        if self._is_lithic():
-            self._write_lithic_section_bbox_csv(
-                out_dir,
-                rows=[r for r in rows if r.get("record_type") == "section_bbox"],
-            )
-
-        return path
-
-    def _write_lithic_section_bbox_csv(
-        self,
-        out_dir: Path,
-        rows: list[dict],
-    ) -> Path:
-        """Write one per-artifact CSV containing one bbox row per section.
-
-        Unlike output/inventory-lithic.csv, this file is never merged across
-        multiple input artifacts.  It lives beside images and transforms in
-        output/<stem>/.
-        """
-        if not self.asset:
-            raise RuntimeError("モデルが読み込まれていません。")
-
-        out_dir.mkdir(parents=True, exist_ok=True)
-        path = out_dir / f"{self.asset.source_path.stem}_section_bboxes.csv"
-        fieldnames = [
-            "source_file",
-            "source_stem",
-            "source_sha256",
-            "input_unit",
-            "section_id",
-            "section_axis",
-            "section_plane",
-            "section_position",
-            "section_position_percent",
-            "section_coordinate",
-            "section_coordinate_mm",
-            "bbox_x",
-            "bbox_y",
-            "bbox_z",
-            "bbox_x_mm",
-            "bbox_y_mm",
-            "bbox_z_mm",
-            "status",
-        ]
-        with path.open("w", encoding="utf-8-sig", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            for row in rows:
-                writer.writerow({
-                    "source_file": self.asset.source_path.name,
-                    "source_stem": self.asset.source_path.stem,
-                    "source_sha256": self.asset.source_sha256,
-                    "input_unit": self.asset.input_unit,
-                    "section_id": row.get("record_id", ""),
-                    "section_axis": row.get("section_axis", ""),
-                    "section_plane": row.get("section_plane", ""),
-                    "section_position": row.get("section_position", ""),
-                    "section_position_percent": row.get("section_position_percent", ""),
-                    "section_coordinate": row.get("section_coordinate", ""),
-                    "section_coordinate_mm": row.get("section_coordinate_mm", ""),
-                    "bbox_x": row.get("bbox_x", ""),
-                    "bbox_y": row.get("bbox_y", ""),
-                    "bbox_z": row.get("bbox_z", ""),
-                    "bbox_x_mm": row.get("bbox_x_mm", ""),
-                    "bbox_y_mm": row.get("bbox_y_mm", ""),
-                    "bbox_z_mm": row.get("bbox_z_mm", ""),
-                    "status": row.get("status", ""),
-                })
-        return path
-
-    @staticmethod
-    def _geometry_inventory_fieldnames() -> list[str]:
-        """Representative geometry inventory: requested minimal four columns."""
-        return [
-            "source_stem",
-            "bbox_x_mm",
-            "bbox_y_mm",
-            "bbox_z_mm",
-        ]
-
-    @staticmethod
-    def _model_inventory_fieldnames() -> list[str]:
-        """3D model / source-data inventory."""
-        return [
-            "source_file",
-            "source_stem",
-            "source_sha256",
-            "mesh_count",
-            "file_size_bytes",
-            "file_size_mb",
-            "surface_area_mm2",
-            "volume_mm3",
-            "is_watertight",
-            "volume_status",
-        ]
-
-    def _current_geometry_inventory_row(
-        self,
-        final_matrix: np.ndarray,
-    ) -> dict:
-        if not self.asset:
-            raise RuntimeError("モデルが読み込まれていません。")
-
-        _bmin, _bmax, ext = self._measurement_model_bbox(final_matrix)
-        unit_to_mm = float(self.asset.unit_to_mm)
-
-        return {
-            "source_stem": self.asset.source_path.stem,
-            "bbox_x_mm": float(ext[0] * unit_to_mm),
-            "bbox_y_mm": float(ext[1] * unit_to_mm),
-            "bbox_z_mm": float(ext[2] * unit_to_mm),
-        }
-
-    def _current_model_inventory_row(self) -> dict:
+    def _measure_input_mesh(self) -> dict:
         """Return source 3D-model metadata and geometry invariants.
 
         mesh_count is the number of triangle faces after Trimesh loading.
-        source_path.stat() measures only the source mesh file.  Therefore an
-        OBJ entry counts the OBJ file itself and intentionally excludes MTL /
-        texture files, as requested.
+        The recorded byte size is that of the entry model file alone.
 
         Surface area and volume are converted from the input coordinate unit
         to mm^2 / mm^3.  Trimesh can return a volume for a non-watertight
         mesh, but that value is not guaranteed to represent a closed physical
-        volume, so the inventory also records watertight/status.
+        volume, so QA also records the watertight test and volume status.
         """
         if not self.asset:
             raise RuntimeError("モデルが読み込まれていません。")
 
         mesh = self.asset.mesh
         unit_to_mm = float(self.asset.unit_to_mm)
-        file_size_bytes = int(self.asset.source_path.stat().st_size)
+        file_size_bytes = next(
+            file["size_bytes"] for file in self.item_source["files"] if file["role"] == "model"
+        )
 
         area_native = float(mesh.area)
-        raw_volume_native = float(mesh.volume)
-        volume_native = abs(raw_volume_native)
+        volume_native = abs(float(mesh.volume))
         watertight = bool(mesh.is_watertight)
 
         return {
@@ -4608,258 +4459,20 @@ class MainWindow(QMainWindow):
             "source_sha256": self.asset.source_sha256,
             "mesh_count": int(len(mesh.faces)),
             "file_size_bytes": file_size_bytes,
-            "file_size_mb": float(file_size_bytes / (1024.0 ** 2)),
             "surface_area_mm2": float(
                 area_native * (unit_to_mm ** 2)
-            ),
+            ) if math.isfinite(area_native) else None,
             "volume_mm3": float(
                 volume_native * (unit_to_mm ** 3)
-            ),
+            ) if math.isfinite(volume_native) else None,
             "is_watertight": watertight,
             "volume_status": (
+                "unavailable" if not math.isfinite(volume_native) else
                 "closed_mesh"
                 if watertight
                 else "non_watertight_estimate"
             ),
         }
-
-    @staticmethod
-    def _upsert_csv_row(
-        path: Path,
-        fieldnames: list[str],
-        row: dict,
-        key_field: str,
-    ) -> str:
-        """Create or update one CSV row; return '追加' or '更新'."""
-        existing: list[dict] = []
-        if path.exists():
-            with path.open(
-                "r",
-                encoding="utf-8-sig",
-                newline="",
-            ) as f:
-                existing = list(csv.DictReader(f))
-
-        key = str(row.get(key_field, ""))
-        replaced = False
-        updated: list[dict] = []
-
-        for existing_row in existing:
-            if (
-                key
-                and str(existing_row.get(key_field, "")) == key
-            ):
-                if not replaced:
-                    updated.append(row)
-                    replaced = True
-                continue
-            updated.append(existing_row)
-
-        if not replaced:
-            updated.append(row)
-
-        with path.open(
-            "w",
-            encoding="utf-8-sig",
-            newline="",
-        ) as f:
-            writer = csv.DictWriter(
-                f,
-                fieldnames=fieldnames,
-                extrasaction="ignore",
-            )
-            writer.writeheader()
-            for current in updated:
-                writer.writerow(
-                    {
-                        name: current.get(name, "")
-                        for name in fieldnames
-                    }
-                )
-
-        return "更新" if replaced else "追加"
-
-    def _inventory_paths(self) -> tuple[Path, Path]:
-        """Return geometry inventory path and model-data inventory path."""
-        lithic = self._is_lithic()
-        geometry_path = OUTPUT_DIR / (
-            "inventory-lithic.csv"
-            if lithic
-            else "inventory-pottery.csv"
-        )
-        model_path = OUTPUT_DIR / (
-            "inventory-model-lithic.csv"
-            if lithic
-            else "inventory-model-pottery.csv"
-        )
-        return geometry_path, model_path
-
-    def _inventory_is_current(
-        self,
-        final_matrix: np.ndarray,
-    ) -> bool:
-        """Check that both inventories already contain the current values.
-
-        Used by split lithic export to decide whether a warning is needed
-        before orthographic or PLY output. Missing measurements no longer block
-        those exports.
-        """
-        if not self.asset:
-            return False
-
-        geometry_path, model_path = self._inventory_paths()
-        if not geometry_path.exists() or not model_path.exists():
-            return False
-
-        geometry_row = self._current_geometry_inventory_row(final_matrix)
-        model_row = self._current_model_inventory_row()
-
-        try:
-            with geometry_path.open(
-                "r",
-                encoding="utf-8-sig",
-                newline="",
-            ) as f:
-                geometry_rows = list(csv.DictReader(f))
-            with model_path.open(
-                "r",
-                encoding="utf-8-sig",
-                newline="",
-            ) as f:
-                model_rows = list(csv.DictReader(f))
-        except Exception:
-            return False
-
-        stem = str(geometry_row["source_stem"])
-        geometry_existing = next(
-            (
-                row for row in geometry_rows
-                if str(row.get("source_stem", "")) == stem
-            ),
-            None,
-        )
-        if geometry_existing is None:
-            return False
-
-        def close_number(csv_value, expected) -> bool:
-            try:
-                return bool(
-                    np.isclose(
-                        float(csv_value),
-                        float(expected),
-                        rtol=1e-9,
-                        atol=1e-6,
-                    )
-                )
-            except Exception:
-                return False
-
-        for field in ("bbox_x_mm", "bbox_y_mm", "bbox_z_mm"):
-            if not close_number(
-                geometry_existing.get(field, ""),
-                geometry_row[field],
-            ):
-                return False
-
-        sha = str(model_row["source_sha256"])
-        model_existing = next(
-            (
-                row for row in model_rows
-                if str(row.get("source_sha256", "")) == sha
-            ),
-            None,
-        )
-        if model_existing is None:
-            return False
-
-        if str(model_existing.get("source_file", "")) != str(
-            model_row["source_file"]
-        ):
-            return False
-        if str(model_existing.get("source_stem", "")) != str(
-            model_row["source_stem"]
-        ):
-            return False
-
-        numeric_fields = (
-            "mesh_count",
-            "file_size_bytes",
-            "surface_area_mm2",
-            "volume_mm3",
-        )
-        for field in numeric_fields:
-            if not close_number(
-                model_existing.get(field, ""),
-                model_row[field],
-            ):
-                return False
-
-        return True
-
-    def export_measurement_inventory(self, *_args, show_message: bool = True) -> bool:
-        """Write both inventory types for the current specimen.
-
-        Geometry representative values:
-            output/inventory-(pottery|lithic).csv
-
-        3D model/source-data values:
-            output/inventory-model-(pottery|lithic).csv
-        """
-        try:
-            if not self.asset:
-                raise RuntimeError("モデルが読み込まれていません。")
-
-            final_matrix = self._measurement_final_matrix()
-            geometry_row = self._current_geometry_inventory_row(
-                final_matrix
-            )
-            model_row = self._current_model_inventory_row()
-
-            OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-            geometry_path, model_path = self._inventory_paths()
-
-            geometry_action = self._upsert_csv_row(
-                geometry_path,
-                self._geometry_inventory_fieldnames(),
-                geometry_row,
-                key_field="source_stem",
-            )
-            model_action = self._upsert_csv_row(
-                model_path,
-                self._model_inventory_fieldnames(),
-                model_row,
-                key_field="source_sha256",
-            )
-
-            self.statusBar().showMessage(
-                "計測一覧出力完了: "
-                f"{geometry_path.name} / {model_path.name}"
-            )
-
-            volume_note = (
-                ""
-                if model_row["is_watertight"]
-                else (
-                    "\n\n注意: このモデルは watertight ではありません。"
-                    "volume_mm3 は Trimesh の非閉合メッシュ推定値として"
-                    "記録されています。"
-                )
-            )
-            if show_message:
-                QMessageBox.information(
-                    self,
-                    "計測一覧出力",
-                    f"Geometry inventory: {geometry_path.name} "
-                    f"({geometry_action})\n"
-                    f"3D model inventory: {model_path.name} "
-                    f"({model_action})"
-                    f"{volume_note}",
-                )
-            return True
-        except Exception as e:
-            self._show_error("計測一覧出力エラー", e)
-            return False
-
 
     # ---------- Lithic orthographic rendering / preview / export ----------
     @staticmethod
@@ -7926,8 +7539,7 @@ class MainWindow(QMainWindow):
             "surface": surface,
         }
 
-    def _pottery_curve_metadata(self) -> dict:
-        kind = self._pottery_output_branch_key()
+    def _pottery_curve_metadata(self, kind: str) -> dict:
         if kind == "ortho":
             return {}
         data = {
@@ -8093,7 +7705,7 @@ class MainWindow(QMainWindow):
                     "horizontal_plane": "X-Y",
                 },
                 "projection": diag,
-                "ui": self._pottery_curve_metadata(),
+                "ui": self._pottery_curve_metadata(kind),
                 "raster_outputs": raster_outputs,
             }
             settings_path = out_dir / f"{stem}_{tag}_settings.json"
@@ -8119,9 +7731,9 @@ class MainWindow(QMainWindow):
     # ---------- Export / batch completion ----------
     def _selected_render_modes(self) -> list[str]:
         modes = []
-        if self.mode_texture.isChecked() and self.mode_texture.isEnabled():
+        if self.mode_texture.isChecked() and self.mode_texture.isEnabledTo(self.centralWidget()):
             modes.append("texture")
-        if self.mode_texture_normal.isChecked() and self.mode_texture_normal.isEnabled():
+        if self.mode_texture_normal.isChecked() and self.mode_texture_normal.isEnabledTo(self.centralWidget()):
             modes.append("texture_normal")
         if self.mode_shade.isChecked():
             modes.append("shade")
@@ -8403,8 +8015,6 @@ class MainWindow(QMainWindow):
                 "matrix_4x4": final_matrix,
                 "inverse_matrix_4x4": inverse,
             },
-            "pottery_output_branch": self._pottery_output_branch_key(),
-            "curve_unwrap": self._pottery_curve_metadata(),
             "orthographic_export": {
                 "views": [k for k, cb in self.view_checks.items() if cb.isChecked()],
                 "view_spacing_mm": self.view_spacing.value(),
@@ -8480,271 +8090,6 @@ class MainWindow(QMainWindow):
             )
             return False
         return True
-
-    def _confirm_lithic_export_without_measurements(
-        self,
-        product_label: str,
-    ) -> bool:
-        """Warn, but allow export, when current measurement data is absent."""
-        if not self._require_confirmed_lithic_pose():
-            return False
-
-        final_matrix = np.asarray(
-            self.lithic_confirmed_final_matrix,
-            dtype=float,
-        )
-        if self._inventory_is_current(final_matrix):
-            return True
-
-        answer = QMessageBox.question(
-            self,
-            "計測データ未保存",
-            "現在の姿勢・単位に対応する計測データが保存されていません。\n\n"
-            f"計測データを保存せずに「{product_label}」を実行しますか？",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        return answer == QMessageBox.StandardButton.Yes
-
-    def _lithic_final_output_dir(self) -> Path:
-        if not self.asset:
-            raise RuntimeError("モデルが読み込まれていません。")
-        final_dir = OUTPUT_DIR / self.asset.source_path.stem
-        final_dir.mkdir(parents=True, exist_ok=True)
-        marker = final_dir / SPLIT_EXPORT_IN_PROGRESS_MARKER
-        marker.touch(exist_ok=True)
-        return final_dir
-
-    def _lithic_component_staging_dir(self, component: str) -> Path:
-        if not self.asset:
-            raise RuntimeError("モデルが読み込まれていません。")
-        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        staging = OUTPUT_DIR / (
-            f"{self.asset.source_path.stem}.__working_{component}__"
-        )
-        if staging.exists():
-            shutil.rmtree(staging)
-        staging.mkdir(parents=True, exist_ok=False)
-        return staging
-
-    @staticmethod
-    def _merge_component_files(staging: Path, final_dir: Path) -> list[Path]:
-        """Atomically expose a completed component at file granularity."""
-        written: list[Path] = []
-        for source in sorted(staging.iterdir()):
-            if not source.is_file():
-                continue
-            target = final_dir / source.name
-            if target.exists():
-                target.unlink()
-            source.replace(target)
-            written.append(target)
-        shutil.rmtree(staging)
-        return written
-
-    @staticmethod
-    def _numbered_output_name(name: str, index: int) -> str:
-        p = Path(name)
-        return f"{p.stem}_{index:02d}{p.suffix}"
-
-    @staticmethod
-    def _replace_json_filename_strings(value, name_map: dict[str, str]):
-        if isinstance(value, dict):
-            return {
-                k: MainWindow._replace_json_filename_strings(v, name_map)
-                for k, v in value.items()
-            }
-        if isinstance(value, list):
-            return [
-                MainWindow._replace_json_filename_strings(v, name_map)
-                for v in value
-            ]
-        if isinstance(value, str):
-            return name_map.get(value, value)
-        return value
-
-    def _merge_layout_files_with_confirmation(
-        self,
-        staging: Path,
-        final_dir: Path,
-        product_label: str,
-    ) -> list[Path] | None:
-        """Merge drawing outputs without silently overwriting prior runs.
-
-        If any target filename already exists, the user can:
-        - overwrite the current names;
-        - save the complete new export set with a shared _01, _02, ... suffix;
-        - cancel and keep both staging/final files unchanged.
-        """
-        sources = [
-            p for p in sorted(staging.iterdir())
-            if p.is_file()
-        ]
-        conflicts = [
-            p for p in sources
-            if (final_dir / p.name).exists()
-        ]
-        if not conflicts:
-            return self._merge_component_files(staging, final_dir)
-
-        box = QMessageBox(self)
-        box.setIcon(QMessageBox.Icon.Question)
-        box.setWindowTitle("同名ファイルが存在します")
-        shown = "\n".join(f"• {p.name}" for p in conflicts[:6])
-        more = (
-            f"\n…ほか {len(conflicts) - 6} ファイル"
-            if len(conflicts) > 6
-            else ""
-        )
-        box.setText(
-            f"{product_label}の同名ファイルがすでに存在します。\n\n"
-            f"{shown}{more}\n\n"
-            "上書きするか、今回の出力一式を別名で保存してください。"
-        )
-        overwrite_btn = box.addButton(
-            "上書き",
-            QMessageBox.ButtonRole.AcceptRole,
-        )
-        rename_btn = box.addButton(
-            "別名で保存",
-            QMessageBox.ButtonRole.ActionRole,
-        )
-        cancel_btn = box.addButton(
-            "キャンセル",
-            QMessageBox.ButtonRole.RejectRole,
-        )
-        box.setDefaultButton(rename_btn)
-        box.exec()
-        clicked = box.clickedButton()
-
-        if clicked is cancel_btn or clicked is None:
-            return None
-        if clicked is overwrite_btn:
-            return self._merge_component_files(staging, final_dir)
-
-        # Find one shared sequence number that is free for the whole export set.
-        sequence = None
-        for index in range(1, 10000):
-            if all(
-                not (
-                    final_dir
-                    / self._numbered_output_name(source.name, index)
-                ).exists()
-                for source in sources
-            ):
-                sequence = index
-                break
-        if sequence is None:
-            raise RuntimeError("別名保存用の連番を確保できませんでした。")
-
-        name_map = {
-            source.name: self._numbered_output_name(
-                source.name,
-                sequence,
-            )
-            for source in sources
-        }
-
-        # Keep JSON references (for example raster_outputs[].png_file) in sync
-        # with the numbered filenames.
-        for source in sources:
-            if source.suffix.lower() != ".json":
-                continue
-            try:
-                data = json.loads(source.read_text(encoding="utf-8"))
-                data = self._replace_json_filename_strings(data, name_map)
-                source.write_text(
-                    json.dumps(data, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
-            except Exception:
-                # A layout JSON that is not ours should not block image saving.
-                pass
-
-        written: list[Path] = []
-        for source in sources:
-            target = final_dir / name_map[source.name]
-            source.replace(target)
-            written.append(target)
-        shutil.rmtree(staging)
-        return written
-
-    def _remove_existing_lithic_ortho_files(self, final_dir: Path) -> None:
-        """Remove prior lithic drawing products before regenerating them.
-
-        Measurement CSVs, PLY, transform files, and the in-progress marker are
-        deliberately preserved.
-        """
-        if not self.asset or not final_dir.exists():
-            return
-        stem = self.asset.source_path.stem
-        view_tokens = (
-            "_ortho_",
-            "_front_",
-            "_back_",
-            "_left_",
-            "_right_",
-            "_top_",
-            "_bottom_",
-            "_section_",
-        )
-        for path in list(final_dir.iterdir()):
-            if (
-                path.is_file()
-                and path.name.startswith(stem)
-                and path.suffix.lower() in (".png", ".svg")
-                and any(token in path.name for token in view_tokens)
-            ):
-                path.unlink()
-
-    def _export_lithic_measurements(self):
-        if not self._require_confirmed_lithic_pose():
-            return
-
-        staging = None
-        try:
-            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-            self.lithic_measurement_export_btn.setEnabled(False)
-            self._set_export_progress(5, "石器 計測データを書き出し中")
-            QApplication.processEvents()
-
-            final_m = np.asarray(
-                self.lithic_confirmed_final_matrix,
-                dtype=float,
-            )
-            staging = self._lithic_component_staging_dir("measurements")
-
-            # Per-specimen measurements and section bbox CSVs.
-            self._write_individual_measurement_csv(staging, final_m)
-
-            # Cross-specimen inventories.
-            if not self.export_measurement_inventory(show_message=False):
-                raise RuntimeError("計測一覧の更新に失敗しました。")
-
-            final_dir = self._lithic_final_output_dir()
-            written = self._merge_component_files(staging, final_dir)
-
-            self._set_export_progress(
-                100,
-                f"計測データ出力完了: {final_dir}",
-            )
-            QMessageBox.information(
-                self,
-                "計測データ出力",
-                "計測データを書き出しました。\n"
-                f"保存先: {final_dir}\n"
-                f"個体別CSV: {len(written)} ファイル\n"
-                "あわせて geometry / 3D model inventory を更新しました。",
-            )
-        except Exception as e:
-            if staging is not None and staging.exists():
-                shutil.rmtree(staging, ignore_errors=True)
-            self._set_export_progress(0, "計測データ出力失敗")
-            self._show_error("石器 計測データ出力エラー", e)
-        finally:
-            QApplication.restoreOverrideCursor()
-            if self.asset is not None:
-                self.lithic_measurement_export_btn.setEnabled(True)
 
     @staticmethod
     def _png_bytes_per_pixel(paths: list[Path]) -> float | None:
@@ -9078,10 +8423,7 @@ class MainWindow(QMainWindow):
             "mode": "file_size",
         }
 
-    def _export_lithic_orthographic_files(self):
-        if not self._confirm_lithic_export_without_measurements("展開図出力"):
-            return
-
+    def _render_lithic_item_drawings(self, staging: Path) -> list[Path]:
         views = self._selected_lithic_views()
         modes = self._selected_lithic_modes()
         export_png_plain = self.lithic_output_png.isChecked()
@@ -9092,82 +8434,94 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self, "未選択", "少なくとも1つの出力面を選択してください。"
             )
-            return
+            return []
         if not export_png_plain and not export_svg and not export_png_outline:
             QMessageBox.warning(
                 self,
                 "未選択",
                 "PNGのみ / SVG / PNG+輪郭 の少なくとも1つを選択してください。",
             )
-            return
+            return []
         if (export_png_plain or export_png_outline) and not modes:
             QMessageBox.warning(
                 self,
                 "未選択",
                 "PNG出力では少なくとも1つの表現を選択してください。",
             )
-            return
+            return []
 
-        staging = None
-        try:
-            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-            self.lithic_ortho_export_btn.setEnabled(False)
-            self._set_export_progress(2, "画像レイアウトと出力サイズを計算中")
+        context = self._build_lithic_output_layout_context(
+            views,
+            float(self.lithic_view_spacing.value()),
+        )
+        resolution = self._resolve_lithic_output_resolution(
+            context,
+            views,
+            modes,
+            export_png_plain,
+            export_png_outline,
+        )
+        if resolution is None:
+            self._set_export_progress(0, "展開図出力をキャンセルしました")
+            return []
 
-            context = self._build_lithic_output_layout_context(
-                views,
-                float(self.lithic_view_spacing.value()),
-            )
-            resolution = self._resolve_lithic_output_resolution(
-                context,
-                views,
-                modes,
-                export_png_plain,
-                export_png_outline,
-            )
-            if resolution is None:
-                self._set_export_progress(0, "展開図出力をキャンセルしました")
-                return
+        ppu = float(resolution["ppu"])
+        png_dpi = resolution["png_dpi"]
+        target_mb = resolution["target_mb"]
 
-            ppu = float(resolution["ppu"])
-            png_dpi = resolution["png_dpi"]
-            target_mb = resolution["target_mb"]
-            staging = self._lithic_component_staging_dir("orthos")
-
-            def ortho_progress(frac: float, message: str):
-                self._set_export_progress(
-                    5 + int(88 * float(frac)),
-                    message,
-                )
-
-            def render_once(current_ppu: float) -> list[Path]:
-                return self.export_lithic_orthos(
-                    staging,
-                    views=views,
-                    modes=modes,
-                    spacing_mm=float(self.lithic_view_spacing.value()),
-                    scale_bar_mm=self._selected_lithic_scale_bar_mm(),
-                    outline_width_px=self._selected_lithic_outline_width_px(),
-                    individual=self.lithic_export_individual.isChecked(),
-                    export_png_plain=export_png_plain,
-                    export_svg=export_svg,
-                    export_png_outline=export_png_outline,
-                    progress_callback=ortho_progress,
-                    pixels_per_model_unit=current_ppu,
-                    png_dpi=png_dpi,
-                    layout_context=context,
-                )
-
+        def ortho_progress(frac: float, message: str):
             self._set_export_progress(
-                5, "石器オルソ / 輪郭 / 断面生成を開始"
+                5 + int(88 * float(frac)),
+                message,
             )
-            written = render_once(ppu)
 
-            # File-size mode uses a measured low-resolution compression ratio.
-            # If the real full-resolution PNG still exceeds the selected cap,
-            # perform one conservative corrective re-render.
-            if target_mb is not None and (export_png_plain or export_png_outline):
-                target_bytes = float(target_mb) * 1_000_000.0
+        def render_once(current_ppu: float) -> list[Path]:
+            return self.export_lithic_orthos(
+                staging,
+                views=views,
+                modes=modes,
+                spacing_mm=float(self.lithic_view_spacing.value()),
+                scale_bar_mm=self._selected_lithic_scale_bar_mm(),
+                outline_width_px=self._selected_lithic_outline_width_px(),
+                individual=self.lithic_export_individual.isChecked(),
+                export_png_plain=export_png_plain,
+                export_svg=export_svg,
+                export_png_outline=export_png_outline,
+                progress_callback=ortho_progress,
+                pixels_per_model_unit=current_ppu,
+                png_dpi=png_dpi,
+                layout_context=context,
+            )
+
+        self._set_export_progress(
+            5, "石器オルソ / 輪郭 / 断面生成を開始"
+        )
+        written = render_once(ppu)
+
+        # File-size mode uses a measured low-resolution compression ratio.
+        # If the real full-resolution PNG still exceeds the selected cap,
+        # perform one conservative corrective re-render.
+        if target_mb is not None and (export_png_plain or export_png_outline):
+            target_bytes = float(target_mb) * 1_000_000.0
+            png_now = [
+                path for path in written
+                if path.suffix.lower() == ".png" and path.exists()
+            ]
+            max_actual = max(
+                (float(path.stat().st_size) for path in png_now),
+                default=0.0,
+            )
+            if max_actual > target_bytes:
+                correction = math.sqrt(target_bytes / max_actual) * 0.90
+                correction = max(0.05, min(0.98, correction))
+                ppu *= correction
+                shutil.rmtree(staging, ignore_errors=True)
+                staging.mkdir(parents=True, exist_ok=False)
+                self._set_export_progress(
+                    5,
+                    "PNG容量を目標値へ補正して再生成中",
+                )
+                written = render_once(ppu)
                 png_now = [
                     path for path in written
                     if path.suffix.lower() == ".png" and path.exists()
@@ -9177,110 +8531,62 @@ class MainWindow(QMainWindow):
                     default=0.0,
                 )
                 if max_actual > target_bytes:
-                    correction = math.sqrt(target_bytes / max_actual) * 0.90
-                    correction = max(0.05, min(0.98, correction))
-                    ppu *= correction
-                    shutil.rmtree(staging, ignore_errors=True)
-                    staging.mkdir(parents=True, exist_ok=False)
-                    self._set_export_progress(
-                        5,
-                        "PNG容量を目標値へ補正して再生成中",
-                    )
-                    written = render_once(ppu)
-                    png_now = [
-                        path for path in written
-                        if path.suffix.lower() == ".png" and path.exists()
-                    ]
-                    max_actual = max(
-                        (float(path.stat().st_size) for path in png_now),
-                        default=0.0,
-                    )
-                    if max_actual > target_bytes:
-                        raise RuntimeError(
-                            f"PNG容量を {target_mb:g} MB 以下に収められませんでした。"
-                            "S/M/Lを1段階大きくするか、出力面を減らしてください。"
-                        )
-
-            png_files = [p for p in written if p.suffix.lower() == ".png"]
-            svg_files = [p for p in written if p.suffix.lower() == ".svg"]
-
-            if export_png_plain:
-                plain_pngs = [
-                    p for p in png_files
-                    if not p.stem.endswith("_outline")
-                ]
-                if not plain_pngs:
                     raise RuntimeError(
-                        "「PNGのみ」がONですがPNGが生成されませんでした。"
+                        f"PNG容量を {target_mb:g} MB 以下に収められませんでした。"
+                        "S/M/Lを1段階大きくするか、出力面を減らしてください。"
                     )
-            if export_png_outline:
-                outlined_pngs = [
-                    p for p in png_files
-                    if p.stem.endswith("_outline")
-                ]
-                if not outlined_pngs:
-                    raise RuntimeError(
-                        "「PNG+輪郭」がONですが輪郭付きPNGが生成されませんでした。"
-                    )
-            if export_svg and not svg_files:
+
+        png_files = [p for p in written if p.suffix.lower() == ".png"]
+        svg_files = [p for p in written if p.suffix.lower() == ".svg"]
+
+        if export_png_plain:
+            plain_pngs = [
+                p for p in png_files
+                if not p.stem.endswith("_outline")
+            ]
+            if not plain_pngs:
                 raise RuntimeError(
-                    "「SVG」がONですがSVGが生成されませんでした。"
+                    "「PNGのみ」がONですがPNGが生成されませんでした。"
                 )
-
-            for path in png_files:
-                self._verify_png_file(path)
-            for path in svg_files:
-                self._verify_svg_file(path)
-
-            # Refresh displayed estimate with the actual largest PNG size.
-            if png_files:
-                actual_bpp = self._png_bytes_per_pixel(png_files)
-                if actual_bpp is not None:
-                    self.lithic_png_bpp_estimate = actual_bpp
-                largest_png = max(png_files, key=lambda path: path.stat().st_size)
-                from PIL import Image
-                with Image.open(largest_png) as im:
-                    w_px, h_px = im.size
-                actual_mb = largest_png.stat().st_size / 1_000_000.0
-                self.lithic_output_size_label.setText(
-                    f"実出力: {w_px:,} × {h_px:,} px / "
-                    f"最大PNG {actual_mb:.1f} MB"
-                    + (
-                        f" / {int(round(png_dpi))} dpi metadata"
-                        if png_dpi is not None else ""
-                    )
+        if export_png_outline:
+            outlined_pngs = [
+                p for p in png_files
+                if p.stem.endswith("_outline")
+            ]
+            if not outlined_pngs:
+                raise RuntimeError(
+                    "「PNG+輪郭」がONですが輪郭付きPNGが生成されませんでした。"
                 )
+        if export_svg and not svg_files:
+            raise RuntimeError(
+                "「SVG」がONですがSVGが生成されませんでした。"
+            )
 
-            final_dir = self._lithic_final_output_dir()
-            merged = self._merge_layout_files_with_confirmation(
-                staging,
-                final_dir,
-                "石器 展開図",
-            )
-            if merged is None:
-                shutil.rmtree(staging, ignore_errors=True)
-                self._set_export_progress(0, "展開図出力をキャンセルしました")
-                return
+        for path in png_files:
+            self._verify_png_file(path)
+        for path in svg_files:
+            self._verify_svg_file(path)
 
-            self._set_export_progress(
-                100,
-                f"展開図出力完了: {final_dir}",
+        # Refresh displayed estimate with the actual largest PNG size.
+        if png_files:
+            actual_bpp = self._png_bytes_per_pixel(png_files)
+            if actual_bpp is not None:
+                self.lithic_png_bpp_estimate = actual_bpp
+            largest_png = max(png_files, key=lambda path: path.stat().st_size)
+            from PIL import Image
+            with Image.open(largest_png) as im:
+                w_px, h_px = im.size
+            actual_mb = largest_png.stat().st_size / 1_000_000.0
+            self.lithic_output_size_label.setText(
+                f"実出力: {w_px:,} × {h_px:,} px / "
+                f"最大PNG {actual_mb:.1f} MB"
+                + (
+                    f" / {int(round(png_dpi))} dpi metadata"
+                    if png_dpi is not None else ""
+                )
             )
-            QMessageBox.information(
-                self,
-                "展開図出力",
-                f"展開図を書き出しました。\n保存先: {final_dir}\n"
-                f"出力ファイル: {len(merged)}",
-            )
-        except Exception as e:
-            if staging is not None and staging.exists():
-                shutil.rmtree(staging, ignore_errors=True)
-            self._set_export_progress(0, "展開図出力失敗")
-            self._show_error("石器 展開図出力エラー", e)
-        finally:
-            QApplication.restoreOverrideCursor()
-            if self.asset is not None:
-                self.lithic_ortho_export_btn.setEnabled(True)
+
+        return written
 
     def _write_lithic_transform_files(
         self,
@@ -9325,84 +8631,6 @@ class MainWindow(QMainWindow):
 
         return written
 
-    def _export_lithic_ply_files(self):
-        if not self._confirm_lithic_export_without_measurements(
-            "PLY / Transform出力"
-        ):
-            return
-
-        staging = None
-        try:
-            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-            self.lithic_ply_export_btn.setEnabled(False)
-            staging = self._lithic_component_staging_dir("ply")
-
-            final_m = np.asarray(
-                self.lithic_confirmed_final_matrix,
-                dtype=float,
-            )
-            stem = self.asset.source_path.stem
-            mesh_path = staging / f"{stem}_rev.ply"
-
-            self._set_export_progress(
-                10, f"正規化PLYを書き出し中: {mesh_path.name}"
-            )
-            export_normalized_mesh(self.asset, final_m, mesh_path)
-            self._set_export_progress(70, "Transform情報を書き出し中")
-            self._write_lithic_transform_files(staging, final_m)
-
-            final_dir = self._lithic_final_output_dir()
-            merged = self._merge_component_files(staging, final_dir)
-
-            self._set_export_progress(
-                100,
-                f"PLY / Transform出力完了: {final_dir}",
-            )
-            QMessageBox.information(
-                self,
-                "PLY / Transform出力",
-                f"PLYとTransform情報を書き出しました。\n"
-                f"保存先: {final_dir}\n"
-                f"出力ファイル: {len(merged)}",
-            )
-        except Exception as e:
-            if staging is not None and staging.exists():
-                shutil.rmtree(staging, ignore_errors=True)
-            self._set_export_progress(0, "PLY / Transform出力失敗")
-            self._show_error("石器 PLY / Transform出力エラー", e)
-        finally:
-            QApplication.restoreOverrideCursor()
-            if self.asset is not None:
-                self.lithic_ply_export_btn.setEnabled(True)
-
-    def _finish_lithic_and_next(self):
-        """Mark split export work complete and advance the input queue."""
-        if not self.asset or not self._is_lithic():
-            return
-
-        final_dir = OUTPUT_DIR / self.asset.source_path.stem
-        if not final_dir.exists():
-            answer = QMessageBox.question(
-                self,
-                "出力なし",
-                "この資料ではまだ出力ファイルが作成されていません。\n"
-                "出力なしで完了扱いにして次のファイルへ進みますか？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if answer != QMessageBox.StandardButton.Yes:
-                return
-            final_dir.mkdir(parents=True, exist_ok=True)
-
-        marker = final_dir / SPLIT_EXPORT_IN_PROGRESS_MARKER
-        if marker.exists():
-            marker.unlink()
-
-        self.statusBar().showMessage(
-            f"完了: {self.asset.source_path.name} — 次のファイルへ進みます。"
-        )
-        self.scan_queue_and_load()
-
     def _require_confirmed_pottery_pose(self) -> bool:
         if not self.asset or self._is_lithic() or not self.posture_done:
             QMessageBox.warning(
@@ -9410,151 +8638,6 @@ class MainWindow(QMainWindow):
             )
             return False
         return True
-
-    def _confirm_pottery_export_without_measurements(
-        self,
-        product_label: str,
-    ) -> bool:
-        if not self._require_confirmed_pottery_pose():
-            return False
-        final_matrix = np.asarray(self._current_final_matrix(), dtype=float)
-        if self._inventory_is_current(final_matrix):
-            return True
-        answer = QMessageBox.question(
-            self,
-            "計測データ未保存",
-            "現在の姿勢・単位に対応する計測データが保存されていません。\n\n"
-            f"計測データを保存せずに「{product_label}」を実行しますか？",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        return answer == QMessageBox.StandardButton.Yes
-
-    def _pottery_final_output_dir(self) -> Path:
-        if not self.asset:
-            raise RuntimeError("モデルが読み込まれていません。")
-        final_dir = OUTPUT_DIR / self.asset.source_path.stem
-        final_dir.mkdir(parents=True, exist_ok=True)
-        (final_dir / SPLIT_EXPORT_IN_PROGRESS_MARKER).touch(exist_ok=True)
-        return final_dir
-
-    def _pottery_component_staging_dir(self, component: str) -> Path:
-        if not self.asset:
-            raise RuntimeError("モデルが読み込まれていません。")
-        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        staging = OUTPUT_DIR / (
-            f"{self.asset.source_path.stem}.__working_pottery_{component}__"
-        )
-        if staging.exists():
-            shutil.rmtree(staging)
-        staging.mkdir(parents=True, exist_ok=False)
-        return staging
-
-    def _remove_existing_pottery_layout_files(
-        self,
-        final_dir: Path,
-        branch: str,
-    ) -> None:
-        if not self.asset or not final_dir.exists():
-            return
-        stem = self.asset.source_path.stem
-        for path in list(final_dir.iterdir()):
-            if not path.is_file():
-                continue
-            name = path.name
-            if branch == "cylindrical":
-                if name.startswith(f"{stem}_cylindrical_"):
-                    path.unlink()
-                continue
-            if branch == "fan":
-                if name.startswith(f"{stem}_fan_"):
-                    path.unlink()
-                continue
-            if path.suffix.lower() not in (".png", ".svg"):
-                continue
-            ortho_tokens = (
-                f"{stem}_ortho_",
-                f"{stem}_front_",
-                f"{stem}_back_",
-                f"{stem}_left_",
-                f"{stem}_right_",
-                f"{stem}_top_",
-                f"{stem}_bottom_",
-                f"{stem}_section",
-            )
-            if name.startswith(ortho_tokens):
-                path.unlink()
-
-    def _export_pottery_measurements(self):
-        if not self._require_confirmed_pottery_pose():
-            return
-        staging = None
-        try:
-            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-            self.pottery_measurement_export_btn.setEnabled(False)
-            self._set_export_progress(5, "土器 計測データを書き出し中")
-            final_m = np.asarray(self._current_final_matrix(), dtype=float)
-            staging = self._pottery_component_staging_dir("measurements")
-            self._write_individual_measurement_csv(staging, final_m)
-            if not self.export_measurement_inventory(show_message=False):
-                raise RuntimeError("計測一覧の更新に失敗しました。")
-            final_dir = self._pottery_final_output_dir()
-            merged = self._merge_component_files(staging, final_dir)
-            self._set_export_progress(100, f"計測データ出力完了: {final_dir}")
-            QMessageBox.information(
-                self,
-                "計測データ出力",
-                f"計測データを書き出しました。\n保存先: {final_dir}\n"
-                f"個体別CSV: {len(merged)} ファイル\n"
-                "あわせて geometry / 3D model inventory を更新しました。",
-            )
-        except Exception as e:
-            if staging is not None and staging.exists():
-                shutil.rmtree(staging, ignore_errors=True)
-            self._set_export_progress(0, "計測データ出力失敗")
-            self._show_error("土器 計測データ出力エラー", e)
-        finally:
-            QApplication.restoreOverrideCursor()
-            if self.asset is not None:
-                self.pottery_measurement_export_btn.setEnabled(True)
-
-    def _export_pottery_ply_files(self):
-        if not self._confirm_pottery_export_without_measurements(
-            "PLY / Transform出力"
-        ):
-            return
-        staging = None
-        try:
-            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-            self.pottery_ply_export_btn.setEnabled(False)
-            staging = self._pottery_component_staging_dir("ply")
-            final_m = np.asarray(self._current_final_matrix(), dtype=float)
-            stem = self.asset.source_path.stem
-            mesh_path = staging / f"{stem}_rev.ply"
-            self._set_export_progress(10, f"正規化PLYを書き出し中: {mesh_path.name}")
-            export_normalized_mesh(self.asset, final_m, mesh_path)
-            self._set_export_progress(65, "Transform情報を書き出し中")
-            export_transform_json(staging / "transform.json", self._metadata(final_m))
-            export_matrix_csv(staging / "transform_matrix.csv", final_m)
-            export_matrix_txt(staging / "transform_matrix_cloudcompare.txt", final_m)
-            final_dir = self._pottery_final_output_dir()
-            merged = self._merge_component_files(staging, final_dir)
-            self._set_export_progress(100, f"PLY / Transform出力完了: {final_dir}")
-            QMessageBox.information(
-                self,
-                "PLY / Transform出力",
-                f"PLYとTransform情報を書き出しました。\n保存先: {final_dir}\n"
-                f"出力ファイル: {len(merged)}",
-            )
-        except Exception as e:
-            if staging is not None and staging.exists():
-                shutil.rmtree(staging, ignore_errors=True)
-            self._set_export_progress(0, "PLY / Transform出力失敗")
-            self._show_error("土器 PLY / Transform出力エラー", e)
-        finally:
-            QApplication.restoreOverrideCursor()
-            if self.asset is not None:
-                self.pottery_ply_export_btn.setEnabled(True)
 
     def _validate_pottery_ortho_selection(self) -> tuple[list[str], list[str]] | None:
         views = [k for k, cb in self.view_checks.items() if cb.isChecked()]
@@ -9594,193 +8677,306 @@ class MainWindow(QMainWindow):
             return None
         return views, modes
 
-    def _export_pottery_current_layout(self):
-        branch = self._pottery_output_branch_key()
-        label = {
-            "ortho": "オルソ展開図出力",
-            "cylindrical": "円筒展開図出力",
-            "fan": "扇形展開図出力",
-        }[branch]
-        if not self._confirm_pottery_export_without_measurements(label):
-            return
-
-        staging = None
-        try:
-            if branch == "ortho":
-                selection = self._validate_pottery_ortho_selection()
-                if selection is None:
-                    return
-                views, modes = selection
-            elif branch == "cylindrical":
-                self._pottery_cylinder_segments_mm()
-            else:
-                self._pottery_fan_profile_mm()
-
-            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-            self.pottery_layout_export_btn.setEnabled(False)
-            staging = self._pottery_component_staging_dir(branch)
-
-            if branch == "ortho":
-                export_png_plain = self.output_png.isChecked()
-                export_svg = self.output_svg.isChecked()
-                export_png_outline = self.outline_overlay.isChecked()
-                if export_png_plain or export_png_outline:
-                    resolution = self._resolve_pottery_ortho_resolution(
-                        views, modes, preflight=True
-                    )
-                    if resolution is None:
-                        shutil.rmtree(staging, ignore_errors=True)
-                        return
-                else:
-                    context = self._build_pottery_ortho_layout_context(
-                        views, modes, float(self.view_spacing.value())
-                    )
-                    resolution = {
-                        "ppu": ORTHO_COMPOSITE_LONG_EDGE_PX / max(
-                            float(context["sheet_w"]),
-                            float(context["sheet_h"]),
-                            1.0e-9,
-                        ),
-                        "png_dpi": None,
-                        "target_mb": None,
-                        "context": context,
-                    }
-
-                def ortho_progress(frac: float, message: str):
-                    self._set_export_progress(5 + int(88 * float(frac)), message)
-
-                written = self.export_orthos(
-                    staging,
-                    views=views,
-                    modes=modes,
-                    spacing_mm=float(self.view_spacing.value()),
-                    scale_bar_mm=self._selected_scale_bar_mm(),
-                    outline_width_px=self._selected_outline_width_px(),
-                    individual=self.export_individual.isChecked(),
-                    export_png_plain=export_png_plain,
-                    export_svg=export_svg,
-                    export_png_outline=export_png_outline,
-                    progress_callback=ortho_progress,
-                    pixels_per_model_unit=float(resolution["ppu"]),
-                    png_dpi=resolution.get("png_dpi"),
-                    layout_context=resolution["context"],
+    def _render_pottery_item_drawings(self, staging: Path, branch: str) -> list[Path]:
+        if branch == "ortho":
+            selection = self._validate_pottery_ortho_selection()
+            if selection is None:
+                return []
+            views, modes = selection
+        label = {"cylindrical": "円筒展開図", "fan": "扇形展開図"}.get(branch, "オルソ展開図")
+        if branch == "ortho":
+            export_png_plain = self.output_png.isChecked()
+            export_svg = self.output_svg.isChecked()
+            export_png_outline = self.outline_overlay.isChecked()
+            if export_png_plain or export_png_outline:
+                resolution = self._resolve_pottery_ortho_resolution(
+                    views, modes, preflight=True
                 )
-
-                target_mb = resolution.get("target_mb")
-                png_files = [p for p in written if p.suffix.lower() == ".png"]
-                if target_mb is not None and png_files:
-                    largest = max(p.stat().st_size for p in png_files)
-                    target_bytes = float(target_mb) * 1_000_000.0
-                    if largest > target_bytes:
-                        ratio = math.sqrt(target_bytes / max(largest, 1)) * 0.97
-                        corrected_ppu = max(0.01, float(resolution["ppu"]) * ratio)
-                        shutil.rmtree(staging)
-                        staging.mkdir(parents=True, exist_ok=False)
-                        written = self.export_orthos(
-                            staging,
-                            views=views,
-                            modes=modes,
-                            spacing_mm=float(self.view_spacing.value()),
-                            scale_bar_mm=self._selected_scale_bar_mm(),
-                            outline_width_px=self._selected_outline_width_px(),
-                            individual=self.export_individual.isChecked(),
-                            export_png_plain=export_png_plain,
-                            export_svg=export_svg,
-                            export_png_outline=export_png_outline,
-                            progress_callback=ortho_progress,
-                            pixels_per_model_unit=corrected_ppu,
-                            png_dpi=None,
-                            layout_context=resolution["context"],
-                        )
-                for p in [x for x in written if x.suffix.lower() == ".png"]:
-                    self._verify_png_file(p)
-                for p in [x for x in written if x.suffix.lower() == ".svg"]:
-                    self._verify_svg_file(p)
-            else:
-                self._set_export_progress(5, f"{label}を生成中")
-                written = self.export_pottery_curved_unwrap(
-                    staging,
-                    kind=branch,
-                    preview_long_edge_px=None,
-                    preflight=True,
-                )
-                if not written:
+                if resolution is None:
                     shutil.rmtree(staging, ignore_errors=True)
-                    return
-                for p in [x for x in written if x.suffix.lower() == ".png"]:
-                    self._verify_png_file(p)
+                    return []
+            else:
+                context = self._build_pottery_ortho_layout_context(
+                    views, modes, float(self.view_spacing.value())
+                )
+                resolution = {
+                    "ppu": ORTHO_COMPOSITE_LONG_EDGE_PX / max(
+                        float(context["sheet_w"]),
+                        float(context["sheet_h"]),
+                        1.0e-9,
+                    ),
+                    "png_dpi": None,
+                    "target_mb": None,
+                    "context": context,
+                }
 
-            final_dir = self._pottery_final_output_dir()
-            merged = self._merge_layout_files_with_confirmation(
+            def ortho_progress(frac: float, message: str):
+                self._set_export_progress(5 + int(88 * float(frac)), message)
+
+            written = self.export_orthos(
                 staging,
-                final_dir,
-                label,
+                views=views,
+                modes=modes,
+                spacing_mm=float(self.view_spacing.value()),
+                scale_bar_mm=self._selected_scale_bar_mm(),
+                outline_width_px=self._selected_outline_width_px(),
+                individual=self.export_individual.isChecked(),
+                export_png_plain=export_png_plain,
+                export_svg=export_svg,
+                export_png_outline=export_png_outline,
+                progress_callback=ortho_progress,
+                pixels_per_model_unit=float(resolution["ppu"]),
+                png_dpi=resolution.get("png_dpi"),
+                layout_context=resolution["context"],
             )
-            if merged is None:
-                shutil.rmtree(staging, ignore_errors=True)
-                self._set_export_progress(0, f"{label}をキャンセルしました")
-                return
-            self._set_export_progress(100, f"{label}完了: {final_dir}")
-            QMessageBox.information(
-                self,
-                label,
-                f"書き出しが完了しました。\n保存先: {final_dir}\n"
-                f"出力ファイル: {len(merged)}\n\n"
-                "出力方式を切り替えると、同じ資料について別の展開図を続けて出力できます。",
+
+            target_mb = resolution.get("target_mb")
+            png_files = [p for p in written if p.suffix.lower() == ".png"]
+            if target_mb is not None and png_files:
+                largest = max(p.stat().st_size for p in png_files)
+                target_bytes = float(target_mb) * 1_000_000.0
+                if largest > target_bytes:
+                    ratio = math.sqrt(target_bytes / max(largest, 1)) * 0.97
+                    corrected_ppu = max(0.01, float(resolution["ppu"]) * ratio)
+                    shutil.rmtree(staging)
+                    staging.mkdir(parents=True, exist_ok=False)
+                    written = self.export_orthos(
+                        staging,
+                        views=views,
+                        modes=modes,
+                        spacing_mm=float(self.view_spacing.value()),
+                        scale_bar_mm=self._selected_scale_bar_mm(),
+                        outline_width_px=self._selected_outline_width_px(),
+                        individual=self.export_individual.isChecked(),
+                        export_png_plain=export_png_plain,
+                        export_svg=export_svg,
+                        export_png_outline=export_png_outline,
+                        progress_callback=ortho_progress,
+                        pixels_per_model_unit=corrected_ppu,
+                        png_dpi=None,
+                        layout_context=resolution["context"],
+                    )
+            for p in [x for x in written if x.suffix.lower() == ".png"]:
+                self._verify_png_file(p)
+            for p in [x for x in written if x.suffix.lower() == ".svg"]:
+                self._verify_svg_file(p)
+        else:
+            self._set_export_progress(5, f"{label}を生成中")
+            written = self.export_pottery_curved_unwrap(
+                staging,
+                kind=branch,
+                preview_long_edge_px=None,
+                preflight=True,
             )
-        except Exception as e:
-            if staging is not None and staging.exists():
+            if not written:
                 shutil.rmtree(staging, ignore_errors=True)
-            self._set_export_progress(0, f"{label}失敗")
-            self._show_error(f"土器 {label}エラー", e)
+                return []
+            for p in [x for x in written if x.suffix.lower() == ".png"]:
+                self._verify_png_file(p)
+
+        return written
+
+    def _export_item(self):
+        if not (
+            self._require_confirmed_lithic_pose()
+            if self._is_lithic() else self._require_confirmed_pottery_pose()
+        ):
+            return
+        layouts = ["ortho"] if self._is_lithic() else [
+            name for name, checkbox in self.pottery_export_layouts.items()
+            if checkbox.isChecked()
+        ]
+        if not layouts:
+            QMessageBox.warning(self, "未選択", "少なくとも1つの図版を選択してください。")
+            return
+        final_matrix = self._measurement_final_matrix()
+        self.item_export_active = True
+        self.centralWidget().setEnabled(False)
+        self.reload_action.setEnabled(False)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix=".aom-item-", dir=OUTPUT_DIR) as workspace:
+                staging = Path(workspace) / "item"
+                staging.mkdir()
+                roles = {}
+                for layout in layouts:
+                    drawing_dir = Path(workspace) / layout
+                    drawing_dir.mkdir()
+                    written = (
+                        self._render_lithic_item_drawings(drawing_dir)
+                        if self._is_lithic()
+                        else self._render_pottery_item_drawings(drawing_dir, layout)
+                    )
+                    if not written:
+                        self._set_export_progress(0, "資料の書き出しを中止しました")
+                        return
+                    for path in written:
+                        target = staging / path.name
+                        if target.exists():
+                            raise RuntimeError(f"出力名が重複しています: {path.name}")
+                        path.rename(target)
+                        roles[path.name] = (
+                            "drawing_settings" if path.suffix == ".json" else "drawing",
+                            layout,
+                        )
+                self._set_export_progress(95, "計測・品質・変換情報を保存中")
+                self.last_item_output = self._publish_item(staging, final_matrix, roles)
+            self._set_export_progress(100, f"資料出力完了: {self.last_item_output}")
+            QMessageBox.information(self, "資料出力", f"保存先: {self.last_item_output}")
+        except Exception as exc:
+            self._set_export_progress(0, "資料の書き出しに失敗しました")
+            self._show_error("資料出力エラー", exc)
         finally:
             QApplication.restoreOverrideCursor()
-            if self.asset is not None:
-                self.pottery_layout_export_btn.setEnabled(True)
+            self.reload_action.setEnabled(True)
+            self.centralWidget().setEnabled(True)
+            self.item_export_active = False
 
-    def _finish_pottery_and_next(self):
-        if not self.asset or self._is_lithic():
+    def closeEvent(self, event):
+        if getattr(self, "item_export_active", False):
+            event.ignore()
             return
-        final_dir = OUTPUT_DIR / self.asset.source_path.stem
-        if not final_dir.exists():
-            answer = QMessageBox.question(
-                self,
-                "出力なし",
-                "この資料ではまだ出力ファイルが作成されていません。\n"
-                "出力なしで完了扱いにして次のファイルへ進みますか？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if answer != QMessageBox.StandardButton.Yes:
-                return
-            final_dir.mkdir(parents=True, exist_ok=True)
-        marker = final_dir / SPLIT_EXPORT_IN_PROGRESS_MARKER
-        if marker.exists():
-            marker.unlink()
-        self.statusBar().showMessage(
-            f"完了: {self.asset.source_path.name} — 次のファイルへ進みます。"
-        )
-        self.scan_queue_and_load()
+        super().closeEvent(event)
 
-    def save_current_and_next(self):
-        """Legacy compatibility entry point.
+    def _publish_item(self, staging: Path, final_matrix: np.ndarray, roles: dict) -> Path:
+        from PIL import Image
 
-        v1.0.0 keeps pottery outputs separated so that orthographic, cylindrical,
-        and fan developments can be exported consecutively before advancing.
-        """
+        stem = self.asset.source_path.stem
+        artifact_type = "lithic" if self._is_lithic() else "pottery"
+        revision_id = uuid4().hex
+        created_at = item_output.utc_now()
+        model = self._measure_input_mesh()
+        rows = self._measurement_rows(final_matrix)
+        sections = [row for row in rows if row["record_type"] == "section_bbox"]
+        measurement_path = staging / f"{stem}_measurements.csv"
+        quality_path = staging / f"{stem}_quality.json"
+        measurement_rows = []
+        for row in rows:
+            whole = row["record_type"] == "model_bbox"
+            measurement_rows.append({
+                "item_id": stem,
+                "revision_id": revision_id,
+                "artifact_type": artifact_type,
+                "source_file": model["source_file"],
+                "source_stem": stem,
+                "source_sha256": model["source_sha256"],
+                "input_unit": self.asset.input_unit,
+                **row,
+                "surface_area_mm2": model["surface_area_mm2"] if whole else "",
+                "volume_mm3": model["volume_mm3"] if whole else "",
+            })
+        with measurement_path.open("w", encoding="utf-8-sig", newline="") as file:
+            writer = csv.DictWriter(file, fieldnames=list(measurement_rows[0]))
+            writer.writeheader()
+            writer.writerows(measurement_rows)
+
+        checks = {
+            "source_dependencies": self.item_source["status"],
+            "normals": self.asset.normals_status,
+            "appearance": self.asset.appearance_kind,
+            "volume": model["volume_status"],
+        }
+        warnings = []
+        if checks["source_dependencies"] != "complete":
+            warnings.append("input_dependencies_incomplete")
+        if model["volume_status"] != "closed_mesh":
+            warnings.append(model["volume_status"])
+        if checks["normals"] == "missing_recalculated":
+            warnings.append("source_normals_missing")
+        if any(row["status"] != "ok" for row in sections):
+            warnings.append("section_without_intersection")
+        quality = {
+            "schema_version": item_output.SCHEMA_VERSION,
+            "item_id": stem,
+            "revision_id": revision_id,
+            "checks": checks,
+            "warnings": warnings,
+            "mesh_checked": "loaded_analysis_mesh",
+            "vertices": len(self.asset.mesh.vertices),
+            "faces": model["mesh_count"],
+            "source_file_size_bytes": model["file_size_bytes"],
+            "is_watertight": model["is_watertight"],
+            "source_normals_present": self.asset.source_normals_present,
+            "notes": self.asset.notes,
+            "sections": [{"id": row["record_id"], "status": row["status"]} for row in sections],
+            "verified_drawings": sorted(
+                name for name, (role, _) in roles.items() if role == "drawing"
+            ),
+        }
+        item_output.write_json(quality_path, quality)
+
+        export_normalized_mesh(self.asset, final_matrix, staging / f"{stem}_rev.ply")
         if self._is_lithic():
-            QMessageBox.information(
-                self,
-                "石器出力",
-                "石器は個別の出力ボタンを使用してください。",
-            )
+            self._write_lithic_transform_files(staging, final_matrix)
+        else:
+            export_transform_json(staging / "transform.json", self._metadata(final_matrix))
+            export_matrix_csv(staging / "transform_matrix.csv", final_matrix)
+            export_matrix_txt(staging / "transform_matrix_cloudcompare.txt", final_matrix)
+        roles[measurement_path.name] = ("measurements", None)
+        roles[quality_path.name] = ("quality", None)
+        roles[f"{stem}_rev.ply"] = ("normalized_model", None)
+        outputs = []
+        for path in sorted(staging.iterdir()):
+            role, layout = roles.get(path.name, ("transform", None))
+            record = item_output.file_record(path, path.name, role)
+            if not record["size_bytes"]:
+                raise RuntimeError(f"出力ファイルが空です: {path.name}")
+            record["format"] = path.suffix.lower().lstrip(".")
+            if layout:
+                record["layout"] = layout
+            if path.suffix == ".png":
+                with Image.open(path) as image:
+                    record["width_px"], record["height_px"] = image.size
+                    record["dpi"] = image.info.get("dpi")
+            outputs.append(record)
+
+        item_output.write_json(staging / item_output.MANIFEST, {
+            "schema_version": item_output.SCHEMA_VERSION,
+            "item_id": stem,
+            "item_id_basis": "input_stem",
+            "revision_id": revision_id,
+            "artifact_type": artifact_type,
+            "application": {"name": APP_NAME, "version": APP_VERSION},
+            "created_at": created_at,
+            "input_unit": self.asset.input_unit,
+            "inputs": self.item_source,
+            "outputs": outputs,
+        })
+        destination = OUTPUT_DIR / stem
+        if destination.exists():
+            revisions = destination / "revisions"
+            revisions.mkdir(exist_ok=True)
+            destination = revisions / revision_id
+        staging.rename(destination)
+        return destination
+
+    def _append_item_inventory(self):
+        folder = getattr(self, "last_item_output", None)
+        if folder is None:
+            QMessageBox.warning(self, "資料未出力", "先に「資料を書き出す」を実行してください。")
             return
-        QMessageBox.information(
-            self,
-            "土器出力",
-            "v1.0.0では「計測データ出力」「現在の展開図を出力」"
-            "「PLY / Transform出力」を個別に使用し、最後に「次のファイルへ」を押します。",
-        )
+        inventory = OUTPUT_DIR / item_output.INVENTORY
+        lock = QLockFile(str(inventory) + ".lock")
+        try:
+            if not lock.tryLock(0):
+                raise RuntimeError("一覧表を別の処理が更新中です。再試行してください。")
+            item_output.append_inventory(inventory, item_output.inventory_row(folder, OUTPUT_DIR))
+        except (OSError, ValueError, RuntimeError, KeyError) as exc:
+            self._show_error("一覧表への追加エラー", exc)
+        else:
+            QMessageBox.information(self, "一覧表に追加", f"対象: {folder}\n保存先: {inventory}")
+        finally:
+            if lock.isLocked():
+                lock.unlock()
+
+    def _advance_item(self):
+        if self.asset is None:
+            return
+        if not self._input_output_is_complete(self.asset.source_path):
+            QMessageBox.warning(self, "資料未出力", "先に「資料を書き出す」を実行してください。")
+            return
+        self.scan_queue_and_load()
 
     @staticmethod
     def _verify_png_file(path: Path) -> None:
