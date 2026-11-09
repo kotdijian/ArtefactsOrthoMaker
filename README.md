@@ -17,15 +17,16 @@ Repository: https://github.com/kotdijian/ArtefactsOrthoMaker
 ## 目次
 
 - [概要](#overview)
-- [最初に読む：`input/`・`output/`・処理キュー](#input-output)
-  - [処理対象を置く場所](#input-files)
-  - [入力対応ファイル](#supported-input-files)
-  - [出力先とスキップ条件](#output-skip)
-  - [CLI初心者向け：最短利用手順](#quick-start)
-- [Python 環境・実行方法](#python-environment)
-  - [Pythonが未インストールの場合](#python-install)
-  - [macOS：初回セットアップ](#macos-setup)
-  - [Windows / PowerShell：初回セットアップ](#windows-setup)
+- [はじめて使う方へ](#python-environment)
+  - [1. Pythonのインストール](#python-install)
+  - [2. フォルダ（ディレクトリ）の整備](#folder-setup)
+    - [処理対象を置く場所](#input-files)
+    - [入力対応ファイル](#supported-input-files)
+    - [出力先とスキップ条件](#output-skip)
+  - [3. 初期設定と起動](#initial-setup)
+    - [macOSの初期設定](#macos-setup)
+    - [Windowsの初期設定](#windows-setup)
+    - [2回目以降の起動](#run-again)
   - [環境確認スクリプト](#environment-check-script)
   - [よくあるエラー](#troubleshooting)
   - [SELF TEST](#self-test)
@@ -66,11 +67,56 @@ ArtefactsOrthoMaker は OBJ / PLY / GLB 形式の考古資料3Dモデルを読�
 - 資料別計測 CSV
 - geometry / 3D model inventory
 
+<a id="python-environment"></a>
+<a id="quick-start"></a>
+## はじめて使う方へ
+
+初回は **1. Pythonのインストール → 2. フォルダ（ディレクトリ）の整備 → 3. 初期設定と起動** の順に進めてください。コードブロック内のコマンドは、macOSでは「ターミナル」、Windowsでは「PowerShell」に1行ずつ入力し、Enterを押して実行します。
+
+<a id="python-install"></a>
+### 1. Pythonのインストール
+
+このアプリは **Python 3.13.x** を推奨します。すでに下記の確認コマンドで `Python 3.13.x` と表示される場合は、[2. フォルダの整備](#folder-setup)へ進んでください。新規導入には、公式インストーラーが提供されている [Python 3.13.17 の配布ページ](https://www.python.org/downloads/release/python-31317/#files)を使います。
+
+#### Windows
+
+1. 配布ページの **Files** から **Windows installer (64-bit)** をダウンロードします。これはシステムの種類が **x64** のPC向けです。PCの種類は **設定 → システム → バージョン情報 → システムの種類** で確認できます。ARM64のPCには同じページに **Windows installer (ARM64)** があります。
+2. ダウンロードした `.exe` をダブルクリックします。最初の画面で **Add python.exe to PATH** にチェックを入れ、**Install Now** をクリックします。
+3. インストールが完了したら、スタートメニューから新しい **PowerShell** を開き、次を実行します。
+
+```powershell
+python --version
+```
+
+`Python 3.13.17` のように `3.13.` で始まるバージョンが表示されれば、[2. フォルダの整備](#folder-setup)へ進みます。コマンドが見つからない場合は、PowerShellを閉じて開き直し、インストール時にPATH追加を有効にしたか確認してください。別のバージョンが表示される場合は、`py -3.13 --version` も試してください。こちらで3.13系が確認できた場合の仮想環境作成方法は、[Windowsの初期設定](#windows-setup)に記載しています。
+
+#### macOS
+
+1. 配布ページの **Files** から **macOS installer** をダウンロードします。Apple SiliconとIntel Macの両方に対応します。
+2. ダウンロードした `.pkg` を開き、画面の案内に沿ってインストールします。
+3. 新しい「ターミナル」を開き、次を実行します。
+
+```bash
+python3.13 --version
+```
+
+`Python 3.13.17` のように `3.13.` で始まるバージョンが表示されれば、[2. フォルダの整備](#folder-setup)へ進みます。
+
+<a id="folder-setup"></a>
+### 2. フォルダ（ディレクトリ）の整備
+
+1. [GitHubのリポジトリ](https://github.com/kotdijian/ArtefactsOrthoMaker)をブラウザーで開き、緑色の **Code → Download ZIP** を選びます。
+2. ダウンロードしたZIPを展開します。WindowsではZIPを右クリックして **すべて展開**、macOSではZIPをダブルクリックします。
+3. 展開先を開き、`app.py`、`pose_core.py`、`requirements.txt` が並んでいるフォルダを探します。ZIPで取得した場合、フォルダ名は通常 `ArtefactsOrthoMaker-main` です。このフォルダを以後「プロジェクトフォルダ」と呼びます。ZIPに含まれるファイル一式をそのまま使います。`pose_core.py` は同梱の必須ファイルです。
+4. プロジェクトフォルダ内の小文字の `input` フォルダに、処理したい3Dモデルを入れます。フォルダがなければ作成してください。対応形式と出力先は下記のとおりです。
+
+Gitを使っている場合は、ZIPの代わりに `git clone https://github.com/kotdijian/ArtefactsOrthoMaker.git` で取得できます。すでにクローン済みの場合は、`app.py` がある既存のプロジェクトフォルダを使います。
+
 <a id="input-output"></a>
-## 最初に読む：`input/`・`output/`・処理キュー
+#### `input/`・`output/`・処理キュー
 
 > [!IMPORTANT]
-> 実際に使用するフォルダ名は **小文字の `input/` と `output/`** です。Cloneした場合もZIPを展開した場合も、**`app.py` があるフォルダを基準**にします。`Input/` や `Output/` という別名を自分で作る必要はありません。
+> 実際に使用するフォルダ名は **小文字の `input/` と `output/`** です。Cloneした場合もZIPを展開した場合も、**`app.py` があるフォルダを基準**にします。フォルダ名は小文字でそろえてください。
 
 ArtefactsOrthoMaker は、起動時に `app.py` と同じ階層を作業ルートとして扱います。処理対象はその直下の `input/`、処理結果は同じ作業ルート直下の `output/` に保存します。
 
@@ -90,10 +136,10 @@ ArtefactsOrthoMaker/
         └── ...
 ```
 
-`input/` と `output/` が存在しない場合は、アプリ起動時に自動作成されます。
+`input` がなければ、`app.py` と同じ場所に小文字で `input` フォルダを作ってください。`output` はアプリ起動時に自動作成されます。
 
 <a id="input-files"></a>
-### 処理対象を置く場所
+##### 処理対象を置く場所
 
 処理したい `.obj` / `.ply` / `.glb` を、CloneまたはZIP展開した **ArtefactsOrthoMakerフォルダ内の `input/` に直接置いてください**。
 
@@ -105,7 +151,7 @@ ArtefactsOrthoMaker/
 - 同じstem（拡張子を除いたファイル名）の対応3Dファイルが複数あると、出力先が衝突するため停止します。たとえば `pot001.obj` と `pot001.ply` を同時に `input/` に置かないでください。
 
 <a id="supported-input-files"></a>
-### 入力対応ファイル
+##### 入力対応ファイル
 
 処理キューへ追加される**3Dモデル本体**は次の3形式です。
 
@@ -137,7 +183,7 @@ ArtefactsOrthoMaker/
 > `input/` に画像やMTLだけを置いても処理キューには表示されません。キュー判定の対象は `.obj`, `.ply`, `.glb` の3Dモデル本体です。
 
 <a id="output-skip"></a>
-### 出力先とスキップ条件
+##### 出力先とスキップ条件
 
 入力ファイルごとに、同じstem名のフォルダを `output/` に使用します。
 
@@ -173,175 +219,15 @@ output/pot001/.aom_in_progress
 
 また、`output/` 直下には資料別フォルダ以外に、`inventory-pottery.csv`、`inventory-lithic.csv` などの一覧CSVが作成される場合があります。
 
-<a id="quick-start"></a>
-### CLI初心者向け：最短利用手順
+<a id="initial-setup"></a>
+### 3. 初期設定と起動
 
-初回だけ、CloneまたはZIP展開したフォルダでPython環境を準備します。macOSの例：
-
-```bash
-cd /path/to/ArtefactsOrthoMaker
-python3.13 -m venv venv
-source venv/bin/activate
-python -m pip install --upgrade pip setuptools wheel
-python -m pip install -r requirements.txt
-python check_environment.py
-```
-
-次に、Finder等で処理対象を：
-
-```text
-ArtefactsOrthoMaker/input/
-```
-
-へ置きます。
-
-その後、ターミナルで：
-
-```bash
-python app.py
-```
-
-を実行します。処理結果は：
-
-```text
-ArtefactsOrthoMaker/output/
-```
-
-へ保存されます。
-
-2回目以降は、通常は次だけで起動できます。
-
-```bash
-cd /path/to/ArtefactsOrthoMaker
-source venv/bin/activate
-python app.py
-```
-
-すでに完了済みの `output/<stem>/` がある資料は自動的にスキップされ、未処理または処理途中の資料がキューに表示されます。Windowsの初回セットアップと起動方法は次節を参照してください。
-
-<a id="python-environment"></a>
-## Python 環境・実行方法
-
-リポジトリ全体を **Clone** または **ZIP** で取得してください。**`app.py` だけを単独で取得しないでください。** `pose_core.py`、`requirements.txt`、環境確認・SELF TEST用スクリプトも必要です。
-
-対応入力は `.obj`, `.ply`, `.glb` です。STL は対象外です。
-
-### 1. 推奨フォルダ構成
-
-```text
-ArtefactsOrthoMaker/
-├── app.py
-├── pose_core.py
-├── check_environment.py
-├── self_test.py
-├── requirements.txt
-├── README.md
-├── README_EN.md
-├── LICENSE
-├── LICENSE_HISTORY.md
-├── docs/
-├── archive/
-├── input/
-└── output/
-```
-
-`pose_core.py` は **pip でインストールするライブラリではなく、このアプリに含まれる必須ファイル**です。通常利用では `app.py` と同じリポジトリ内の配置を保ってください。
-
-`input/` と `output/` は存在しない場合、アプリ起動時に作成されます。過去版は `archive/versions/` に保存されています。
-
-<a id="python-install"></a>
-### 2. Pythonが未インストールの場合
-
-ArtefactsOrthoMaker は **Python 3.13.x** を推奨します。Pythonがまだ入っていない場合は、先にPython本体をインストールしてから、本READMEの仮想環境作成へ進んでください。
-
-#### macOS
-
-Python公式サイトの macOS 向けダウンロードページから、**Python 3.13系の最新安定版**の macOS installer を取得してください。
-
-- Python公式: https://www.python.org/downloads/macos/
-- Python 3.13のmacOS用installerは、Apple Silicon / Intelの双方に対応するUniversal2形式で配布されています。
-
-ダウンロードした `.pkg` を開き、標準の手順でインストールします。macOSに既存のシステム用Pythonがある場合でも、それを削除・置換する必要はありません。
-
-インストール後、新しいターミナルを開いて次を確認します。
-
-```bash
-python3.13 --version
-```
-
-例えば次のように `Python 3.13.x` と表示されれば準備完了です。
-
-```text
-Python 3.13.x
-```
-
-その後、本READMEの「macOS：初回セットアップ」に進みます。
-
-#### Windows
-
-Python公式サイトのWindows向けダウンロードページから、**Python 3.13系の最新安定版**を取得してください。
-
-- Python公式: https://www.python.org/downloads/windows/
-- 一般的な64-bit Windows PCでは、Python 3.13系の **Windows installer (64-bit)** が推奨です。
-
-通常のinstallerを使用する場合は、最初の画面に **Add Python to PATH** または同等のPATH追加オプションが表示されたら、有効にすることを推奨します。これによりPowerShellから `python` コマンドを直接実行しやすくなります。
-
-> [!NOTE]
-> Python公式ではWindows向けにPython install managerも提供されています。AOMではPython 3.13系が利用できればよく、導入方法自体は限定しません。CLI初心者は、Python公式ページからPython 3.13系の64-bit installerを使う方法が分かりやすいです。
-
-インストール完了後、**新しいPowerShellを開いて**次を確認します。
-
-```powershell
-python --version
-```
-
-例えば次のように `Python 3.13.x` と表示されれば準備完了です。
-
-```text
-Python 3.13.x
-```
-
-`python` が見つからない場合は、いったんPowerShellを閉じて開き直してください。それでも認識されない場合は、Python installerを再実行してPATH追加を有効にするか、Windowsの「環境変数を編集」でPythonのinstall directoryをPATHへ追加してください。
-
-その後、本READMEの「Windows / PowerShell：初回セットアップ」に進みます。
-
-### 3. 推奨 Python と最初の確認
-
-**Python 3.13.x** を推奨します。
-
-macOS：
-
-```bash
-python3.13 --version
-```
-
-Windows PowerShell：
-
-```powershell
-python --version
-```
-
-`Python 3.13.x` と表示されれば、以下の標準手順を使用できます。
-
-### 4. リポジトリの取得
-
-Git を使用する場合：
-
-```bash
-git clone https://github.com/kotdijian/ArtefactsOrthoMaker.git
-cd ArtefactsOrthoMaker
-```
-
-Git を使用しない場合は、GitHub の **Code → Download ZIP** でリポジトリ全体を取得し、ZIPを展開してから、そのフォルダをターミナル / PowerShell で開いてください。
+OSに合った手順に進みます。初回は、アプリ専用の仮想環境 `venv` を作り、`requirements.txt` に記載されたパッケージをまとめて導入します。
 
 <a id="macos-setup"></a>
-### 5. macOS：初回セットアップ
+#### macOS：初回セットアップ
 
-ターミナルでプロジェクトフォルダへ移動します。
-
-```bash
-cd /path/to/ArtefactsOrthoMaker
-```
+ターミナルで `cd` と半角スペースを入力し、Finderからプロジェクトフォルダをターミナルのウィンドウへドラッグして、Enterを押します。`ls` を実行して `app.py` と `requirements.txt` が表示されることを確認してください。
 
 仮想環境 `venv` を作成・有効化します。
 
@@ -376,7 +262,7 @@ python self_test.py
 python app.py
 ```
 
-#### macOS の Qt 起動エラー
+##### macOS の Qt 起動エラー
 
 本プロジェクトの検証では、`.venv` という名前の環境で Qt platform plugin の file flags に関する問題が発生した例があるため、標準手順では仮想環境名を **`venv`** としています。`.venv` が一般に使用不能という意味ではありません。
 
@@ -389,19 +275,17 @@ python -c 'from PySide6.QtWidgets import QApplication; app=QApplication([]); pri
 ```
 
 <a id="windows-setup"></a>
-### 6. Windows / PowerShell：初回セットアップ
+#### Windows / PowerShell：初回セットアップ
 
-PowerShell でプロジェクトフォルダへ移動します。
-
-```powershell
-cd C:\path\to\ArtefactsOrthoMaker
-```
+エクスプローラーでプロジェクトフォルダを開きます。アドレスバーに `powershell` と入力してEnterを押すと、そのフォルダでPowerShellが開きます。`dir` を実行して `app.py` と `requirements.txt` が表示されることを確認してください。
 
 仮想環境を作成します。
 
 ```powershell
 python -m venv venv
 ```
+
+手順1で `py -3.13 --version` を使って確認した場合は、上のコマンドの代わりに `py -3.13 -m venv venv` を実行します。
 
 有効化します。
 
@@ -437,7 +321,7 @@ python self_test.py
 python app.py
 ```
 
-### 7. requirements.txt
+#### requirements.txt
 
 v1.0.0 の `requirements.txt` では、アプリが利用する主要な第三者パッケージをversion固定しています。
 
@@ -455,10 +339,31 @@ Pillow==12.3.0
 
 Python標準ライブラリはPython本体に含まれるため、個別インストールは不要です。また、上記パッケージが必要とする内部依存パッケージは `pip` が自動的に導入します。**個別モジュールを1つずつ追加するのではなく、原則として `requirements.txt` を使用してください。**
 
-各パッケージの用途は後述の「[使用しているPythonモジュール](#使用しているpythonモジュール)」を参照してください。
+各パッケージの用途は後述の「[使用しているPythonモジュール](#python-modules)」を参照してください。
+
+<a id="run-again"></a>
+#### 2回目以降の起動
+
+初期設定時と同じプロジェクトフォルダをターミナルまたはPowerShellで開きます。仮想環境を有効にし、アプリを起動します。
+
+macOS
+
+```bash
+source venv/bin/activate
+python app.py
+```
+
+Windows
+
+```powershell
+.\venv\Scripts\Activate.ps1
+python app.py
+```
+
+Windowsでスクリプトの実行が拒否された場合は、[Windowsの初期設定](#windows-setup)の対処手順を参照してください。処理済みの資料は、[出力先とスキップ条件](#output-skip)に従って自動でスキップされます。
 
 <a id="environment-check-script"></a>
-### 8. `check_environment.py`
+#### `check_environment.py`
 
 依存関係とQt起動環境を確認するスクリプトです。
 
@@ -477,9 +382,9 @@ ENVIRONMENT CHECK PASSED
 と表示します。
 
 <a id="troubleshooting"></a>
-### 9. よくあるエラー
+#### よくあるエラー
 
-#### `ModuleNotFoundError: No module named '...'`
+##### `ModuleNotFoundError: No module named '...'`
 
 まず仮想環境が有効か確認します。
 
@@ -509,11 +414,11 @@ python check_environment.py
 
 を再実行してください。
 
-#### `No module named 'pose_core'`
+##### `No module named 'pose_core'`
 
 `pose_core.py` は pip パッケージではありません。`app.py` と `pose_core.py` が同じリポジトリ内の所定位置にあることを確認してください。
 
-#### `No module named 'scipy'`
+##### `No module named 'scipy'`
 
 SciPy は必須です。個別追加ではなく：
 
@@ -523,7 +428,7 @@ python -m pip install -r requirements.txt
 
 を実行してください。
 
-#### Qt platform plugin エラー
+##### Qt platform plugin エラー
 
 まず：
 
@@ -534,7 +439,7 @@ python check_environment.py
 でQtの段階だけが失敗しているか確認してください。macOSでは [docs/macos_qt_venv_issue.md](docs/macos_qt_venv_issue.md) も参照してください。
 
 <a id="self-test"></a>
-### 10. SELF TEST
+#### SELF TEST
 
 共通計算コアの簡易テスト：
 
@@ -551,7 +456,7 @@ SELF TEST PASSED
 `self_test.py` は主として姿勢・Normal・メッシュI/O等の共通計算を確認します。土器・石器のGUI操作、3Dビュー、インタラクティブ操作、オルソ・曲面展開は `app.py` を起動して実機確認してください。
 
 <a id="update-procedure"></a>
-### 11. 更新時の推奨手順
+#### 更新時の推奨手順
 
 Git clone した環境を更新する場合：
 
