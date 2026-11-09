@@ -76,23 +76,30 @@ ArtefactsOrthoMaker は OBJ / PLY / GLB 形式の考古資料3Dモデルを読�
 <a id="python-install"></a>
 ### 1. Pythonのインストール
 
-このアプリは **Python 3.13.x** を推奨します。すでに下記の確認コマンドで `Python 3.13.x` と表示される場合は、[2. フォルダの整備](#folder-setup)へ進んでください。新規導入には、公式インストーラーが提供されている [Python 3.13.17 の配布ページ](https://www.python.org/downloads/release/python-31317/#files)を使います。
+このアプリは **Python 3.13.x** を推奨します。お使いのOSに合った手順を選んでください。
 
 #### Windows
 
-1. 配布ページの **Files** の下に表示される **Windows** 欄の黄色いボタン **(Download Python install manager** をクリックします。ジャンプ先の **Python install manager 26.4** ページの下の方から　**Windows** **Download Installer (MSIX)** をクリックしてインストーラーをダウンロードします。これはシステムの種類が **x64** のPC向けです。PCの種類は **設定 → システム → バージョン情報 → システムの種類** で確認できます。ARM64のPCには同じページに **Windows installer (ARM64)** があります。
-2. ダウンロードした `.msix` をダブルクリックします。最初の画面で **Add python.exe to PATH** にチェックを入れ、**Install Now** をクリックします。
-3. インストールが完了したら、スタートメニューから新しい **PowerShell** を開き、次を実行します。
+すでにPowerShellで `py -3.13 --version` を実行して `Python 3.13.x` と表示される場合は、[2. フォルダの整備](#folder-setup)へ進んでください。
+
+1. [Python公式の Install Manager 配布ページ](https://www.python.org/downloads/release/pymanager-264/)を開き、**Download Installer (MSIX)** をクリックします。この `.msix` はx64とARM64の両方に対応します。
+2. ダウンロードした `.msix` をダブルクリックし、Windowsの「アプリ インストーラー」で **インストール** を選びます。
+3. スタートメニューから新しい **PowerShell** を開き、次の2行を順に実行します。1行目でPython 3.13本体をインストールし、2行目でバージョンを確認します。
 
 ```powershell
-python --version
+py install 3.13
+py -3.13 --version
 ```
 
-`Python 3.13.17` のように `3.13.` で始まるバージョンが表示されれば、[2. フォルダの整備](#folder-setup)へ進みます。コマンドが見つからない場合は、PowerShellを閉じて開き直し、インストール時にPATH追加を有効にしたか確認してください。別のバージョンが表示される場合は、`py -3.13 --version` も試してください。こちらで3.13系が確認できた場合の仮想環境作成方法は、[Windowsの初期設定](#windows-setup)に記載しています。
+`Python 3.13.` で始まるバージョンが表示されれば、[2. フォルダの整備](#folder-setup)へ進みます。Pythonが複数入っている場合は、`python --version` が別のバージョンを表示することがあるため、ここではバージョンを指定して確認します。
+
+`py install 3.13` が古いPythonランチャーの影響で動かない場合は、`pymanager install 3.13` でインストールし、`pymanager exec -V:3.13 --version` で確認できます。
 
 #### macOS
 
-1. 配布ページの **Files** から **macOS installer** をダウンロードします。Apple SiliconとIntel Macの両方に対応します。
+すでにターミナルで `python3.13 --version` を実行して `Python 3.13.x` と表示される場合は、[2. フォルダの整備](#folder-setup)へ進んでください。
+
+1. [Python 3.13.17 の公式配布ページ](https://www.python.org/downloads/release/python-31317/#files)の **Files** から **macOS installer** をダウンロードします。Apple SiliconとIntel Macの両方に対応します。
 2. ダウンロードした `.pkg` を開き、画面の案内に沿ってインストールします。
 3. 新しい「ターミナル」を開き、次を実行します。
 
@@ -279,13 +286,13 @@ python -c 'from PySide6.QtWidgets import QApplication; app=QApplication([]); pri
 
 エクスプローラーでプロジェクトフォルダを開きます。アドレスバーに `powershell` と入力してEnterを押すと、そのフォルダでPowerShellが開きます。`dir` を実行して `app.py` と `requirements.txt` が表示されることを確認してください。
 
-仮想環境を作成します。
+Python 3.13を指定して、仮想環境を作成します。
 
 ```powershell
-python -m venv venv
+py -3.13 -m venv venv
 ```
 
-手順1で `py -3.13 --version` を使って確認した場合は、上のコマンドの代わりに `py -3.13 -m venv venv` を実行します。
+手順1で `pymanager exec` を使って確認した場合は、代わりに `pymanager exec -V:3.13 -m venv venv` を実行します。
 
 有効化します。
 
