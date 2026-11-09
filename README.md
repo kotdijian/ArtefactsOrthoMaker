@@ -23,6 +23,7 @@ Repository: https://github.com/kotdijian/ArtefactsOrthoMaker
   - [出力先とスキップ条件](#output-skip)
   - [CLI初心者向け：最短利用手順](#quick-start)
 - [Python 環境・実行方法](#python-environment)
+  - [Pythonが未インストールの場合](#python-install)
   - [macOS：初回セットアップ](#macos-setup)
   - [Windows / PowerShell：初回セットアップ](#windows-setup)
   - [環境確認スクリプト](#environment-check-script)
@@ -248,7 +249,63 @@ ArtefactsOrthoMaker/
 
 `input/` と `output/` は存在しない場合、アプリ起動時に作成されます。過去版は `archive/versions/` に保存されています。
 
-### 2. 推奨 Python と最初の確認
+<a id="python-install"></a>
+### 2. Pythonが未インストールの場合
+
+ArtefactsOrthoMaker は **Python 3.13.x** を推奨します。Pythonがまだ入っていない場合は、先にPython本体をインストールしてから、本READMEの仮想環境作成へ進んでください。
+
+#### macOS
+
+Python公式サイトの macOS 向けダウンロードページから、**Python 3.13系の最新安定版**の macOS installer を取得してください。
+
+- Python公式: https://www.python.org/downloads/macos/
+- Python 3.13のmacOS用installerは、Apple Silicon / Intelの双方に対応するUniversal2形式で配布されています。
+
+ダウンロードした `.pkg` を開き、標準の手順でインストールします。macOSに既存のシステム用Pythonがある場合でも、それを削除・置換する必要はありません。
+
+インストール後、新しいターミナルを開いて次を確認します。
+
+```bash
+python3.13 --version
+```
+
+例えば次のように `Python 3.13.x` と表示されれば準備完了です。
+
+```text
+Python 3.13.x
+```
+
+その後、本READMEの「macOS：初回セットアップ」に進みます。
+
+#### Windows
+
+Python公式サイトのWindows向けダウンロードページから、**Python 3.13系の最新安定版**を取得してください。
+
+- Python公式: https://www.python.org/downloads/windows/
+- 一般的な64-bit Windows PCでは、Python 3.13系の **Windows installer (64-bit)** が推奨です。
+
+通常のinstallerを使用する場合は、最初の画面に **Add Python to PATH** または同等のPATH追加オプションが表示されたら、有効にすることを推奨します。これによりPowerShellから `python` コマンドを直接実行しやすくなります。
+
+> [!NOTE]
+> Python公式ではWindows向けにPython install managerも提供されています。AOMではPython 3.13系が利用できればよく、導入方法自体は限定しません。CLI初心者は、Python公式ページからPython 3.13系の64-bit installerを使う方法が分かりやすいです。
+
+インストール完了後、**新しいPowerShellを開いて**次を確認します。
+
+```powershell
+python --version
+```
+
+例えば次のように `Python 3.13.x` と表示されれば準備完了です。
+
+```text
+Python 3.13.x
+```
+
+`python` が見つからない場合は、いったんPowerShellを閉じて開き直してください。それでも認識されない場合は、Python installerを再実行してPATH追加を有効にするか、Windowsの「環境変数を編集」でPythonのinstall directoryをPATHへ追加してください。
+
+その後、本READMEの「Windows / PowerShell：初回セットアップ」に進みます。
+
+### 3. 推奨 Python と最初の確認
 
 **Python 3.13.x** を推奨します。
 
@@ -266,7 +323,7 @@ python --version
 
 `Python 3.13.x` と表示されれば、以下の標準手順を使用できます。
 
-### 3. リポジトリの取得
+### 4. リポジトリの取得
 
 Git を使用する場合：
 
@@ -278,7 +335,7 @@ cd ArtefactsOrthoMaker
 Git を使用しない場合は、GitHub の **Code → Download ZIP** でリポジトリ全体を取得し、ZIPを展開してから、そのフォルダをターミナル / PowerShell で開いてください。
 
 <a id="macos-setup"></a>
-### 4. macOS：初回セットアップ
+### 5. macOS：初回セットアップ
 
 ターミナルでプロジェクトフォルダへ移動します。
 
@@ -332,7 +389,7 @@ python -c 'from PySide6.QtWidgets import QApplication; app=QApplication([]); pri
 ```
 
 <a id="windows-setup"></a>
-### 5. Windows / PowerShell：初回セットアップ
+### 6. Windows / PowerShell：初回セットアップ
 
 PowerShell でプロジェクトフォルダへ移動します。
 
@@ -380,7 +437,7 @@ python self_test.py
 python app.py
 ```
 
-### 6. requirements.txt
+### 7. requirements.txt
 
 v1.0.0 の `requirements.txt` では、アプリが利用する主要な第三者パッケージをversion固定しています。
 
@@ -401,7 +458,7 @@ Python標準ライブラリはPython本体に含まれるため、個別イン�
 各パッケージの用途は後述の「[使用しているPythonモジュール](#使用しているpythonモジュール)」を参照してください。
 
 <a id="environment-check-script"></a>
-### 7. `check_environment.py`
+### 8. `check_environment.py`
 
 依存関係とQt起動環境を確認するスクリプトです。
 
@@ -420,7 +477,7 @@ ENVIRONMENT CHECK PASSED
 と表示します。
 
 <a id="troubleshooting"></a>
-### 8. よくあるエラー
+### 9. よくあるエラー
 
 #### `ModuleNotFoundError: No module named '...'`
 
@@ -477,7 +534,7 @@ python check_environment.py
 でQtの段階だけが失敗しているか確認してください。macOSでは [docs/macos_qt_venv_issue.md](docs/macos_qt_venv_issue.md) も参照してください。
 
 <a id="self-test"></a>
-### 9. SELF TEST
+### 10. SELF TEST
 
 共通計算コアの簡易テスト：
 
@@ -494,7 +551,7 @@ SELF TEST PASSED
 `self_test.py` は主として姿勢・Normal・メッシュI/O等の共通計算を確認します。土器・石器のGUI操作、3Dビュー、インタラクティブ操作、オルソ・曲面展開は `app.py` を起動して実機確認してください。
 
 <a id="update-procedure"></a>
-### 10. 更新時の推奨手順
+### 11. 更新時の推奨手順
 
 Git clone した環境を更新する場合：
 
