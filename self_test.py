@@ -1,4 +1,4 @@
-"""Geometry/file-format self test for ArtefactsOrthoMaker v2.0.0.
+"""Geometry/file-format self test for ArtefactsOrthoMaker v2.0.1.
 
 The GUI is not launched. The test checks:
 1) Slice-axis recovery for deep and shallow vessel-like meshes.

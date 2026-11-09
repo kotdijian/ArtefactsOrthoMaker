@@ -71,7 +71,7 @@ from pose_core import (
 )
 
 APP_NAME = "ArtefactsOrthoMaker"
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.0.1"
 SUPPORTED_SUFFIXES = {".obj", ".ply", ".glb"}
 WORK_DIR = Path(__file__).resolve().parent
 INPUT_DIR = WORK_DIR / "input"
@@ -92,6 +92,7 @@ PNG_TARGET_MB = {"S": 10.0, "M": 50.0, "L": 100.0}
 
 SPLIT_EXPORT_IN_PROGRESS_MARKER = ".aom_in_progress"
 
+POTTERY_INNER_BACKSIDE_COLOR = "#6699CC"
 POTTERY_CURVE_SURFACE_LABELS = {
     "outer": "外面",
     "inner": "内面",
@@ -6984,6 +6985,7 @@ class MainWindow(QMainWindow):
         self,
         mapped_points: np.ndarray,
         selected_faces: np.ndarray,
+        source_points: np.ndarray,
     ) -> pv.PolyData:
         if not self.asset:
             raise RuntimeError("モデルが読み込まれていません。")
@@ -6999,6 +7001,16 @@ class MainWindow(QMainWindow):
             np.asarray(mapped_points, dtype=float)[used],
             vtk_faces,
         )
+        # Classify the source faces before the development can reverse winding.
+        triangles = source_points[faces]
+        normals = np.cross(
+            triangles[:, 1] - triangles[:, 0],
+            triangles[:, 2] - triangles[:, 0],
+        )
+        radial = triangles[:, :, :2].mean(axis=1)
+        radial_dot = np.einsum("ij,ij->i", normals[:, :2], radial)
+        tolerance = 1e-6 * np.linalg.norm(normals, axis=1) * np.linalg.norm(radial, axis=1)
+        poly.cell_data["source_radially_outward"] = (radial_dot > tolerance).astype(np.uint8)
         if self.asset.appearance_kind == "vertex_color" and self.asset.vertex_colors is not None:
             colors = np.asarray(self.asset.vertex_colors, dtype=np.uint8)[used]
             if colors.shape[1] == 4:
@@ -7138,7 +7150,7 @@ class MainWindow(QMainWindow):
                     rho,
                     np.clip(vertices[:, 2], z0, z1) - z0,
                 ])
-                poly = self._poly_from_mapped_faces(mapped, selected)
+                poly = self._poly_from_mapped_faces(mapped, selected, vertices)
                 b = poly.bounds
                 local_mid_x = 0.5 * (float(b[0]) + float(b[1]))
                 local_zmin = float(b[4])
@@ -7223,7 +7235,7 @@ class MainWindow(QMainWindow):
                 sector_angle = math.degrees(2.0 * math.pi * k)
 
             mapped = np.column_stack([x2, rho, z2])
-            poly = self._poly_from_mapped_faces(mapped, selected)
+            poly = self._poly_from_mapped_faces(mapped, selected, vertices)
             b = poly.bounds
             local_mid_x = 0.5 * (float(b[0]) + float(b[1]))
             local_zmin = float(b[4])
@@ -7292,6 +7304,20 @@ class MainWindow(QMainWindow):
             appearance = mode in ("texture", "texture_normal")
             lighting = mode in ("texture_normal", "shade")
             for poly in polys:
+                if surface == "inner":
+                    backside = np.asarray(poly.cell_data["source_radially_outward"], dtype=bool)
+                    if backside.any():
+                        blue = poly if backside.all() else poly.extract_cells(backside)
+                        actor = pl.add_mesh(
+                            blue, color=POTTERY_INNER_BACKSIDE_COLOR, lighting=False,
+                            show_edges=False,
+                        )
+                        actor.mapper.scalar_visibility = False
+                        if backside.all():
+                            continue
+                        poly = poly.extract_cells(~backside).extract_surface(
+                            algorithm="dataset_surface",
+                        )
                 self._add_mesh_actor(
                     pl,
                     poly,
@@ -7568,6 +7594,12 @@ class MainWindow(QMainWindow):
                 self.pottery_curve_image_size_mode_combo.currentText()
             ),
         }
+        if "inner" in data["surfaces"]:
+            data["inner_backside"] = {
+                "color_rgb_hex": POTTERY_INNER_BACKSIDE_COLOR,
+                "criterion": "outward radial component of source triangle winding",
+                "lighting": False,
+            }
         if kind == "cylindrical":
             data["breakpoints_z_mm"] = [
                 float(z) for z in sorted(self.pottery_cylinder_breakpoints_mm)

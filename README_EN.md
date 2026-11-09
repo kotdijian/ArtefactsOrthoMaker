@@ -2,7 +2,7 @@
 
 **Desktop GUI for archaeological 3D artifact pose normalization, orthographic layouts, curved developments, measurements, and reproducible transforms**
 
-> **Current version:** **v2.0.0**.
+> **Current version:** **v2.0.1**.
 >
 > **License:** v0.4.10 and later use the MIT License. Releases through v0.4.9 published under CC0 1.0 Universal retain their original terms.
 
@@ -30,6 +30,8 @@ Pottery coordinates are Z-up. Cylindrical mapping uses `rho=sqrt(X^2+Y^2)`, `the
 Cylindrical/fan output supports **outer / inner / upper** views. Z breakpoints can be set numerically, by slider, or by 3D click; the click is consumed for position selection rather than camera rotation. Existing output names trigger Overwrite / Save As / Cancel; Save As adds `_01`, `_02`, ... consistently across the output set.
 
 Lithic normalized coordinates: X=width, Y=length, Z=thickness. Loaded pose can be preserved or an explicit minimum-volume OBB workflow can be run.
+
+In cylindrical and fan inner views, visible reverse sides of radially outward-facing source triangles are shown in flat blue (`#6699CC`). Classification uses the original triangle winding.
 
 ## Raster sizing
 
@@ -63,5 +65,6 @@ No automatic large-model proxy is used. Curved-development segment boundary face
 | v0.4.10 | Repeated curved-output workflow, manual Z breakpoints |
 | **v1.0.0** | UV-seam-safe OBJ, outer/inner/upper views, cylindrical breakpoints, click/camera separation, overwrite/save-as numbering, settings JSON, >300 MB warning, raster reduction preflight, stable repository cleanup |
 | **v2.0.0** | Item export, QA and file manifest, independent append to the inventory |
+| **v2.0.1** | Mark exterior backsides in cylindrical and fan inner views in blue (`#6699CC`) |
 
 License history: [LICENSE_HISTORY.md](LICENSE_HISTORY.md). Normal use: root `app.py`; historical standalone versions: `archive/versions/`.
