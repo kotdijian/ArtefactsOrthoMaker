@@ -263,7 +263,7 @@ python check_environment.py
 python self_test.py
 ```
 
-最後にアプリを起動します。
+起動する前に、Finderで作業対象の3Dモデル（`.obj`、`.ply`、`.glb`）を、`app.py` と同じ階層にある小文字の `input/` フォルダへコピーしてください。OBJに付属するMTLやテクスチャ画像がある場合は、[処理対象を置く場所](#input-files)に沿って配置します。その後、次のコマンドで起動します。
 
 ```bash
 python app.py
@@ -322,7 +322,7 @@ python check_environment.py
 python self_test.py
 ```
 
-起動：
+起動する前に、エクスプローラーで作業対象の3Dモデル（`.obj`、`.ply`、`.glb`）を、`app.py` と同じ階層にある小文字の `input/` フォルダへコピーしてください。OBJに付属するMTLやテクスチャ画像がある場合は、[処理対象を置く場所](#input-files)に沿って配置します。その後、次のコマンドで起動します。
 
 ```powershell
 python app.py
@@ -351,7 +351,7 @@ Python標準ライブラリはPython本体に含まれるため、個別イン�
 <a id="run-again"></a>
 #### 2回目以降の起動
 
-初期設定時と同じプロジェクトフォルダをターミナルまたはPowerShellで開きます。仮想環境を有効にし、アプリを起動します。
+`app.py` を実行する前に、作業対象のファイルがプロジェクトフォルダ内の `input/` にあることを確認してください。新しく処理するファイルは、先に `input/` へコピーします。初期設定時と同じプロジェクトフォルダをターミナルまたはPowerShellで開き、仮想環境を有効にしてアプリを起動します。
 
 macOS
 
