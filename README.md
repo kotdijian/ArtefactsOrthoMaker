@@ -80,8 +80,8 @@ ArtefactsOrthoMaker は OBJ / PLY / GLB 形式の考古資料3Dモデルを読�
 
 #### Windows
 
-1. 配布ページの **Files** から **Windows installer (64-bit)** をダウンロードします。これはシステムの種類が **x64** のPC向けです。PCの種類は **設定 → システム → バージョン情報 → システムの種類** で確認できます。ARM64のPCには同じページに **Windows installer (ARM64)** があります。
-2. ダウンロードした `.exe` をダブルクリックします。最初の画面で **Add python.exe to PATH** にチェックを入れ、**Install Now** をクリックします。
+1. 配布ページの **Files** の下に表示される **Windows** 欄の黄色いボタン **(Download Python install manager** をクリックします。ジャンプ先の **Python install manager 26.4** ページの下の方から　**Windows** **Download Installer (MSIX)** をクリックしてインストーラーをダウンロードします。これはシステムの種類が **x64** のPC向けです。PCの種類は **設定 → システム → バージョン情報 → システムの種類** で確認できます。ARM64のPCには同じページに **Windows installer (ARM64)** があります。
+2. ダウンロードした `.msix` をダブルクリックします。最初の画面で **Add python.exe to PATH** にチェックを入れ、**Install Now** をクリックします。
 3. インストールが完了したら、スタートメニューから新しい **PowerShell** を開き、次を実行します。
 
 ```powershell
