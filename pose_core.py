@@ -584,11 +584,61 @@ def _radial_extreme_points(
 
 
 def estimate_rim_plane(vertices: np.ndarray, initial_axis: AxisEstimate, sectors: int = 72) -> PlaneEstimate:
-    pts = _radial_extreme_points(vertices, initial_axis.direction, high_end=True, sectors=sectors, band_fraction=0.12)
+    """Level the representative opening plane of a sloping or uneven rim."""
+    verts = np.asarray(vertices, dtype=float)
+    direction = normalize(initial_axis.direction)
+    u, v = orthonormal_basis(direction)
+    rel = verts - initial_axis.point
+    height = rel @ direction
+    if np.ptp(height) < EPS:
+        raise ValueError("Degenerate mesh extent along the initial axis.")
+
+    x, y = rel @ u, rel @ v
+    radius = np.hypot(x, y)
+    theta = np.mod(np.arctan2(y, x), 2.0 * np.pi)
+    bins = np.minimum((theta * (sectors / (2.0 * np.pi))).astype(int), sectors - 1)
+    # Find the axial maximum in each sector without a global height cut.
+    # Points on the estimated axis have no useful angular coordinate.
+    ids = np.flatnonzero(radius > EPS)
+    upper = np.full(sectors, -np.inf)
+    np.maximum.at(upper, bins[ids], height[ids])
+    top = ids[height[ids] == upper[bins[ids]]]
+    first = np.full(sectors, len(verts), dtype=np.intp)
+    np.minimum.at(first, bins[top], top)
+    pts = verts[first[first < len(verts)]]
+    if len(pts) < max(12, sectors // 4):
+        raise ValueError("Too few radial sectors contained valid rim points.")
+
     fit = robust_plane_fit(pts)
-    if np.dot(fit.normal, initial_axis.direction) < 0:
+    # For a wavy rim, trimming can reject broad genuine low or high arcs.
+    # Prefer the full sector-balanced plane when trimming removes too many.
+    if len(fit.support_points) < 0.75 * len(pts):
+        center = np.mean(pts, axis=0)
+        centered = pts - center
+        _, _, basis = np.linalg.svd(centered, full_matrices=False)
+        normal = basis[-1]
+        fit = PlaneEstimate(center, normal, 0.0, 0.0, pts, {
+            "input_points": len(pts),
+            "accepted_points": len(pts),
+            "fit": "full_sector_plane",
+        })
+    else:
+        fit.diagnostics["fit"] = "robust_sector_plane"
+
+    if np.dot(fit.normal, direction) < 0:
         fit.normal = -fit.normal
-    fit.diagnostics |= {"method": "rim_radial_extreme_robust_plane", "sectors": sectors}
+    residual = (pts - fit.point) @ fit.normal
+    fit.residual_rms = float(np.sqrt(np.mean(residual**2)))
+    spread = float(np.linalg.norm(np.ptp(pts, axis=0)))
+    coverage = len(pts) / sectors
+    fit.confidence = float(np.clip(1.0 - 8.0 * fit.residual_rms / max(spread, EPS), 0.0, 1.0) * coverage)
+    fit.diagnostics.update({
+        "method": "rim_sector_upper_envelope_plane",
+        "sectors": sectors,
+        "occupied_sectors": len(pts),
+        "sector_coverage": coverage,
+        "rim_relief_input_unit": float(np.ptp(residual)),
+    })
     return fit
 
 
