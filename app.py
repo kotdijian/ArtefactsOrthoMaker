@@ -61,7 +61,8 @@ from pose_core import (
     angle_between_deg,
     build_pose_transform,
     estimate_base_plane,
-    estimate_rim_plane,
+    estimate_pottery_opening,
+    estimate_pottery_slice,
     estimate_slice_axis,
     export_matrix_csv,
     export_matrix_txt,
@@ -568,6 +569,9 @@ class MainWindow(QMainWindow):
 
         self.asset: MeshAsset | None = None
         self.initial_axis: AxisEstimate | None = None
+        self.pottery_opening: PlaneEstimate | None = None
+        self.pottery_slice_axis: AxisEstimate | None = None
+        self.pottery_flip_z = False
         self.reference_plane: PlaneEstimate | None = None
         self.pose_matrix = np.eye(4)
         self.front_angle_deg = 0.0
@@ -1878,6 +1882,9 @@ class MainWindow(QMainWindow):
         # Changing artifact type resets all pose state; the mesh itself is
         # retained and does not need to be reloaded.
         self.initial_axis = None
+        self.pottery_opening = None
+        self.pottery_slice_axis = None
+        self.pottery_flip_z = False
         self.reference_plane = None
         self.pose_matrix = np.eye(4)
         self.front_angle_deg = 0.0
@@ -3466,6 +3473,9 @@ class MainWindow(QMainWindow):
             self.last_item_output = None
             self.current_queue_path = path
             self.initial_axis = None
+            self.pottery_opening = None
+            self.pottery_slice_axis = None
+            self.pottery_flip_z = False
             self.reference_plane = None
             self.pose_matrix = np.eye(4)
             self.front_angle_deg = 0.0
@@ -4082,51 +4092,83 @@ class MainWindow(QMainWindow):
         )
 
     # ---------- Pose estimation ----------
-    def _ensure_initial_axis(self):
-        if self.initial_axis is not None:
-            return
-        if not self.asset:
-            raise RuntimeError("No mesh loaded")
-        self.statusBar().showMessage("Slice中心軸候補を推定中…")
-        QApplication.processEvents()
-        self.initial_axis = estimate_slice_axis(np.asarray(self.asset.mesh.vertices))
-
     def estimate_and_apply_posture(self):
         if not self.asset:
             return
         try:
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-            self._ensure_initial_axis()
             method_text = self.method_combo.currentText()
             method = method_text.split()[0].lower()
-            self.reference_plane = None
+            vertices = np.asarray(self.asset.mesh.vertices)
+            plane = None
             ref_normal = None
-
-            if method == "rim":
-                self.statusBar().showMessage("口縁を放射セクタ抽出し、robust planeを最適化中…")
-                QApplication.processEvents()
-                self.reference_plane = estimate_rim_plane(np.asarray(self.asset.mesh.vertices), self.initial_axis)
-                ref_normal = self.reference_plane.normal
-            elif method == "base":
-                self.statusBar().showMessage("底面支持点を放射セクタ抽出し、robust planeを最適化中…")
-                QApplication.processEvents()
-                self.reference_plane = estimate_base_plane(np.asarray(self.asset.mesh.vertices), self.initial_axis)
-                ref_normal = self.reference_plane.normal
-            elif method == "manual":
+            quality = {}
+            if method == "manual":
                 if len(self.manual_points) != 3:
                     raise ValueError("Manualでは先に「手動水平：3点を選択」で3点を指定してください。")
-                self.reference_plane = plane_from_three_points(np.asarray(self.manual_points), preferred_up=self.initial_axis.direction)
-                ref_normal = self.reference_plane.normal
-            elif method != "slice":
+                axis = estimate_slice_axis(vertices)
+                plane = plane_from_three_points(np.asarray(self.manual_points), preferred_up=axis.direction)
+                ref_normal = plane.normal
+            elif method in {"rim", "base", "slice"}:
+                if self.pottery_opening is None:
+                    self.statusBar().showMessage("開口側と口縁候補を探索中…")
+                    self.pottery_opening = estimate_pottery_opening(self.asset.mesh)
+                opening = self.pottery_opening
+                opening_axis = AxisEstimate(opening.point, opening.normal, 0.0, opening.confidence,
+                                            np.empty((0, 3)), {"axis_method": "opening_reference"})
+                axis = opening_axis
+                quality["opening"] = opening.diagnostics
+                if self.pottery_slice_axis is not None:
+                    quality["slice"] = dict(self.pottery_slice_axis.diagnostics)
+                if method == "rim":
+                    plane = opening
+                    ref_normal = plane.normal
+                elif method == "base":
+                    plane = estimate_base_plane(vertices, axis)
+                    ref_normal = plane.normal
+                else:
+                    if self.pottery_slice_axis is None:
+                        self.statusBar().showMessage("断面の対称性から器軸を推定中…")
+                        self.pottery_slice_axis = estimate_pottery_slice(self.asset.mesh, opening)
+                    axis = self.pottery_slice_axis
+                    status = axis.diagnostics["status"]
+                    reason = axis.diagnostics["reason"]
+                    if status == "held":
+                        if self.posture_done:
+                            self.pose_info.setdefault("pose_quality", {})["slice"] = dict(axis.diagnostics)
+                        QMessageBox.information(self, "Slice 判定保留", reason + "\nRim・Baseまたは手動水平を選択できます。")
+                        self.statusBar().showMessage("Sliceの自動確定を保留しました。")
+                        return
+                    if status == "reference" and QMessageBox.question(
+                        self, "Slice 参考値", reason + "\n参考姿勢として適用しますか？",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                        QMessageBox.StandardButton.No,
+                    ) != QMessageBox.StandardButton.Yes:
+                        return
+                    deltas = {"rim_deg": angle_between_deg(axis.direction, opening.normal)}
+                    try:
+                        base = estimate_base_plane(vertices, opening_axis)
+                        deltas["base_candidate_deg"] = angle_between_deg(axis.direction, base.normal)
+                    except (ValueError, np.linalg.LinAlgError):
+                        deltas["base_candidate_deg"] = None
+                    quality["slice"] = axis.diagnostics | {"comparison_angles": deltas}
+            else:
                 raise ValueError(f"Unknown method: {method_text}")
 
-            self.pose_matrix, self.center_axis_after_pose, origin, info = build_pose_transform(
-                np.asarray(self.asset.mesh.vertices),
-                method,
-                self.initial_axis,
-                reference_normal=ref_normal,
+            if self.pottery_flip_z:
+                if ref_normal is None:
+                    axis = AxisEstimate(axis.point, -axis.direction, axis.score, axis.confidence,
+                                        axis.slice_centers, axis.diagnostics)
+                else:
+                    ref_normal = -ref_normal
+            matrix, center_axis, _, info = build_pose_transform(
+                vertices, method, axis, ref_normal, geometric_center=True,
             )
-            self.pose_info = info
+            self.pose_matrix = matrix
+            self.center_axis_after_pose = center_axis
+            self.reference_plane = plane
+            self.initial_axis = axis
+            self.pose_info = info | {"pose_quality": quality, "manual_flip_z": self.pottery_flip_z}
             self.posture_done = True
             self.set_front_angle(0.0)
             self._initialize_pottery_curve_controls()
@@ -4140,6 +4182,9 @@ class MainWindow(QMainWindow):
                     f"<br>Reference plane RMS: {self.reference_plane.residual_rms:.4g} input-unit"
                     f" / confidence: {self.reference_plane.confidence:.2f}"
                 )
+            if "slice" in quality:
+                status_label = {"accepted": "採用", "reference": "参考", "held": "保留"}[quality["slice"]["status"]]
+                ref_text += f"<br>Slice判定: {status_label} / {quality['slice']['reason']}"
             self.pose_label.setText(
                 f"Method: {method_text}<br>"
                 f"Center-axis confidence: {self.center_axis_after_pose.confidence:.2f}<br>"
@@ -4157,13 +4202,11 @@ class MainWindow(QMainWindow):
     def flip_z_and_reapply(self):
         if not self.asset:
             return
-        try:
-            self._ensure_initial_axis()
-            self.initial_axis.direction *= -1.0
-            self.initial_axis.diagnostics["manual_flip_z"] = not self.initial_axis.diagnostics.get("manual_flip_z", False)
-            self.estimate_and_apply_posture()
-        except Exception as e:
-            self._show_error("Z反転エラー", e)
+        self.pottery_flip_z = not self.pottery_flip_z
+        previous_info = self.pose_info
+        self.estimate_and_apply_posture()
+        if self.pose_info is previous_info:
+            self.pottery_flip_z = not self.pottery_flip_z
 
     # ---------- Manual plane picking ----------
     def start_manual_pick(self):

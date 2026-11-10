@@ -411,6 +411,7 @@ def slice_centers_along_direction(
     n_slices: int = 36,
     trim_fraction: float = 0.04,
     min_points: int = 40,
+    geometric_center: bool = False,
 ) -> tuple[np.ndarray, dict]:
     """Estimate robust slice centers for sections perpendicular to *direction*.
 
@@ -442,7 +443,10 @@ def slice_centers_along_direction(
         x = r @ u
         y = r @ v
         # Median suppresses protrusions / handles / local damage better than mean.
-        cx, cy = float(np.median(x)), float(np.median(y))
+        if geometric_center:
+            cx, cy = _geometric_median_2d(np.column_stack((x, y)), np.ones(len(x)))
+        else:
+            cx, cy = float(np.median(x)), float(np.median(y))
         smid = 0.5 * (edges[i] + edges[i + 1])
         centers.append(center0 + u * cx + v * cy + d * smid)
 
@@ -463,6 +467,346 @@ def slice_centers_along_direction(
         "valid_slices": len(centers),
         "slice_counts": counts,
     }
+
+
+class _OpeningSearch:
+    """Sample first-hit depth projections without requiring a renderer."""
+
+    def __init__(self, vertices, faces):
+        from vtkmodules.util.numpy_support import numpy_to_vtk, numpy_to_vtkIdTypeArray
+        from vtkmodules.vtkCommonCore import vtkPoints
+        from vtkmodules.vtkCommonDataModel import vtkCellArray, vtkPolyData, vtkStaticCellLocator
+
+        points = vtkPoints()
+        points.SetData(numpy_to_vtk(np.ascontiguousarray(vertices), deep=False))
+        cells = vtkCellArray()
+        cells.SetData(
+            numpy_to_vtkIdTypeArray(np.arange(0, 3 * len(faces) + 1, 3), deep=True),
+            numpy_to_vtkIdTypeArray(np.ascontiguousarray(faces, dtype=np.int64).ravel(), deep=True),
+        )
+        self.data = vtkPolyData()
+        self.data.SetPoints(points)
+        self.data.SetPolys(cells)
+        self.center = vertices.mean(axis=0)
+        self.centered = vertices - self.center
+        self.span = float(np.linalg.norm(np.ptp(vertices, axis=0)))
+        self.locator = vtkStaticCellLocator()
+        self.locator.SetDataSet(self.data)
+        self.locator.BuildLocator()
+
+    def view(self, direction, size):
+        from scipy.ndimage import distance_transform_edt
+        from vtkmodules.vtkCommonCore import reference
+        from vtkmodules.vtkCommonDataModel import vtkGenericCell
+
+        u, v = orthonormal_basis(direction)
+        xy = self.centered @ np.column_stack((u, v))
+        lo, hi = xy.min(axis=0), xy.max(axis=0)
+        step = max(hi - lo) / (size - 3)
+        axes = (hi + lo)[:, None] / 2 + step * (np.arange(size) - (size - 1) / 2)
+        depth = np.full((size, size), np.nan)
+        t, sub_id, cell_id = reference(0.0), reference(0), reference(0)
+        hit, parametric = [0.0] * 3, [0.0] * 3
+        cell = vtkGenericCell()
+        offset = self.span * direction
+        for row, y in enumerate(axes[1]):
+            for col, x in enumerate(axes[0]):
+                base = self.center + x * u + y * v
+                if self.locator.IntersectWithLine(
+                    base + offset, base - offset, self.span * 1e-9,
+                    t, hit, parametric, sub_id, cell_id, cell,
+                ):
+                    depth[row, col] = (np.asarray(hit) - self.center) @ direction
+        distance = distance_transform_edt(np.isfinite(depth))
+        return depth, distance, axes, step, u, v
+
+    def coarse(self, direction):
+        depth, distance, *_ = self.view(direction, 37)
+        radius = distance.max()
+        ring = (distance > 0.15 * radius) & (distance < 0.35 * radius)
+        if radius < 3 or not ring.any():
+            return -np.inf
+        core = distance > 0.65 * radius
+        return float((np.median(depth[ring]) - np.median(depth[core])) / self.span)
+
+    def opening(self, direction):
+        from scipy.ndimage import map_coordinates
+
+        depth, distance, axes, step, u, v = self.view(direction, 101)
+        radius = distance.max()
+        core = distance > 0.73 * radius
+        if core.sum() < 12:
+            return None
+        y0, x0 = np.mean(np.argwhere(core & (depth <= np.median(depth[core]))), axis=0)
+        points, support, ray_radii = [], [], []
+        ray_steps = np.arange(0, 1.6 * radius, 0.5)
+        for theta in np.arange(48) * np.pi / 24:
+            x = x0 + ray_steps * np.cos(theta)
+            y = y0 + ray_steps * np.sin(theta)
+            profile = map_coordinates(depth, [y, x], order=1, prefilter=False, cval=np.nan)
+            invalid = np.flatnonzero(~np.isfinite(profile))
+            end = invalid[0] if len(invalid) else len(profile)
+            if end < 10:
+                continue
+            # Find the depth crest between the central cavity and the silhouette.
+            start = max(3, int(end * 0.30))
+            index = start + np.argmax(profile[start:end - 1])
+            inner = np.median(profile[:max(2, index // 2)])
+            points.append(self.center + (axes[0, 0] + x[index] * step) * u
+                          + (axes[1, 0] + y[index] * step) * v + profile[index] * direction)
+            support.append(profile[index] - inner)
+            ray_radii.append(ray_steps[index] * step)
+        if len(points) < 32:
+            return None
+        points = np.asarray(points)
+        center = points.mean(axis=0)
+        normal = normalize(np.linalg.svd(points - center, full_matrices=False)[2][-1])
+        if normal @ direction < 0:
+            normal = -normal
+        opening_radius = float(np.median(ray_radii))
+        relief = float(np.median(support))
+        coverage = float(np.count_nonzero(np.asarray(support) > 0.01 * opening_radius) / 48)
+        error = float(np.median(np.abs((points - np.median(points, axis=0)) @ normal)) / opening_radius)
+        alignment = normal @ direction
+        score = max(relief / opening_radius, 0) * coverage * alignment**2 / (1 + 4 * error)
+        return dict(normal=normal, points=points, center=center, coverage=coverage,
+                    err=error, score=score, r=opening_radius)
+
+
+def _directions_around(direction, degrees, count):
+    u, v = orthonormal_basis(direction)
+    angle = np.radians(degrees)
+    return [
+        np.cos(angle) * direction + np.sin(angle) * (np.cos(theta) * u + np.sin(theta) * v)
+        for theta in np.arange(count) * 2 * np.pi / count
+    ]
+
+
+def _opening_candidates(search):
+    count = 80
+    index = np.arange(count)
+    z = 1 - 2 * (index + 0.5) / count
+    radius = np.sqrt(1 - z**2)
+    theta = np.pi * (3 - np.sqrt(5)) * index
+    pca = np.linalg.eigh(search.centered.T @ search.centered)[1].T
+    directions = np.vstack((pca, -pca, np.column_stack((radius * np.cos(theta), radius * np.sin(theta), z))))
+    values = [search.coarse(direction) for direction in directions]
+    distinct = np.cos(np.radians(22))
+    picked = []
+    for i in np.argsort(values)[::-1]:
+        if np.isfinite(values[i]) and all(directions[i] @ d < distinct for d in picked):
+            picked.append(directions[i])
+        if len(picked) == 7:
+            break
+    candidates = list(filter(None, (search.opening(d) for d in [*picked, pca[0], -pca[0]])))
+    candidates.sort(key=lambda item: item["score"], reverse=True)
+    for candidate in candidates[:2]:
+        normal = candidate["normal"]
+        candidates.extend(filter(None, (search.opening(d) for d in [normal, *_directions_around(normal, 10, 4)])))
+    return sorted(candidates, key=lambda item: item["score"], reverse=True)
+
+
+def estimate_pottery_opening(mesh: trimesh.Trimesh) -> PlaneEstimate:
+    """Find a provisional opening and preserve the evidence used to fit its rim plane."""
+    vertices = np.asarray(mesh.vertices, dtype=float)
+    if len(vertices) < 4 or not len(mesh.faces) or np.linalg.norm(np.ptp(vertices, axis=0)) <= EPS:
+        raise ValueError("開口推定に必要なメッシュ面がありません。")
+    candidates = _opening_candidates(_OpeningSearch(vertices, np.asarray(mesh.faces)))
+    if not candidates:
+        raise ValueError("開口候補を取得できません。手動水平を使用してください。")
+    best = candidates[0]
+    # Separate distinct opposing openings from repeated views of the same opening.
+    competing_score = max(
+        (item["score"] for item in candidates if item["normal"] @ best["normal"] < 0.5),
+        default=0.0,
+    )
+    if best["score"] < 0.008 or competing_score >= 0.85 * best["score"]:
+        raise ValueError("開口側の根拠が不足しています。手動水平を使用してください。")
+    points, normal, center = best["points"], best["normal"], best["center"]
+    residual = (points - center) @ normal
+    return PlaneEstimate(center, normal, float(np.sqrt(np.mean(residual**2))),
+                         float(np.clip(best["coverage"] * (1 - best["err"]), 0, 1)), points, {
+        "method": "multiview_opening_depth_and_rim",
+        "occupied_sectors": len(points),
+        "sectors": 48,
+        "rim_relief_input_unit": float(np.ptp(residual)),
+        "opposing_candidate_score": float(competing_score),
+        "opening_score": float(best["score"]),
+        "opening_support_fraction": float(best["coverage"]),
+        "opening_radius": float(best["r"]),
+    })
+
+
+def _geometric_median_2d(points: np.ndarray, weights: np.ndarray) -> np.ndarray:
+    """Compute a planar centre that is invariant to the choice of basis."""
+    center = np.average(points, axis=0, weights=weights)
+    tolerance = max(float(np.max(np.linalg.norm(points - center, axis=1))) * 1e-8, EPS)
+    for _ in range(64):
+        distance = np.linalg.norm(points - center, axis=1)
+        updated = np.average(points, axis=0, weights=weights / np.maximum(distance, tolerance))
+        if np.linalg.norm(updated - center) <= tolerance:
+            return updated
+        center = updated
+    return center
+
+
+def _symmetry_sections(mesh, vertices, direction, opening, fractions):
+    from scipy.spatial import cKDTree
+
+    origin = opening.point
+    u, v = orthonormal_basis(direction)
+    frame = np.column_stack((u, v))
+    heights = (vertices - origin) @ direction
+    lo, hi = np.quantile(heights, [0.03, 0.97])
+    span = float(hi - lo)
+    if span <= EPS:
+        return None
+    centers, residuals, radii, coverages, used = [], [], [], [], []
+    for fraction in fractions:
+        height = float(lo + span * fraction)
+        segments = trimesh.intersections.mesh_plane(
+            mesh, direction, origin + direction * height, cached_dots=heights - height,
+        )
+        if len(segments) < 8:
+            continue
+        xy = (segments - origin) @ frame
+        lengths = np.linalg.norm(xy[:, 1] - xy[:, 0], axis=1)
+        good = lengths > EPS
+        xy, lengths = xy[good], lengths[good]
+        if len(xy) < 8:
+            continue
+        # Interpolate actual cut segments with length weights. No gaps are closed.
+        total = float(lengths.sum())
+        counts = np.clip(np.ceil(192 * lengths / total).astype(int), 1, 192)
+        idx = np.repeat(np.arange(len(xy)), counts)
+        fraction_along = (np.arange(len(idx)) - np.repeat(np.cumsum(counts) - counts, counts) + 0.5) / counts[idx]
+        points = xy[idx, 0] + fraction_along[:, None] * (xy[idx, 1] - xy[idx, 0])
+        weights = lengths[idx] / counts[idx]
+        center = _geometric_median_2d(points, weights)
+        q = points - center
+        radius = float(np.average(np.linalg.norm(q, axis=1), weights=weights))
+        if radius <= EPS:
+            continue
+        distance = cKDTree(q).query(-q)[0]
+        # 180-degree symmetry also admits elliptical and rectangular sections.
+        opposite = distance <= radius * 0.15
+        coverage = float(np.average(opposite, weights=weights))
+        if coverage < 0.45:
+            continue
+        centers.append(origin + frame @ center + height * direction)
+        residuals.append(float(np.average(np.minimum(distance / radius, 0.6), weights=weights)))
+        radii.append(radius)
+        coverages.append(coverage)
+        used.append(height)
+    if len(centers) < 3:
+        return None
+    centers = np.asarray(centers)
+    radius = float(np.median(radii))
+    point, axis, rms = _fit_line_pca(centers, direction)
+    score = float(np.median(residuals) + rms / radius + np.linalg.norm(np.cross(axis, direction)))
+    return score, point, axis, centers, {
+        "valid_sections": len(centers),
+        "opposite_support_fraction": float(np.median(coverages)),
+        "section_height_span_to_diameter": float(np.ptp(used) / (2 * radius)),
+        "symmetry_residual": float(np.median(residuals)),
+        "center_line_rms_to_radius": float(rms / radius),
+        "section_axis_alignment_deg": angle_between_deg(axis, direction),
+    }
+
+
+def estimate_pottery_slice(mesh: trimesh.Trimesh, opening: PlaneEstimate) -> AxisEstimate:
+    """Estimate an independent axis and classify its support for spill-volume comparison."""
+    vertices = np.asarray(mesh.vertices, dtype=float)
+    sample = vertices[::max(1, (len(vertices) + 99999) // 100000)]
+    q = sample - sample.mean(axis=0)
+    _, vectors = np.linalg.eigh(q.T @ q)
+    up = opening.normal
+    diameter = 2 * opening.diagnostics["opening_radius"]
+    h = q @ up
+    # A short stack of wall cuts cannot provide the same evidence for a plate.
+    if np.ptp(np.quantile(h, [0.03, 0.97])) < 0.14 * diameter:
+        from scipy.spatial import cKDTree
+
+        direction = vectors[:, 0]
+        direction *= 1 if direction @ up >= 0 else -1
+        # Compare the body's broad surface normals with the normal of its spatial spread.
+        normals = mesh.face_normals
+        areas = mesh.area_faces
+        _, normal_vectors = np.linalg.eigh((normals.T * areas) @ normals)
+        surface_axis = normal_vectors[:, -1]
+        normal_delta = min(angle_between_deg(direction, surface_axis),
+                           angle_between_deg(direction, -surface_axis))
+        frame = np.column_stack(orthonormal_basis(direction))
+        rim_xy = (opening.support_points - opening.point) @ frame
+        center = _geometric_median_2d(rim_xy, np.ones(len(rim_xy)))
+        centered_rim = rim_xy - center
+        opposite_dist = cKDTree(centered_rim).query(-centered_rim)[0]
+        coverage = float(np.count_nonzero(opposite_dist <= 0.075 * diameter)
+                         / opening.diagnostics["sectors"])
+        body_offset = float(np.linalg.norm((mesh.centroid - opening.point) @ frame - center) / diameter)
+        if direction @ up < 0.90 or normal_delta > 12:
+            status, reason = "held", "扁平な器形の面方向に十分な一致がありません。"
+        elif coverage < 0.70 or body_offset > 0.08:
+            status, reason = "reference", "扁平な器形の器軸を支持する対向輪郭が限られています。"
+        else:
+            status, reason = "accepted", "扁平な器形の口縁輪郭と広い器面が共通の器軸を支持しています。"
+        return AxisEstimate(opening.point + frame @ center, direction, body_offset,
+                            float(np.clip(coverage * (1 - normal_delta / 90), 0, 1)),
+                            np.empty((0, 3)), {
+            "axis_method": "flat_body_plane",
+            "status": status,
+            "reason": reason,
+            "opposite_support_fraction": coverage,
+            "flat_surface_normal_delta_deg": normal_delta,
+            "flat_body_center_offset_to_diameter": body_offset,
+        })
+
+    seeds = [up]
+    for v in vectors.T:
+        v = v if v @ up >= 0 else -v
+        if v @ up > 0.45 and all(v @ other < 0.998 for other in seeds):
+            seeds.append(v)
+    directions = [*seeds, *_directions_around(up, 14, 6), *_directions_around(up, 28, 6)]
+    fractions = np.linspace(0.16, 0.84, 7)
+    results = []
+    for direction in directions:
+        section = _symmetry_sections(mesh, vertices, direction, opening, fractions)
+        if section is not None:
+            results.append((section, direction))
+    if not results:
+        return AxisEstimate(opening.point, up, 0.0, 0.0, np.empty((0, 3)), {
+            "axis_method": "section_symmetry", "status": "held",
+            "reason": "対向する器壁を含む断面が不足しています。",
+        })
+
+    best, direction = min(results, key=lambda result: result[0][0])
+    for candidate in [best[2], *_directions_around(direction, 5, 6)]:
+        if candidate @ up <= 0:
+            continue
+        section = _symmetry_sections(mesh, vertices, candidate, opening, fractions)
+        if section is not None:
+            results.append((section, candidate))
+    best, direction = min(results, key=lambda result: result[0][0])
+    score, point, axis, centers, diagnostics = best
+    shifted = _symmetry_sections(mesh, vertices, direction, opening, fractions + 0.04)
+    shift_angle = angle_between_deg(axis, shifted[2]) if shifted is not None else None
+    competing_angle = max((angle_between_deg(axis, other[2]) for other, _ in results
+                           if other[0] <= score + 0.035), default=0.0)
+    if shift_angle is None or shift_angle > 8 or competing_angle > 14 or axis @ up <= 0:
+        status, reason = "held", "断面の取り方を変えると器軸が変動するか、別方向の候補が競合します。"
+    elif (diagnostics["valid_sections"] < 5 or diagnostics["opposite_support_fraction"] < 0.70
+          or diagnostics["section_height_span_to_diameter"] < 0.25
+          or diagnostics["section_axis_alignment_deg"] > 10):
+        status, reason = "reference", "器軸を支持する対向輪郭・高さ範囲、または断面間の整合性が限られています。"
+    else:
+        status, reason = "accepted", "複数の高さで対向する器壁が共通の器軸を支持しています。"
+    return AxisEstimate(point, axis, score, float(np.clip(1 - score, 0, 1)), centers, diagnostics | {
+        "axis_method": "section_symmetry",
+        "status": status,
+        "reason": reason,
+        "shifted_sections_axis_delta_deg": shift_angle,
+        "competing_axis_delta_deg": competing_angle,
+    })
 
 
 def _end_centrality(vertices: np.ndarray, axis: np.ndarray, high_end: bool, fraction: float = 0.07) -> float:
@@ -558,13 +902,18 @@ def estimate_slice_axis(vertices: np.ndarray, n_slices: int = 36) -> AxisEstimat
     return AxisEstimate(best[1], signed_dir, float(best[0]), confidence, best[3], diagnostics)
 
 
-def center_axis_with_fixed_vertical(vertices: np.ndarray, n_slices: int = 36) -> AxisEstimate:
+def center_axis_with_fixed_vertical(
+    vertices: np.ndarray, n_slices: int = 36, *, geometric_center: bool = False,
+) -> AxisEstimate:
     """After horizontal attitude is fixed, derive the center axis by slicing along current Z.
 
     The returned center axis may be slightly tilted relative to Z. That tilt is preserved and used
     for the origin intersection; it does not re-level Rim/Base/Manual modes.
     """
-    centers, diag = slice_centers_along_direction(vertices, np.array([0.0, 0.0, 1.0]), n_slices=n_slices, min_points=25)
+    centers, diag = slice_centers_along_direction(
+        vertices, np.array([0.0, 0.0, 1.0]), n_slices=n_slices, min_points=25,
+        geometric_center=geometric_center,
+    )
     p, d, rms = _fit_line_pca(centers, np.array([0.0, 0.0, 1.0]))
     if d[2] < 0:
         d = -d
@@ -791,6 +1140,8 @@ def build_pose_transform(
     orientation_method: str,
     initial_slice_axis: AxisEstimate,
     reference_normal: Optional[np.ndarray] = None,
+    *,
+    geometric_center: bool = False,
 ) -> tuple[np.ndarray, AxisEstimate, np.ndarray, dict]:
     """Build raw -> pose-normalized transform before the manual front rotation.
 
@@ -823,7 +1174,7 @@ def build_pose_transform(
             diagnostics=dict(initial_slice_axis.diagnostics) | {"retained_from_initial_slice": True},
         )
     else:
-        center_axis = center_axis_with_fixed_vertical(oriented)
+        center_axis = center_axis_with_fixed_vertical(oriented, geometric_center=geometric_center)
 
     zmin = float(oriented[:, 2].min())
     origin_oriented = line_plane_z_intersection(center_axis.point, center_axis.direction, zmin)
