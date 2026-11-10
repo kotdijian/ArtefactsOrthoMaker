@@ -2,7 +2,7 @@ from __future__ import annotations
 import importlib, sys
 from importlib import metadata
 
-REQUIRED=[("NumPy","numpy","numpy"),("SciPy","scipy","scipy"),("Trimesh","trimesh","trimesh"),("PyVista","pyvista","pyvista"),("PyVistaQt","pyvistaqt","pyvistaqt"),("VTK","vtk","vtk"),("PySide6","PySide6","PySide6"),("QtPy","qtpy","QtPy"),("Pillow","PIL","Pillow")]
+REQUIRED=[("NumPy","numpy","numpy"),("SciPy","scipy","scipy"),("Trimesh","trimesh","trimesh"),("PyVista","pyvista","pyvista"),("PyVistaQt","pyvistaqt","pyvistaqt"),("VTK","vtk","vtk"),("PySide6","PySide6","PySide6"),("QtPy","qtpy","QtPy"),("Pillow","PIL","Pillow"),("psutil","psutil","psutil")]
 
 def ver(name):
     try: return metadata.version(name)

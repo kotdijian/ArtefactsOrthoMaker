@@ -7,12 +7,14 @@ import json
 import math
 import csv
 import struct
-from typing import Iterable, Optional
+from typing import Callable, Iterable, Optional
 
 import numpy as np
 import trimesh
 
 EPS = 1e-12
+OBJ_SEAM_BYTES_PER_FACE = 320
+OBJ_SEAM_MEMORY_RESERVE_BYTES = 512 * 1024**2
 
 
 @dataclass
@@ -36,6 +38,17 @@ class PlaneEstimate:
 
 
 @dataclass
+class MeshTopologyQA:
+    is_watertight: bool
+    is_winding_consistent: bool
+    obj_seam_status: str = "not_applicable"
+    obj_seam_winding_consistent: bool | None = None
+    available_memory_bytes: int | None = None
+    estimated_extra_memory_bytes: int | None = None
+    memory_reserve_bytes: int | None = None
+
+
+@dataclass
 class MeshAsset:
     mesh: trimesh.Trimesh
     source_path: Path
@@ -51,6 +64,7 @@ class MeshAsset:
     vertex_normals: np.ndarray
     source_scene: Optional[trimesh.Scene]
     notes: list[str]
+    topology_qa: MeshTopologyQA
 
 
 UNIT_TO_MM = {
@@ -137,6 +151,63 @@ def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
                 break
             h.update(b)
     return h.hexdigest()
+
+
+def inspect_mesh_topology(
+    mesh: trimesh.Trimesh,
+    *,
+    obj: bool = False,
+    confirm_seam_check: Callable[[MeshTopologyQA], bool] | None = None,
+) -> MeshTopologyQA:
+    """Inspect the loaded mesh, and optionally its exact-position OBJ adjacency."""
+    # Trimesh computes and caches both results in the same edge pass.
+    qa = MeshTopologyQA(bool(mesh.is_watertight), bool(mesh.is_winding_consistent))
+    if not obj:
+        return qa
+    if qa.is_watertight:
+        qa.obj_seam_status = "not_needed_watertight"
+        return qa
+
+    qa.estimated_extra_memory_bytes = len(mesh.faces) * OBJ_SEAM_BYTES_PER_FACE
+    qa.memory_reserve_bytes = OBJ_SEAM_MEMORY_RESERVE_BYTES
+    try:
+        import psutil
+
+        qa.available_memory_bytes = int(psutil.virtual_memory().available)
+    except (ImportError, OSError, RuntimeError):
+        qa.obj_seam_status = "skipped_memory_unavailable"
+    else:
+        if qa.available_memory_bytes < qa.estimated_extra_memory_bytes + qa.memory_reserve_bytes:
+            qa.obj_seam_status = "skipped_low_memory"
+
+    if qa.obj_seam_status.startswith("skipped_"):
+        if confirm_seam_check is None or not confirm_seam_check(qa):
+            return qa
+
+    try:
+        vertices, inverse = np.unique(np.asarray(mesh.vertices), axis=0, return_inverse=True)
+        if len(vertices) == len(mesh.vertices):
+            qa.obj_seam_status = "no_exact_duplicate_vertices"
+            return qa
+        # Only the temporary inspection mesh joins vertices. Preserve source UVs and face order.
+        faces = inverse[np.asarray(mesh.faces)]
+        # Ignore triangles collapsed by position matching: they have no oriented area.
+        noncollapsed = (
+            (faces[:, 0] != faces[:, 1]) &
+            (faces[:, 1] != faces[:, 2]) &
+            (faces[:, 2] != faces[:, 0])
+        )
+        if not noncollapsed.any():
+            qa.obj_seam_status = "no_nondegenerate_faces"
+            return qa
+        if not noncollapsed.all():
+            faces = faces[noncollapsed]
+        inspection_mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+        qa.obj_seam_winding_consistent = bool(inspection_mesh.is_winding_consistent)
+        qa.obj_seam_status = "completed"
+    except MemoryError:
+        qa.obj_seam_status = "failed_memory_allocation"
+    return qa
 
 
 def area_weighted_vertex_normals(vertices: np.ndarray, faces: np.ndarray) -> np.ndarray:
@@ -280,6 +351,8 @@ def load_mesh_asset(path: str | Path, input_unit: str) -> MeshAsset:
     if np.asarray(mesh.faces).shape[1] != 3:
         raise ValueError("Triangle mesh is required.")
 
+    topology_qa = inspect_mesh_topology(mesh, obj=path.suffix.lower() == ".obj")
+
     # Validate / compute normals at load time. The calculation is always performed here;
     # source_has_normals only records whether the input already stored them.
     computed = area_weighted_vertex_normals(np.asarray(mesh.vertices), np.asarray(mesh.faces))
@@ -305,6 +378,7 @@ def load_mesh_asset(path: str | Path, input_unit: str) -> MeshAsset:
         vertex_normals=computed,
         source_scene=source_scene,
         notes=notes,
+        topology_qa=topology_qa,
     )
 
 

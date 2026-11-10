@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+from dataclasses import asdict
 import io
 import json
 import math
@@ -10,6 +11,7 @@ import tempfile
 import traceback
 from uuid import uuid4
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import pyvista as pv
@@ -126,7 +128,11 @@ class ObjInputResolver(trimesh.resolvers.FilePathResolver):
 
 
 def load_mesh_asset(
-    path: str | Path, input_unit: str, obj_reads: list[dict] | None = None
+    path: str | Path,
+    input_unit: str,
+    obj_reads: list[dict] | None = None,
+    *,
+    confirm_seam_check: Callable[[_pose_core.MeshTopologyQA], bool] | None = None,
 ) -> MeshAsset:
     """Load an artifact mesh, preserving OBJ UV seams correctly.
 
@@ -171,6 +177,9 @@ def load_mesh_asset(
     if np.asarray(mesh.faces).shape[1] != 3:
         raise ValueError("Triangle mesh is required.")
 
+    topology_qa = _pose_core.inspect_mesh_topology(
+        mesh, obj=True, confirm_seam_check=confirm_seam_check,
+    )
     computed = _pose_core.area_weighted_vertex_normals(
         np.asarray(mesh.vertices),
         np.asarray(mesh.faces),
@@ -221,6 +230,7 @@ def load_mesh_asset(
         vertex_normals=computed,
         source_scene=source_scene,
         notes=notes,
+        topology_qa=topology_qa,
     )
 
 
@@ -3398,6 +3408,32 @@ class MainWindow(QMainWindow):
         box.exec()
         return box.clickedButton() is continue_btn
 
+    def _confirm_obj_seam_check(self, qa: _pose_core.MeshTopologyQA) -> bool:
+        mib = 1024**2
+        available = (
+            f"{qa.available_memory_bytes / mib:,.0f} MiB"
+            if qa.available_memory_bytes is not None else "取得できませんでした"
+        )
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("OBJのUV継ぎ目検査とメモリの確認")
+        box.setText(
+            f"利用可能メモリ: {available}\n"
+            f"検査の推定追加メモリ: {qa.estimated_extra_memory_bytes / mib:,.0f} MiB\n"
+            f"確保する余裕: {qa.memory_reserve_bytes / mib:,.0f} MiB"
+        )
+        box.setInformativeText("継ぎ目検査を省略しても、通常の水密性・頂点順序検査の結果は記録されます。")
+        skip = box.addButton("継ぎ目検査を省略して続行", QMessageBox.ButtonRole.RejectRole)
+        run = box.addButton("検査を実行", QMessageBox.ButtonRole.AcceptRole)
+        box.setDefaultButton(skip)
+        box.setEscapeButton(skip)
+        QApplication.setOverrideCursor(Qt.CursorShape.ArrowCursor)
+        try:
+            box.exec()
+        finally:
+            QApplication.restoreOverrideCursor()
+        return box.clickedButton() is run
+
     def _load_path(self, path: Path):
         try:
             if not self._confirm_large_input_file(path):
@@ -3407,13 +3443,16 @@ class MainWindow(QMainWindow):
                 return
 
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-            self.statusBar().showMessage(f"読み込み・Normal検証中: {path.name}")
+            self.statusBar().showMessage(f"読み込み・メッシュ検査・Normal計算中: {path.name}")
             QApplication.processEvents()
             source = path.resolve()
             initial_stamp = item_output.file_stamp(source)
             dependencies = item_output.source_dependencies(source, INPUT_DIR)
             obj_reads = []
-            asset = load_mesh_asset(path, self.unit_combo.currentText(), obj_reads)
+            asset = load_mesh_asset(
+                path, self.unit_combo.currentText(), obj_reads,
+                confirm_seam_check=self._confirm_obj_seam_check,
+            )
             if (
                 item_output.file_stamp(source) != initial_stamp
                 or any(item_output.file_stamp(dep) != stamp
@@ -3509,13 +3548,28 @@ class MainWindow(QMainWindow):
             "none": "none",
         }[self.asset.appearance_kind]
         notes = "<br>".join(self.asset.notes) if self.asset.notes else "—"
+        topology = self.asset.topology_qa
+        seam_labels = {
+            "not_needed_watertight": "通常検査で閉合を確認",
+            "no_exact_duplicate_vertices": "同一座標の重複頂点なし",
+            "no_nondegenerate_faces": "判定不能（有効面なし）",
+            "skipped_low_memory": "未実施（メモリ不足見込み）",
+            "skipped_memory_unavailable": "未実施（メモリ余力を取得できず）",
+            "failed_memory_allocation": "中断（メモリ割り当て失敗）",
+            "completed": "整合" if topology.obj_seam_winding_consistent else "不整合あり",
+        }
+        seam_label = seam_labels.get(topology.obj_seam_status)
+        seam_html = f"OBJ UV継ぎ目（同一座標）: {seam_label}<br>" if seam_label else ""
+        winding_label = "整合" if topology.is_winding_consistent else "不整合あり"
         self.qa_label.setText(
             f"Vertices: {len(m.vertices):,}<br>"
             f"Faces: {len(m.faces):,}<br>"
             f"Input unit: {self.asset.input_unit}（座標値は変更しません）<br>"
             f"Normals: {self.asset.normals_status}<br>"
             f"Appearance: {appearance}<br>"
-            f"Watertight: {bool(m.is_watertight)}<br>"
+            f"Watertight: {topology.is_watertight}<br>"
+            f"頂点順序（読み込みメッシュ）: {winding_label}<br>"
+            f"{seam_html}"
             f"Notes: {notes}"
         )
 
@@ -4452,7 +4506,7 @@ class MainWindow(QMainWindow):
 
         area_native = float(mesh.area)
         volume_native = abs(float(mesh.volume))
-        watertight = bool(mesh.is_watertight)
+        watertight = self.asset.topology_qa.is_watertight
 
         return {
             "source_file": self.asset.source_path.name,
@@ -8910,6 +8964,13 @@ class MainWindow(QMainWindow):
             "volume": model["volume_status"],
         }
         warnings = []
+        topology = self.asset.topology_qa
+        if not topology.is_winding_consistent:
+            warnings.append("inconsistent_face_winding")
+        if topology.obj_seam_winding_consistent is False:
+            warnings.append("inconsistent_obj_seam_winding")
+        if topology.obj_seam_status.startswith(("skipped_", "failed_", "no_nondegenerate")):
+            warnings.append(f"obj_seam_check_{topology.obj_seam_status}")
         if checks["source_dependencies"] != "complete":
             warnings.append("input_dependencies_incomplete")
         if model["volume_status"] != "closed_mesh":
@@ -8925,6 +8986,10 @@ class MainWindow(QMainWindow):
             "checks": checks,
             "warnings": warnings,
             "mesh_checked": "loaded_analysis_mesh",
+            "mesh_topology": {
+                **asdict(topology),
+                "obj_seam_matching": "exact_vertex_positions",
+            },
             "vertices": len(self.asset.mesh.vertices),
             "faces": model["mesh_count"],
             "source_file_size_bytes": model["file_size_bytes"],
