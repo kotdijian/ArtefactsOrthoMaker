@@ -1,5 +1,7 @@
 # ArtefactsOrthoMaker
 
+[English available here](README_EN.md)
+
 **考古資料3Dモデルの姿勢正規化・オルソ展開・曲面展開・計測出力を行うデスクトップGUI**
 
 > **現行バージョン:** **v2.1.0**
@@ -17,7 +19,6 @@ BagItやレポート生成への受け渡しには `item_manifest.json` を使�
 
 旧版は [v1.0.0アーカイブ](archive/v1.0.0/README.md) から利用できます。
 
-English: [README_EN.md](README_EN.md)  
 開発レポート: [docs/DEVELOPMENT_REPORT.md](docs/DEVELOPMENT_REPORT.md)  
 総合コードレビュー: [docs/CODE_REVIEW_v1.0.0.md](docs/CODE_REVIEW_v1.0.0.md)  
 Release notes: [docs/RELEASE_NOTES_v1.0.0.md](docs/RELEASE_NOTES_v1.0.0.md)
@@ -85,6 +86,8 @@ ArtefactsOrthoMaker は OBJ / PLY / GLB 形式の考古資料3Dモデルを読�
 <a id="quick-start"></a>
 ## はじめて使う方へ
 
+左パネル上部の **言語 / Language** で **日本語** と **English** を切り替えられます。選択は次回起動時にも引き継がれます。
+
 初回は **1. Pythonのインストール → 2. フォルダ（ディレクトリ）の整備 → 3. 初期設定と起動** の順に進めてください。コードブロック内のコマンドは、macOSでは「ターミナル」、Windowsでは「PowerShell」に1行ずつ入力し、Enterを押して実行します。
 
 <a id="python-install"></a>
@@ -128,7 +131,7 @@ python3.13 --version
 
 1. [GitHubのリポジトリ](https://github.com/kotdijian/ArtefactsOrthoMaker)をブラウザーで開き、緑色の **Code → Download ZIP** を選びます。
 2. ダウンロードしたZIPを展開します。WindowsではZIPを右クリックして **すべて展開**、macOSではZIPをダブルクリックします。
-3. 展開先を開き、`app.py`、`pose_core.py`、`requirements.txt` が並んでいるフォルダを探します。ZIPで取得した場合、フォルダ名は通常 `ArtefactsOrthoMaker-main` です。このフォルダを以後「プロジェクトフォルダ」と呼びます。ZIPに含まれるファイル一式をそのまま使います。`pose_core.py` は同梱の必須ファイルです。
+3. 展開先を開き、`app.py`、`pose_core.py`、`requirements.txt` が並んでいるフォルダを探します。ZIPで取得した場合、フォルダ名は通常 `ArtefactsOrthoMaker-main` です。このフォルダを以後「プロジェクトフォルダ」と呼びます。ZIPに含まれるファイル一式をそのまま使います。`pose_core.py`、`item_output.py`、`ui_language.py` は同梱の必須ファイルです。
 4. プロジェクトフォルダ内の小文字の `input` フォルダに、処理したい3Dモデルを入れます。フォルダがなければ作成してください。対応形式と出力先は下記のとおりです。
 
 Gitを使っている場合は、ZIPの代わりに `git clone https://github.com/kotdijian/ArtefactsOrthoMaker.git` で取得できます。すでにクローン済みの場合は、`app.py` がある既存のプロジェクトフォルダを使います。
@@ -145,6 +148,8 @@ ArtefactsOrthoMaker は、起動時に `app.py` と同じ階層を作業ルー�
 ArtefactsOrthoMaker/
 ├── app.py
 ├── pose_core.py
+├── item_output.py
+├── ui_language.py
 ├── requirements.txt
 ├── input/                 ← 処理したい3Dモデルを置く
 │   ├── pot001.obj
@@ -336,6 +341,7 @@ vtk==9.6.2
 PySide6==6.10.3
 QtPy==2.4.3
 Pillow==12.3.0
+psutil==7.2.2
 ```
 
 Python標準ライブラリはPython本体に含まれるため、個別インストールは不要です。また、上記パッケージが必要とする内部依存パッケージは `pip` が自動的に導入します。**個別モジュールを1つずつ追加するのではなく、原則として `requirements.txt` を使用してください。**
@@ -372,7 +378,7 @@ Windowsでスクリプトの実行が拒否された場合は、[Windowsの初�
 python check_environment.py
 ```
 
-NumPy、SciPy、Trimesh、PyVista、PyVistaQt、VTK、PySide6、QtPy、Pillow、ローカル `pose_core.py`、Qt `QApplication` / platform plugin を順に確認します。
+NumPy、SciPy、Trimesh、PyVista、PyVistaQt、VTK、PySide6、QtPy、Pillow、psutil、ローカル `pose_core.py`、Qt `QApplication` / platform plugin を順に確認します。
 
 正常な場合、最後に：
 
@@ -590,6 +596,7 @@ OBJサイズは `v / vt / vn`、桁数、material記述で変わるため概算�
 | `PySide6` | GUI / event処理 |
 | `PIL` (Pillow) | PNG生成・合成、輪郭・断面・scale bar |
 | `QtPy` | PyVistaQt依存のQt abstraction |
+| `psutil` | OBJのUV継ぎ目検査前の利用可能メモリ確認 |
 
 標準ライブラリでは `csv`, `io`, `json`, `math`, `shutil`, `sys`, `tempfile`, `traceback`, `pathlib`, `time`, `xml.etree.ElementTree`, `itertools`, `hashlib`, `struct`, `dataclasses`, `typing` 等を使用します。ローカル `pose_core.py` がMeshAsset、姿勢推定、Transform、mesh I/Oの共通コアです。
 

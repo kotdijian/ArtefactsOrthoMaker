@@ -18,6 +18,7 @@ import pyvista as pv
 import trimesh
 import pose_core as _pose_core
 import item_output
+from ui_language import UiLanguage
 from pyvistaqt import QtInteractor
 from PySide6.QtCore import Qt, QEvent, QLockFile, QTimer
 from PySide6.QtGui import QAction, QColor, QPainter, QPen, QPixmap
@@ -239,6 +240,7 @@ def load_mesh_asset(
 class OrthoPreviewWindow(QMainWindow):
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.ui = getattr(parent, "ui", None) or UiLanguage()
         self.setWindowTitle("オルソ画像プレビュー")
         self.resize(1280, 900)
 
@@ -260,7 +262,7 @@ class OrthoPreviewWindow(QMainWindow):
         self.zoom_out_btn.clicked.connect(lambda: self._step_zoom(-10))
         toolbar.addWidget(self.zoom_out_btn)
 
-        self.zoom_label = QLabel("Fit width")
+        self.zoom_label = QLabel("幅に合わせる")
         self.zoom_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.zoom_label.setMinimumWidth(90)
         toolbar.addWidget(self.zoom_label)
@@ -269,7 +271,7 @@ class OrthoPreviewWindow(QMainWindow):
         self.zoom_reset_btn.clicked.connect(self._set_actual_size)
         toolbar.addWidget(self.zoom_reset_btn)
 
-        self.zoom_fit_btn = QPushButton("Fit width")
+        self.zoom_fit_btn = QPushButton("幅に合わせる")
         self.zoom_fit_btn.clicked.connect(self._set_fit_width)
         toolbar.addWidget(self.zoom_fit_btn)
 
@@ -303,6 +305,7 @@ class OrthoPreviewWindow(QMainWindow):
         self.scroll.setWidget(self.container)
 
         self._update_zoom_label()
+        self.ui.register(self)
 
     def _clear_items(self):
         self._items.clear()
@@ -314,9 +317,9 @@ class OrthoPreviewWindow(QMainWindow):
 
     def _update_zoom_label(self):
         if self._fit_width_mode:
-            self.zoom_label.setText(f"Fit width ({self._zoom_percent}%)")
+            self.ui.bind(self.zoom_label, "setText", f"幅に合わせる ({self._zoom_percent}%)")
         else:
-            self.zoom_label.setText(f"{self._zoom_percent}%")
+            self.ui.bind(self.zoom_label, "setText", f"{self._zoom_percent}%")
 
     def _fit_base_width(self) -> int:
         vw = max(200, self.scroll.viewport().width() - 24)
@@ -356,20 +359,22 @@ class OrthoPreviewWindow(QMainWindow):
         self._apply_zoom()
 
     def set_message(self, message: str):
-        self.info_label.setText(message)
+        self.ui.bind(self.info_label, "setText", message)
         self._clear_items()
 
     def set_images(self, items: list[tuple[str, str]], summary: str = ""):
-        self.info_label.setText(summary or "")
+        self.ui.bind(self.info_label, "setText", summary or "")
         self._clear_items()
         if not items:
             empty = QLabel("表示できるオルソPNGがありません。")
+            self.ui.bind(empty, "setText", empty.text())
             empty.setWordWrap(True)
             self.container_layout.addWidget(empty)
             return
 
         for title, path in items:
             title_label = QLabel(title)
+            self.ui.bind(title_label, "setText", title)
             title_label.setWordWrap(True)
             self.container_layout.addWidget(title_label)
 
@@ -377,7 +382,7 @@ class OrthoPreviewWindow(QMainWindow):
             image_label = QLabel()
             image_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
             if pix.isNull():
-                image_label.setText(f"画像を読み込めませんでした: {path}")
+                self.ui.bind(image_label, "setText", f"画像を読み込めませんでした: {path}")
             else:
                 self._items.append((title, image_label, pix))
             self.container_layout.addWidget(image_label)
@@ -564,6 +569,7 @@ class LithicSectionLineItem(QGraphicsLineItem):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+        self.ui = UiLanguage()
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
         self.resize(1500, 900)
 
@@ -650,7 +656,8 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._build_menu()
-        self.statusBar().showMessage("inputフォルダを確認しています…")
+        self.ui.register(self)
+        self._show_status("inputフォルダを確認しています…")
         QTimer.singleShot(0, self.scan_queue_and_load)
 
     # ---------- UI ----------
@@ -665,12 +672,21 @@ class MainWindow(QMainWindow):
         left_layout = QVBoxLayout(controls)
         left_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
 
+        language_row = QHBoxLayout()
+        language_row.addWidget(QLabel("言語 / Language"))
+        self.language_combo = QComboBox()
+        self.language_combo.addItem("日本語", "ja")
+        self.language_combo.addItem("English", "en")
+        self.language_combo.setCurrentIndex(1 if self.ui.code == "en" else 0)
+        self.language_combo.currentIndexChanged.connect(self._set_ui_language)
+        language_row.addWidget(self.language_combo, 1)
+        left_layout.addLayout(language_row)
+
         file_group = QGroupBox("1. 入力キュー / 単位")
         file_form = QFormLayout(file_group)
         self.artifact_type_combo = QComboBox()
-        self.artifact_type_combo.addItems(["土器", "石器"])
-        self.artifact_type_combo.setCurrentText("土器")
-        self.artifact_type_combo.currentTextChanged.connect(self._artifact_type_changed)
+        self._set_translated_options(self.artifact_type_combo, ["土器", "石器"])
+        self.artifact_type_combo.currentIndexChanged.connect(self._artifact_type_changed)
 
         self.unit_combo = QComboBox()
         self.unit_combo.addItems(["mm", "cm", "m"])
@@ -817,12 +833,12 @@ class MainWindow(QMainWindow):
         self.pottery_output_branch_group = QGroupBox("4. 土器 出力方式")
         pottery_branch_layout = QVBoxLayout(self.pottery_output_branch_group)
         self.pottery_output_branch_combo = QComboBox()
-        self.pottery_output_branch_combo.addItems([
+        self._set_translated_options(self.pottery_output_branch_combo, [
             "オルソ展開図",
             "円筒展開図",
             "扇形展開図",
         ])
-        self.pottery_output_branch_combo.currentTextChanged.connect(
+        self.pottery_output_branch_combo.currentIndexChanged.connect(
             self._pottery_output_branch_changed
         )
         pottery_branch_layout.addWidget(QLabel(
@@ -839,7 +855,7 @@ class MainWindow(QMainWindow):
         )
         pottery_size_form = QFormLayout(self.pottery_image_size_group)
         self.pottery_curve_image_size_mode_combo = QComboBox()
-        self.pottery_curve_image_size_mode_combo.addItems([
+        self._set_translated_options(self.pottery_curve_image_size_mode_combo, [
             "印刷スケール指定",
             "ファイルサイズ指定",
         ])
@@ -1024,7 +1040,7 @@ class MainWindow(QMainWindow):
         image_size_form = QFormLayout(image_size_group)
 
         self.lithic_image_size_mode_combo = QComboBox()
-        self.lithic_image_size_mode_combo.addItems([
+        self._set_translated_options(self.lithic_image_size_mode_combo, [
             "印刷スケール指定",
             "ファイルサイズ指定",
         ])
@@ -1236,7 +1252,7 @@ class MainWindow(QMainWindow):
         ))
         curve_render_form = QFormLayout()
         self.pottery_curve_render_combo = QComboBox()
-        self.pottery_curve_render_combo.addItems([
+        self._set_translated_options(self.pottery_curve_render_combo, [
             "テクスチャ / 頂点カラー",
             "テクスチャ / 頂点カラー + Normal",
             "Normalのみ（シェード）",
@@ -1305,7 +1321,7 @@ class MainWindow(QMainWindow):
             "現在Zを区分点として追加すると、各区間を別々の基準外径で円筒展開します。"
         ))
         self.pottery_cylinder_break_table = QTableWidget(0, 1)
-        self.pottery_cylinder_break_table.setHorizontalHeaderLabels(["区分Z (mm)"])
+        self.pottery_cylinder_break_table.setProperty("headerSources", ["区分Z (mm)"])
         self.pottery_cylinder_break_table.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.Stretch
         )
@@ -1325,7 +1341,7 @@ class MainWindow(QMainWindow):
         cylinder_layout.addLayout(cylinder_break_buttons)
 
         self.pottery_cylinder_segment_table = QTableWidget(0, 4)
-        self.pottery_cylinder_segment_table.setHorizontalHeaderLabels([
+        self.pottery_cylinder_segment_table.setProperty("headerSources", [
             "Z下端 (mm)", "Z上端 (mm)", "基準Z (mm)", "外径D (mm)"
         ])
         self.pottery_cylinder_segment_table.horizontalHeader().setSectionResizeMode(
@@ -1357,7 +1373,7 @@ class MainWindow(QMainWindow):
             "スライダーまたは3Dクリックで現在Zを指定して区分点を追加します。"
         ))
         self.pottery_fan_table = QTableWidget(0, 2)
-        self.pottery_fan_table.setHorizontalHeaderLabels(["Z (mm)", "外径D (mm)"])
+        self.pottery_fan_table.setProperty("headerSources", ["Z (mm)", "外径D (mm)"])
         self.pottery_fan_table.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.Stretch
         )
@@ -1510,13 +1526,27 @@ class MainWindow(QMainWindow):
         self._connect_preview_refresh_signals()
         self._update_artifact_type_ui()
 
+    @staticmethod
+    def _set_translated_options(combo, options):
+        combo.setProperty("translatedOptions", True)
+        for option in options:
+            combo.addItem(option, option)
+
+    def _set_ui_language(self, *_args):
+        self.ui.set_language(self.language_combo.currentData(), self)
+        self.statusBar().showMessage(self.ui.text(self._status_source))
+
+    def _show_status(self, source):
+        self._status_source = source
+        self.statusBar().showMessage(self.ui.text(source))
+
     def _build_menu(self):
-        file_menu = self.menuBar().addMenu("File")
-        reload_action = QAction("Reload input queue", self)
+        file_menu = self.menuBar().addMenu("ファイル")
+        reload_action = QAction("inputフォルダを再読込", self)
         self.reload_action = reload_action
         reload_action.triggered.connect(self.scan_queue_and_load)
         file_menu.addAction(reload_action)
-        quit_action = QAction("Quit", self)
+        quit_action = QAction("終了", self)
         quit_action.triggered.connect(self.close)
         file_menu.addAction(quit_action)
 
@@ -1624,7 +1654,7 @@ class MainWindow(QMainWindow):
     def _pottery_output_branch_key(self) -> str:
         if not hasattr(self, "pottery_output_branch_combo"):
             return "ortho"
-        text = self.pottery_output_branch_combo.currentText()
+        text = self.pottery_output_branch_combo.currentData()
         if text == "円筒展開図":
             return "cylindrical"
         if text == "扇形展開図":
@@ -1649,7 +1679,8 @@ class MainWindow(QMainWindow):
         self.pottery_curve_group.setVisible(branch != "ortho")
         self.pottery_cylinder_group.setVisible(branch == "cylindrical")
         self.pottery_fan_group.setVisible(branch == "fan")
-        self.preview_btn.setText(
+        self.ui.bind(
+            self.preview_btn, "setText",
             "オルソ画像プレビューを開く"
             if branch == "ortho"
             else "曲面展開プレビューを開く"
@@ -1827,7 +1858,7 @@ class MainWindow(QMainWindow):
 
     # ---------- Artifact type / Lithic initial pose ----------
     def _is_lithic(self) -> bool:
-        return self.artifact_type_combo.currentText() == "石器"
+        return self.artifact_type_combo.currentData() == "石器"
 
     def _update_artifact_type_ui(self):
         lithic = self._is_lithic()
@@ -1904,13 +1935,13 @@ class MainWindow(QMainWindow):
         self.lithic_pose_confirmed = False
         self._reset_lithic_section_definitions()
         self.manual_points = []
-        self.manual_pick_label.setText("選択点: 0 / 3")
+        self.ui.bind(self.manual_pick_label, "setText", "選択点: 0 / 3")
 
         self._configure_appearance_options()
         if self._is_lithic():
             self._use_lithic_input_pose()
         else:
-            self.pose_label.setText("姿勢未確定")
+            self.ui.bind(self.pose_label, "setText", "姿勢未確定")
             self.pottery_output_branch_group.setEnabled(False)
             self.pottery_image_size_group.setEnabled(False)
             self.refresh_view(reset_camera=True)
@@ -2213,7 +2244,8 @@ class MainWindow(QMainWindow):
                 if self.lithic_section_level_residual_deg is not None
                 else 0.0
             )
-            self.lithic_obb_label.setText(
+            self.ui.bind(
+                self.lithic_obb_label, "setText",
                 "自動姿勢推定済み<br>"
                 "① minimum-volume OBB<br>"
                 f"X = 幅: {ex[0]:.3f} {unit} ({ex[0] * scale:.2f} mm)<br>"
@@ -2229,7 +2261,8 @@ class MainWindow(QMainWindow):
 
         bounds = np.asarray(self.asset.mesh.bounds, dtype=float)
         extents = bounds[1] - bounds[0]
-        self.lithic_obb_label.setText(
+        self.ui.bind(
+            self.lithic_obb_label, "setText",
             "読込姿勢を使用中（自動姿勢推定は未適用）<br>"
             "入力PLYのX/Y/Z方向をそのまま保持します。<br>"
             f"X extent: {extents[0]:.3f} {unit} "
@@ -2283,7 +2316,7 @@ class MainWindow(QMainWindow):
         self._update_lithic_pose_status_label()
         self._update_artifact_type_ui()
         self.refresh_view(reset_camera=True)
-        self.statusBar().showMessage(
+        self._show_status(
             "石器: 読込時の姿勢を保持しています。"
             "必要な場合だけ「自動姿勢推定」を実行してください。"
         )
@@ -2307,7 +2340,7 @@ class MainWindow(QMainWindow):
                 ) from e
 
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-            self.statusBar().showMessage(
+            self._show_status(
                 "石器: minimum-volume oriented_bounds() を計算中…"
             )
             QApplication.processEvents()
@@ -2357,7 +2390,7 @@ class MainWindow(QMainWindow):
             )
             original_to_obb = obb_origin_shift @ raw_to_obb_centered
 
-            self.statusBar().showMessage(
+            self._show_status(
                 "石器: 中央X-Z断面の左右端を水平化中…"
             )
             QApplication.processEvents()
@@ -2440,14 +2473,15 @@ class MainWindow(QMainWindow):
             self._update_lithic_pose_status_label()
 
             self.refresh_view(reset_camera=True)
-            self.statusBar().showMessage(
+            self._show_status(
                 "石器の自動姿勢推定（OBB＋中央X-Z断面水平化）を適用しました。"
                 "必要に応じてX/Y/Z軸回転で微調整してください。"
             )
         except Exception as e:
             # Do not invalidate the loaded/input pose merely because optional
             # automatic estimation failed.
-            self.lithic_obb_label.setText(
+            self.ui.bind(
+                self.lithic_obb_label, "setText",
                 f"石器自動姿勢推定エラー: {e}<br>"
                 "「読込姿勢に戻す」で入力PLYの姿勢を使用できます。"
             )
@@ -2599,13 +2633,11 @@ class MainWindow(QMainWindow):
 
     def _confirm_lithic_pose(self):
         if not self.asset or not self.posture_done:
-            QMessageBox.warning(
-                self, "未確定", "石器の基準姿勢を準備できていません。"
-            )
+            self._message_box("warning", "未確定", "石器の基準姿勢を準備できていません。")
             return
         try:
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-            self.statusBar().showMessage(
+            self._show_status(
                 "石器姿勢を確定し、bbox左下隅へ座標原点を設定中…"
             )
             QApplication.processEvents()
@@ -2614,9 +2646,10 @@ class MainWindow(QMainWindow):
             self.lithic_confirmed_final_matrix = final_matrix
             self.lithic_obb_to_result_matrix = obb_to_result
             self.lithic_pose_confirmed = True
-            current_label = self.lithic_obb_label.text()
+            current_label = self.ui.source(self.lithic_obb_label, "setText")
             if "座標原点:" not in current_label:
-                self.lithic_obb_label.setText(
+                self.ui.bind(
+                    self.lithic_obb_label, "setText",
                     current_label
                     + "<br>座標原点: final bbox 左下隅 "
                     "(Xmin, Ymin, Zmin) = (0, 0, 0)"
@@ -2629,7 +2662,7 @@ class MainWindow(QMainWindow):
             self.viewer_stack.setCurrentIndex(1)
             self.refresh_view(reset_camera=True)
             self._schedule_lithic_output_size_update()
-            self.statusBar().showMessage(
+            self._show_status(
                 "石器姿勢を決定しました。出力設定またはプレビュー確認へ進んでください。"
             )
         except Exception as e:
@@ -2647,7 +2680,7 @@ class MainWindow(QMainWindow):
         self.viewer_stack.setCurrentIndex(1)
         self.refresh_view(reset_camera=True)
         self._schedule_lithic_output_size_update()
-        self.statusBar().showMessage(
+        self._show_status(
             "石器姿勢調整へ戻りました。再度「姿勢決定」で確定できます。"
         )
 
@@ -2719,9 +2752,7 @@ class MainWindow(QMainWindow):
     def _delete_selected_lithic_section(self):
         sid = self.lithic_active_section_id
         if not sid:
-            QMessageBox.information(
-                self, "断面未選択", "削除する青線をプレビュー上で選択してください。"
-            )
+            self._message_box("information", "断面未選択", "削除する青線をプレビュー上で選択してください。")
             return
         before = len(self.lithic_sections)
         self.lithic_sections = [
@@ -2773,8 +2804,7 @@ class MainWindow(QMainWindow):
             " / 位置変更後は「プレビュー確認」で断面を再生成"
             if dirty else ""
         )
-        self.lithic_section_status_label.setText(
-            f'断面 X={counts["X"]} / Y={counts["Y"]} / 選択: {selected}{suffix}'
+        self.ui.bind(self.lithic_section_status_label, "setText", f'断面 X={counts["X"]} / Y={counts["Y"]} / 選択: {selected}{suffix}'
         )
 
     def _drag_lithic_section_line(
@@ -3053,7 +3083,7 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "lithic_image_size_mode_combo"):
             return
         print_mode = (
-            self.lithic_image_size_mode_combo.currentText()
+            self.lithic_image_size_mode_combo.currentData()
             == "印刷スケール指定"
         )
         self.lithic_print_dpi_combo.setEnabled(print_mode)
@@ -3224,14 +3254,12 @@ class MainWindow(QMainWindow):
             or not self.lithic_pose_confirmed
             or self.lithic_confirmed_final_matrix is None
         ):
-            self.lithic_output_size_label.setText(
-                "姿勢決定後に画像サイズを概算します。"
-            )
+            self.ui.bind(self.lithic_output_size_label, "setText", "姿勢決定後に画像サイズを概算します。")
             return
 
         views = self._selected_lithic_views()
         if not views:
-            self.lithic_output_size_label.setText("出力面が未選択です。")
+            self.ui.bind(self.lithic_output_size_label, "setText", "出力面が未選択です。")
             return
 
         try:
@@ -3240,7 +3268,7 @@ class MainWindow(QMainWindow):
             )
             unit_to_mm = float(self.asset.unit_to_mm)
             scale_bar_mm = self._selected_lithic_scale_bar_mm()
-            mode = self.lithic_image_size_mode_combo.currentText()
+            mode = self.lithic_image_size_mode_combo.currentData()
             bpp = self._lithic_default_png_bpp_estimate()
 
             if mode == "印刷スケール指定":
@@ -3257,7 +3285,8 @@ class MainWindow(QMainWindow):
                 print_w_mm = metrics["canvas_w_px"] / dpi * 25.4
                 print_h_mm = metrics["canvas_h_px"] / dpi * 25.4
                 raw_mb = metrics["pixels"] * 3.0 / 1_000_000.0
-                self.lithic_output_size_label.setText(
+                self.ui.bind(
+                    self.lithic_output_size_label, "setText",
                     f"概算: {metrics['canvas_w_px']:,} × "
                     f"{metrics['canvas_h_px']:,} px / "
                     f"{metrics['pixels'] / 1_000_000.0:.1f} MP<br>"
@@ -3288,7 +3317,8 @@ class MainWindow(QMainWindow):
                     metrics["pixels"] * bpp * PNG_FILESIZE_SAFETY_FACTOR
                 )
                 px_per_mm = ppu / unit_to_mm
-                self.lithic_output_size_label.setText(
+                self.ui.bind(
+                    self.lithic_output_size_label, "setText",
                     f"概算: {metrics['canvas_w_px']:,} × "
                     f"{metrics['canvas_h_px']:,} px / "
                     f"{metrics['pixels'] / 1_000_000.0:.1f} MP<br>"
@@ -3298,9 +3328,7 @@ class MainWindow(QMainWindow):
                     "本出力前に低解像度PNGで再較正します。"
                 )
         except Exception as e:
-            self.lithic_output_size_label.setText(
-                f"サイズ概算を計算できません: {e}"
-            )
+            self.ui.bind(self.lithic_output_size_label, "setText", f"サイズ概算を計算できません: {e}")
 
     # ---------- Input queue / Loading / QA ----------
     def _scan_files(self) -> list[Path]:
@@ -3343,15 +3371,16 @@ class MainWindow(QMainWindow):
             self.queue_all = self._scan_files()
             pending = [p for p in self.queue_all if not self._input_output_is_complete(p)]
             done = len(self.queue_all) - len(pending)
-            self.queue_label.setText(
+            self.ui.bind(
+                self.queue_label, "setText",
                 f"全 {len(self.queue_all)} / 完了 {done} / 未処理 {len(pending)}\n"
                 f"input: {INPUT_DIR}\noutput: {OUTPUT_DIR}"
             )
             if not pending:
                 self.asset = None
                 self.current_queue_path = None
-                self.file_label.setText("未処理ファイルなし")
-                self.qa_label.setText("—")
+                self.ui.bind(self.file_label, "setText", "未処理ファイルなし")
+                self.ui.bind(self.qa_label, "setText", "—")
                 self._set_enabled(False)
                 self.plotter.clear()
                 self.plotter.add_axes()
@@ -3366,9 +3395,9 @@ class MainWindow(QMainWindow):
                 if self.lithic_preview_scene is not None:
                     self.lithic_preview_scene.clear()
                 if self.queue_all:
-                    self.statusBar().showMessage("すべての入力ファイルが処理済みです。")
+                    self._show_status("すべての入力ファイルが処理済みです。")
                 else:
-                    self.statusBar().showMessage(f"{INPUT_DIR} に OBJ / PLY / GLB を入れてください。")
+                    self._show_status(f"{INPUT_DIR} に OBJ / PLY / GLB を入れてください。")
                 self._schedule_preview_refresh()
                 return
             self._load_path(pending[0])
@@ -3394,21 +3423,21 @@ class MainWindow(QMainWindow):
 
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Icon.Warning)
-        box.setWindowTitle("大容量モデルの確認")
+        box.setWindowTitle(self.ui.text("大容量モデルの確認"))
         box.setText(
-            f"入力ファイルのサイズは {size_mb:,.1f} MB です。\n\n"
+            self.ui.text(f"入力ファイルのサイズは {size_mb:,.1f} MB です。\n\n"
             "300 MBを超えるモデルでは、読み込み・Normal検証・表示・"
             "画像生成に時間がかかり、使用メモリが大きくなる場合があります。\n\n"
             "ArtefactsOrthoMakerは自動的なメッシュ縮小を行いません。"
-            "続行する場合は元のフルメッシュをそのまま読み込みます。"
+            "続行する場合は元のフルメッシュをそのまま読み込みます。")
         )
-        box.setInformativeText("このまま読み込みを続行しますか？")
+        box.setInformativeText(self.ui.text("このまま読み込みを続行しますか？"))
         continue_btn = box.addButton(
-            "続行",
+            self.ui.text("続行"),
             QMessageBox.ButtonRole.AcceptRole,
         )
         cancel_btn = box.addButton(
-            "キャンセル",
+            self.ui.text("キャンセル"),
             QMessageBox.ButtonRole.RejectRole,
         )
         box.setDefaultButton(cancel_btn)
@@ -3423,15 +3452,15 @@ class MainWindow(QMainWindow):
         )
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Icon.Warning)
-        box.setWindowTitle("OBJのUV継ぎ目検査とメモリの確認")
+        box.setWindowTitle(self.ui.text("OBJのUV継ぎ目検査とメモリの確認"))
         box.setText(
-            f"利用可能メモリ: {available}\n"
+            self.ui.text(f"利用可能メモリ: {available}\n"
             f"検査の推定追加メモリ: {qa.estimated_extra_memory_bytes / mib:,.0f} MiB\n"
-            f"確保する余裕: {qa.memory_reserve_bytes / mib:,.0f} MiB"
+            f"確保する余裕: {qa.memory_reserve_bytes / mib:,.0f} MiB")
         )
-        box.setInformativeText("継ぎ目検査を省略しても、通常の水密性・頂点順序検査の結果は記録されます。")
-        skip = box.addButton("継ぎ目検査を省略して続行", QMessageBox.ButtonRole.RejectRole)
-        run = box.addButton("検査を実行", QMessageBox.ButtonRole.AcceptRole)
+        box.setInformativeText(self.ui.text("継ぎ目検査を省略しても、通常の水密性・頂点順序検査の結果は記録されます。"))
+        skip = box.addButton(self.ui.text("継ぎ目検査を省略して続行"), QMessageBox.ButtonRole.RejectRole)
+        run = box.addButton(self.ui.text("検査を実行"), QMessageBox.ButtonRole.AcceptRole)
         box.setDefaultButton(skip)
         box.setEscapeButton(skip)
         QApplication.setOverrideCursor(Qt.CursorShape.ArrowCursor)
@@ -3444,13 +3473,13 @@ class MainWindow(QMainWindow):
     def _load_path(self, path: Path):
         try:
             if not self._confirm_large_input_file(path):
-                self.statusBar().showMessage(
+                self._show_status(
                     f"読み込みをキャンセルしました: {path.name}"
                 )
                 return
 
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-            self.statusBar().showMessage(f"読み込み・メッシュ検査・Normal計算中: {path.name}")
+            self._show_status(f"読み込み・メッシュ検査・Normal計算中: {path.name}")
             QApplication.processEvents()
             source = path.resolve()
             initial_stamp = item_output.file_stamp(source)
@@ -3507,15 +3536,15 @@ class MainWindow(QMainWindow):
             self._reset_lithic_section_definitions()
 
             self.manual_points = []
-            self.manual_pick_label.setText("選択点: 0 / 3")
-            self.pose_label.setText("姿勢未確定")
-            self.file_label.setText(path.name)
+            self.ui.bind(self.manual_pick_label, "setText", "選択点: 0 / 3")
+            self.ui.bind(self.pose_label, "setText", "姿勢未確定")
+            self.ui.bind(self.file_label, "setText", path.name, translate=False)
             self._update_qa()
             self._set_enabled(True)
             self._configure_appearance_options()
             self.set_front_angle(0.0)
             self._update_artifact_type_ui()
-            self.statusBar().showMessage(f"3D表示を更新中: {path.name}")
+            self._show_status(f"3D表示を更新中: {path.name}")
             QApplication.processEvents()
             if self._is_lithic():
                 self._use_lithic_input_pose()
@@ -3524,7 +3553,7 @@ class MainWindow(QMainWindow):
                 self._schedule_preview_refresh()
             pending = [p for p in self.queue_all if not self._input_output_is_complete(p)]
             index = pending.index(path) + 1 if path in pending else 1
-            self.statusBar().showMessage(
+            self._show_status(
                 f"未処理 {index}/{len(pending)}: {path.name} — 姿勢方式を選んでください。"
             )
         except Exception as e:
@@ -3549,7 +3578,7 @@ class MainWindow(QMainWindow):
 
     def _update_qa(self):
         if not self.asset:
-            self.qa_label.setText("—")
+            self.ui.bind(self.qa_label, "setText", "—")
             return
         m = self.asset.mesh
         appearance = {
@@ -3571,7 +3600,8 @@ class MainWindow(QMainWindow):
         seam_label = seam_labels.get(topology.obj_seam_status)
         seam_html = f"OBJ UV継ぎ目（同一座標）: {seam_label}<br>" if seam_label else ""
         winding_label = "整合" if topology.is_winding_consistent else "不整合あり"
-        self.qa_label.setText(
+        self.ui.bind(
+            self.qa_label, "setText",
             f"Vertices: {len(m.vertices):,}<br>"
             f"Faces: {len(m.faces):,}<br>"
             f"Input unit: {self.asset.input_unit}（座標値は変更しません）<br>"
@@ -3608,11 +3638,7 @@ class MainWindow(QMainWindow):
         self.lithic_mode_shade.setChecked(True)
 
         if hasattr(self, "pottery_curve_render_combo"):
-            self.pottery_curve_render_combo.setCurrentText(
-                "テクスチャ / 頂点カラー"
-                if has_appearance
-                else "Normalのみ（シェード）"
-            )
+            self.pottery_curve_render_combo.setCurrentIndex(0 if has_appearance else 2)
         self.mode_section.setEnabled(True)
         self.mode_half_section.setEnabled(True)
         self.mode_quarter_half.setEnabled(True)
@@ -3794,7 +3820,7 @@ class MainWindow(QMainWindow):
             try:
                 self._refresh_lithic_views()
             except Exception as e:
-                self.statusBar().showMessage(f"石器3面表示更新エラー: {e}")
+                self._show_status(f"石器3面表示更新エラー: {e}")
             return
         try:
             angle = self.front_angle_deg if self.posture_done else 0.0
@@ -3838,7 +3864,7 @@ class MainWindow(QMainWindow):
                 self._refresh_pottery_curve_z_guides()
             self._report_gui_shading_state(gui_lighting)
         except Exception as e:
-            self.statusBar().showMessage(f"表示更新エラー: {e}")
+            self._show_status(f"表示更新エラー: {e}")
 
     def _view_mode_changed(self, *_args):
         if not self.asset:
@@ -3848,11 +3874,11 @@ class MainWindow(QMainWindow):
             self._update_viewer_scale_overlay(render=False)
             self.plotter.render()
         except Exception as e:
-            self.statusBar().showMessage(f"表示方向変更エラー: {e}")
+            self._show_status(f"表示方向変更エラー: {e}")
 
 
     def _update_zoom_label(self):
-        self.zoom_label.setText(f"{int(round(self._zoom_percent))}%")
+        self.ui.bind(self.zoom_label, "setText", f"{int(round(self._zoom_percent))}%")
 
     def _zoom_slider_changed(self, value: int):
         if self._updating_zoom_ui:
@@ -3908,7 +3934,7 @@ class MainWindow(QMainWindow):
             if render:
                 self.plotter.render()
         except Exception as e:
-            self.statusBar().showMessage(f"Zoom更新エラー: {e}")
+            self._show_status(f"Zoom更新エラー: {e}")
 
     def _sync_zoom_ui_from_camera(self):
         if not self.asset or not hasattr(self, "plotter"):
@@ -4072,7 +4098,7 @@ class MainWindow(QMainWindow):
             if render:
                 self.plotter.render()
         except Exception as e:
-            self.statusBar().showMessage(f"表示スケール更新エラー: {e}")
+            self._show_status(f"表示スケール更新エラー: {e}")
 
     def _draw_center_axis(self):
         axis = self.center_axis_after_pose
@@ -4111,7 +4137,7 @@ class MainWindow(QMainWindow):
                 ref_normal = plane.normal
             elif method in {"rim", "base", "slice"}:
                 if self.pottery_opening is None:
-                    self.statusBar().showMessage("開口側と口縁候補を探索中…")
+                    self._show_status("開口側と口縁候補を探索中…")
                     self.pottery_opening = estimate_pottery_opening(self.asset.mesh)
                 opening = self.pottery_opening
                 opening_axis = AxisEstimate(opening.point, opening.normal, 0.0, opening.confidence,
@@ -4128,7 +4154,7 @@ class MainWindow(QMainWindow):
                     ref_normal = plane.normal
                 else:
                     if self.pottery_slice_axis is None:
-                        self.statusBar().showMessage("断面の対称性から器軸を推定中…")
+                        self._show_status("断面の対称性から器軸を推定中…")
                         self.pottery_slice_axis = estimate_pottery_slice(self.asset.mesh, opening)
                     axis = self.pottery_slice_axis
                     status = axis.diagnostics["status"]
@@ -4136,11 +4162,10 @@ class MainWindow(QMainWindow):
                     if status == "held":
                         if self.posture_done:
                             self.pose_info.setdefault("pose_quality", {})["slice"] = dict(axis.diagnostics)
-                        QMessageBox.information(self, "Slice 判定保留", reason + "\nRim・Baseまたは手動水平を選択できます。")
-                        self.statusBar().showMessage("Sliceの自動確定を保留しました。")
+                        self._message_box("information", "Slice 判定保留", reason + "\nRim・Baseまたは手動水平を選択できます。")
+                        self._show_status("Sliceの自動確定を保留しました。")
                         return
-                    if status == "reference" and QMessageBox.question(
-                        self, "Slice 参考値", reason + "\n参考姿勢として適用しますか？",
+                    if status == "reference" and self._message_box("question", "Slice 参考値", reason + "\n参考姿勢として適用しますか？",
                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                         QMessageBox.StandardButton.No,
                     ) != QMessageBox.StandardButton.Yes:
@@ -4185,7 +4210,8 @@ class MainWindow(QMainWindow):
             if "slice" in quality:
                 status_label = {"accepted": "採用", "reference": "参考", "held": "保留"}[quality["slice"]["status"]]
                 ref_text += f"<br>Slice判定: {status_label} / {quality['slice']['reason']}"
-            self.pose_label.setText(
+            self.ui.bind(
+                self.pose_label, "setText",
                 f"Method: {method_text}<br>"
                 f"Center-axis confidence: {self.center_axis_after_pose.confidence:.2f}<br>"
                 f"Center axis ↔ Z: {axis_angle:.3f}°<br>"
@@ -4193,7 +4219,7 @@ class MainWindow(QMainWindow):
             )
             self.refresh_view(reset_camera=True)
             self._schedule_preview_refresh()
-            self.statusBar().showMessage("姿勢と原点を確定しました。次にZ軸回転で正面を決めてください。")
+            self._show_status("姿勢と原点を確定しました。次にZ軸回転で正面を決めてください。")
         except Exception as e:
             self._show_error("姿勢推定エラー", e)
         finally:
@@ -4218,7 +4244,7 @@ class MainWindow(QMainWindow):
         self.front_angle_deg = 0.0
         self.center_axis_after_pose = None
         self.manual_points = []
-        self.manual_pick_label.setText("選択点: 0 / 3")
+        self.ui.bind(self.manual_pick_label, "setText", "選択点: 0 / 3")
         self.method_combo.setCurrentText("Manual (3 points)")
         self.refresh_view(reset_camera=True)
         self._schedule_preview_refresh()
@@ -4234,7 +4260,7 @@ class MainWindow(QMainWindow):
             show_point=True,
             pickable_window=False,
         )
-        self.statusBar().showMessage("水平にしたい面上の3点を順にクリックしてください。")
+        self._show_status("水平にしたい面上の3点を順にクリックしてください。")
 
     def _picked_point(self, point):
         if not self.pick_mode:
@@ -4243,14 +4269,14 @@ class MainWindow(QMainWindow):
         if p.shape != (3,) or not np.isfinite(p).all():
             return
         self.manual_points.append(p)
-        self.manual_pick_label.setText(f"選択点: {len(self.manual_points)} / 3")
+        self.ui.bind(self.manual_pick_label, "setText", f"選択点: {len(self.manual_points)} / 3")
         if len(self.manual_points) >= 3:
             self.pick_mode = False
             try:
                 self.plotter.disable_picking()
             except Exception:
                 pass
-            self.statusBar().showMessage("3点を取得しました。「推定 / 適用」を押してください。")
+            self._show_status("3点を取得しました。「推定 / 適用」を押してください。")
 
     # ---------- Front rotation ----------
     def _front_drag_changed(self):
@@ -5624,22 +5650,16 @@ class MainWindow(QMainWindow):
 
     def _show_lithic_output_preview(self):
         if not self._is_lithic() or not self.lithic_pose_confirmed:
-            QMessageBox.warning(
-                self, "姿勢未決定", "先に「姿勢決定」を押してください。"
-            )
+            self._message_box("warning", "姿勢未決定", "先に「姿勢決定」を押してください。")
             return
 
         views = self._selected_lithic_views()
         modes = self._selected_lithic_modes()
         if not views:
-            QMessageBox.warning(
-                self, "未選択", "少なくとも1つの出力面を選択してください。"
-            )
+            self._message_box("warning", "未選択", "少なくとも1つの出力面を選択してください。")
             return
         if not modes:
-            QMessageBox.warning(
-                self, "未選択", "少なくとも1つの表現を選択してください。"
-            )
+            self._message_box("warning", "未選択", "少なくとも1つの表現を選択してください。")
             return
 
         # Interactive preview defaults to shade.  If the user disables
@@ -5649,7 +5669,7 @@ class MainWindow(QMainWindow):
 
         try:
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-            self.statusBar().showMessage("石器展開図プレビューを生成中…")
+            self._show_status("石器展開図プレビューを生成中…")
             QApplication.processEvents()
 
             if self._lithic_preview_temp_dir is not None:
@@ -5759,7 +5779,8 @@ class MainWindow(QMainWindow):
             )
             self._rebuild_lithic_preview_lines()
 
-            self.lithic_preview_info.setText(
+            self.ui.bind(
+                self.lithic_preview_info, "setText",
                 f"石器展開図 / {preview_mode} / "
                 f"青線=画面全体に連続する断面位置 / X断面={sum(s['axis']=='X' for s in self.lithic_sections)} "
                 f"/ Y断面={sum(s['axis']=='Y' for s in self.lithic_sections)}"
@@ -5768,7 +5789,7 @@ class MainWindow(QMainWindow):
             self.lithic_preview_view._fit_on_next_resize = True
             self.lithic_preview_view.fit_scene()
             self._update_lithic_section_status()
-            self.statusBar().showMessage(
+            self._show_status(
                 "石器展開図プレビュー。青線をドラッグし、"
                 "「プレビュー確認」で断面を再生成できます。"
             )
@@ -5800,7 +5821,7 @@ class MainWindow(QMainWindow):
             raise ValueError(f"Unknown pottery curve surface: {surface}") from exc
 
     def _pottery_curve_render_mode(self) -> str:
-        text = self.pottery_curve_render_combo.currentText()
+        text = self.pottery_curve_render_combo.currentData()
         if text == "Normalのみ（シェード）":
             return "shade"
         if text == "テクスチャ / 頂点カラー + Normal":
@@ -5946,7 +5967,7 @@ class MainWindow(QMainWindow):
             self._vtk_widget.setCursor(Qt.CursorShape.CrossCursor)
         except Exception:
             pass
-        self.statusBar().showMessage(
+        self._show_status(
             "土器表面をクリックしてください。クリックはZ位置指定専用となり、"
             "この間はモデル/カメラを回転しません。"
         )
@@ -5988,7 +6009,7 @@ class MainWindow(QMainWindow):
                 point = np.asarray(pp.GetPickPosition(), dtype=float)
 
             if not ok or point.shape != (3,) or not np.isfinite(point).all():
-                self.statusBar().showMessage(
+                self._show_status(
                     "モデル表面/点を取得できませんでした。もう一度クリックしてください。"
                 )
                 return True
@@ -5996,7 +6017,7 @@ class MainWindow(QMainWindow):
             self._pottery_curve_picked_z(point)
             return True
         except Exception as exc:
-            self.statusBar().showMessage(f"Z位置クリック取得エラー: {exc}")
+            self._show_status(f"Z位置クリック取得エラー: {exc}")
             return True
 
     def _pottery_curve_picked_z(self, point):
@@ -6014,7 +6035,7 @@ class MainWindow(QMainWindow):
             float(p[2]) * float(self.asset.unit_to_mm),
             refresh=True,
         )
-        self.statusBar().showMessage(
+        self._show_status(
             f"Z = {self.pottery_curve_z_cursor_spin.value():.3f} mm を選択しました。"
         )
 
@@ -6087,7 +6108,7 @@ class MainWindow(QMainWindow):
             )
             self.plotter.render()
         except Exception as e:
-            self.statusBar().showMessage(f"Z区分線表示エラー: {e}")
+            self._show_status(f"Z区分線表示エラー: {e}")
 
     @staticmethod
     def _readonly_table_item(text: str) -> QTableWidgetItem:
@@ -6259,10 +6280,10 @@ class MainWindow(QMainWindow):
         row = self.pottery_cylinder_break_table.currentRow()
         count = self.pottery_cylinder_break_table.rowCount()
         if row < 0:
-            QMessageBox.information(self, "区分点未選択", "削除する区分点を選択してください。")
+            self._message_box("information", "区分点未選択", "削除する区分点を選択してください。")
             return
         if row in (0, count - 1):
-            QMessageBox.information(self, "端点は保持", "底部・口縁の端点は削除できません。")
+            self._message_box("information", "端点は保持", "底部・口縁の端点は削除できません。")
             return
         del self.pottery_cylinder_breakpoints_mm[row]
         self._rebuild_pottery_cylinder_tables(preserve=True)
@@ -6281,13 +6302,12 @@ class MainWindow(QMainWindow):
                 dia = self._pottery_outer_diameter_at_z_mm(ref)
                 self._setting_pottery_curve_controls = True
                 try:
-                    self.pottery_cylinder_segment_table.item(row, 3).setText(
-                        f"{dia:.6f}"
+                    self.pottery_cylinder_segment_table.item(row, 3).setText(f"{dia:.6f}"
                     )
                 finally:
                     self._setting_pottery_curve_controls = False
             except Exception as e:
-                self.statusBar().showMessage(f"円筒基準外径の更新エラー: {e}")
+                self._show_status(f"円筒基準外径の更新エラー: {e}")
         self._schedule_pottery_curve_size_update()
 
     def _pottery_set_cylinder_reference_from_cursor(self):
@@ -6301,7 +6321,7 @@ class MainWindow(QMainWindow):
                     self.pottery_cylinder_segment_table.selectRow(i)
                     break
         if row < 0:
-            QMessageBox.information(self, "区間未選択", "基準Zを設定する円筒区間を選択してください。")
+            self._message_box("information", "区間未選択", "基準Zを設定する円筒区間を選択してください。")
             return
         try:
             z0 = float(self.pottery_cylinder_segment_table.item(row, 0).text())
@@ -6326,8 +6346,7 @@ class MainWindow(QMainWindow):
                 for row in range(self.pottery_cylinder_segment_table.rowCount()):
                     ref = float(self.pottery_cylinder_segment_table.item(row, 2).text())
                     dia = self._pottery_outer_diameter_at_z_mm(ref)
-                    self.pottery_cylinder_segment_table.item(row, 3).setText(
-                        f"{dia:.6f}"
+                    self.pottery_cylinder_segment_table.item(row, 3).setText(f"{dia:.6f}"
                     )
             finally:
                 self._setting_pottery_curve_controls = False
@@ -6395,12 +6414,10 @@ class MainWindow(QMainWindow):
         row = self.pottery_fan_table.currentRow()
         count = self.pottery_fan_table.rowCount()
         if row < 0:
-            QMessageBox.information(self, "区分点未選択", "削除する区分点を選択してください。")
+            self._message_box("information", "区分点未選択", "削除する区分点を選択してください。")
             return
         if row in (0, count - 1):
-            QMessageBox.information(
-                self, "端点は保持", "底部・口縁の端点は削除できません。"
-            )
+            self._message_box("information", "端点は保持", "底部・口縁の端点は削除できません。")
             return
         self.pottery_fan_table.removeRow(row)
         self._schedule_pottery_curve_size_update()
@@ -6461,7 +6478,7 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "pottery_curve_image_size_mode_combo"):
             return
         print_mode = (
-            self.pottery_curve_image_size_mode_combo.currentText()
+            self.pottery_curve_image_size_mode_combo.currentData()
             == "印刷スケール指定"
         )
         self.pottery_curve_print_dpi_combo.setEnabled(print_mode)
@@ -6851,9 +6868,9 @@ class MainWindow(QMainWindow):
             if hard
             else QMessageBox.Icon.Warning
         )
-        box.setWindowTitle(title)
+        box.setWindowTitle(self.ui.text(title))
         box.setText(
-            text
+            self.ui.text(text
             + "\n\n"
             + (
                 "現在の設定は安全上限を超えています。"
@@ -6861,20 +6878,20 @@ class MainWindow(QMainWindow):
                 else "大容量画像になる可能性があります。"
             )
             + f"\n推奨縮小: 線寸法 {percent:.4g}% "
-              f"→ 約 {w2:,} × {h2:,} px / {mp2:.1f} MP"
+              f"→ 約 {w2:,} × {h2:,} px / {mp2:.1f} MP")
         )
         reduce_btn = box.addButton(
-            f"{percent:.4g}%に縮小して出力",
+            self.ui.text(f"{percent:.4g}%に縮小して出力"),
             QMessageBox.ButtonRole.AcceptRole,
         )
         current_btn = None
         if not hard:
             current_btn = box.addButton(
-                "現設定で出力",
+                self.ui.text("現設定で出力"),
                 QMessageBox.ButtonRole.ActionRole,
             )
         cancel_btn = box.addButton(
-            "キャンセル",
+            self.ui.text("キャンセル"),
             QMessageBox.ButtonRole.RejectRole,
         )
         box.setDefaultButton(reduce_btn)
@@ -6895,7 +6912,7 @@ class MainWindow(QMainWindow):
         context = self._build_pottery_ortho_layout_context(
             views, modes, float(self.view_spacing.value())
         )
-        mode = self.pottery_curve_image_size_mode_combo.currentText()
+        mode = self.pottery_curve_image_size_mode_combo.currentData()
         dpi = None
         target_mb = None
         if mode == "印刷スケール指定":
@@ -6945,7 +6962,7 @@ class MainWindow(QMainWindow):
             f"処理時メモリ目安: {working / 1_000_000_000.0:.2f} GB",
         ])
         text = "\n".join(lines)
-        self.pottery_curve_output_size_label.setText(text.replace("\n", "<br>"))
+        self.ui.bind(self.pottery_curve_output_size_label, "setText", text.replace("\n", "<br>"))
         if preflight and (hard or warning):
             factor = self._large_raster_preflight_choice(
                 "画像サイズ上限超過" if hard else "大容量画像の確認",
@@ -6967,9 +6984,7 @@ class MainWindow(QMainWindow):
                     f"\n→ 書き出し解像度を線寸法 {factor * 100.0:.4g}% "
                     "へ縮小します。"
                 )
-                self.pottery_curve_output_size_label.setText(
-                    text.replace("\n", "<br>")
-                )
+                self.ui.bind(self.pottery_curve_output_size_label, "setText", text.replace("\n", "<br>"))
         return {
             "ppu": float(ppu),
             "png_dpi": dpi,
@@ -6985,18 +7000,16 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "pottery_curve_output_size_label"):
             return
         if not self.asset or not self.posture_done or self._is_lithic():
-            self.pottery_curve_output_size_label.setText(
-                "姿勢決定後に出力サイズを計算します。"
-            )
+            self.ui.bind(self.pottery_curve_output_size_label, "setText", "姿勢決定後に出力サイズを計算します。")
             return
         try:
             branch = self._pottery_output_branch_key()
-            mode = self.pottery_curve_image_size_mode_combo.currentText()
+            mode = self.pottery_curve_image_size_mode_combo.currentData()
             if branch == "ortho":
                 views = [k for k, cb in self.view_checks.items() if cb.isChecked()]
                 modes = self._selected_render_modes()
                 if not views:
-                    self.pottery_curve_output_size_label.setText("出力面が未選択です。")
+                    self.ui.bind(self.pottery_curve_output_size_label, "setText", "出力面が未選択です。")
                     return
                 context = self._build_pottery_ortho_layout_context(
                     views, modes, float(self.view_spacing.value())
@@ -7062,7 +7075,8 @@ class MainWindow(QMainWindow):
                 lead += f" / 展開面: {surface_text}"
                 if "upper" in selected_surfaces:
                     lead += "（上面は出力時に実メッシュ範囲で再計算）"
-            self.pottery_curve_output_size_label.setText(
+            self.ui.bind(
+                self.pottery_curve_output_size_label, "setText",
                 f"{lead}<br>"
                 f"画像: {metrics['canvas_w_px']:,} × {metrics['canvas_h_px']:,} px / "
                 f"{metrics['pixels'] / 1_000_000.0:.1f} MP<br>"
@@ -7070,7 +7084,7 @@ class MainWindow(QMainWindow):
                 f"RGB展開: {raw / 1_000_000.0:.1f} MB"
             )
         except Exception as e:
-            self.pottery_curve_output_size_label.setText(f"サイズ計算待ち: {e}")
+            self.ui.bind(self.pottery_curve_output_size_label, "setText", f"サイズ計算待ち: {e}")
 
     @staticmethod
     def _pottery_theta(vertices: np.ndarray) -> np.ndarray:
@@ -7549,7 +7563,7 @@ class MainWindow(QMainWindow):
             bounds2d,
             surface=surface,
         )
-        mode = self.pottery_curve_image_size_mode_combo.currentText()
+        mode = self.pottery_curve_image_size_mode_combo.currentData()
         dpi = None
         target_mb = None
         if mode == "印刷スケール指定":
@@ -7618,9 +7632,7 @@ class MainWindow(QMainWindow):
             f"処理時メモリ目安: {working / 1_000_000_000.0:.2f} GB",
         ])
         info_text = "\n".join(lines)
-        self.pottery_curve_output_size_label.setText(
-            info_text.replace("\n", "<br>")
-        )
+        self.ui.bind(self.pottery_curve_output_size_label, "setText", info_text.replace("\n", "<br>"))
 
         if preflight and (hard or warning):
             factor = self._large_raster_preflight_choice(
@@ -7648,9 +7660,7 @@ class MainWindow(QMainWindow):
                     f"\n→ 書き出し解像度を線寸法 {factor * 100.0:.4g}% "
                     "へ縮小します。"
                 )
-                self.pottery_curve_output_size_label.setText(
-                    info_text.replace("\n", "<br>")
-                )
+                self.ui.bind(self.pottery_curve_output_size_label, "setText", info_text.replace("\n", "<br>"))
 
         return {
             "ppu": float(ppu),
@@ -7688,7 +7698,7 @@ class MainWindow(QMainWindow):
                 ),
             },
             "image_size_mode": (
-                self.pottery_curve_image_size_mode_combo.currentText()
+                self.pottery_curve_image_size_mode_combo.currentData()
             ),
         }
         if "inner" in data["surfaces"]:
@@ -8022,27 +8032,27 @@ class MainWindow(QMainWindow):
                     "Z": "thickness",
                 },
                 "render_modes": self._selected_lithic_modes(),
-                "image_size_mode": self.lithic_image_size_mode_combo.currentText(),
+                "image_size_mode": self.lithic_image_size_mode_combo.currentData(),
                 "print_dpi": (
                     self._selected_lithic_print_dpi()
-                    if self.lithic_image_size_mode_combo.currentText()
+                    if self.lithic_image_size_mode_combo.currentData()
                     == "印刷スケール指定"
                     else None
                 ),
                 "print_scale_percent": (
                     self._selected_lithic_print_scale() * 100.0
-                    if self.lithic_image_size_mode_combo.currentText()
+                    if self.lithic_image_size_mode_combo.currentData()
                     == "印刷スケール指定"
                     else None
                 ),
                 "file_size_target_mb_per_png": (
                     self._selected_lithic_file_size_target_mb()
-                    if self.lithic_image_size_mode_combo.currentText()
+                    if self.lithic_image_size_mode_combo.currentData()
                     == "ファイルサイズ指定"
                     else None
                 ),
                 "file_size_maximum_mode": bool(
-                    self.lithic_image_size_mode_combo.currentText()
+                    self.lithic_image_size_mode_combo.currentData()
                     == "ファイルサイズ指定"
                     and self._selected_lithic_file_size_target_mb() is None
                 ),
@@ -8149,20 +8159,20 @@ class MainWindow(QMainWindow):
                 "view_spacing_mm": self.view_spacing.value(),
                 "projection": "parallel/orthographic",
                 "render_modes": self._selected_render_modes(),
-                "image_size_mode": self.pottery_curve_image_size_mode_combo.currentText(),
+                "image_size_mode": self.pottery_curve_image_size_mode_combo.currentData(),
                 "print_dpi": (
                     self._selected_pottery_curve_dpi()
-                    if self.pottery_curve_image_size_mode_combo.currentText()
+                    if self.pottery_curve_image_size_mode_combo.currentData()
                     == "印刷スケール指定" else None
                 ),
                 "print_scale": (
                     self._selected_pottery_curve_scale()
-                    if self.pottery_curve_image_size_mode_combo.currentText()
+                    if self.pottery_curve_image_size_mode_combo.currentData()
                     == "印刷スケール指定" else None
                 ),
                 "target_png_mb": (
                     self._selected_pottery_curve_target_mb()
-                    if self.pottery_curve_image_size_mode_combo.currentText()
+                    if self.pottery_curve_image_size_mode_combo.currentData()
                     == "ファイルサイズ指定" else None
                 ),
                 "composite": True,
@@ -8198,11 +8208,11 @@ class MainWindow(QMainWindow):
         value = int(max(0, min(100, value)))
         if self._is_lithic():
             self.lithic_export_progress.setValue(value)
-            self.lithic_export_stage_label.setText(text)
+            self.ui.bind(self.lithic_export_stage_label, "setText", text)
         else:
             self.export_progress.setValue(value)
-            self.export_stage_label.setText(text)
-        self.statusBar().showMessage(text)
+            self.ui.bind(self.export_stage_label, "setText", text)
+        self._show_status(text)
         QApplication.processEvents()
 
     def _require_confirmed_lithic_pose(self) -> bool:
@@ -8212,8 +8222,8 @@ class MainWindow(QMainWindow):
             or not self.lithic_pose_confirmed
             or self.lithic_confirmed_final_matrix is None
         ):
-            QMessageBox.warning(
-                self,
+            self._message_box(
+                "warning",
                 "姿勢未決定",
                 "先に石器の「姿勢決定」を押してください。",
             )
@@ -8419,7 +8429,7 @@ class MainWindow(QMainWindow):
         export_png_outline: bool,
     ) -> dict | None:
         """Resolve ppu/dpi, show preflight warnings, and return export config."""
-        mode = self.lithic_image_size_mode_combo.currentText()
+        mode = self.lithic_image_size_mode_combo.currentData()
         has_png = bool(export_png_plain or export_png_outline)
 
         # SVG itself is vector output and has no raster file-size target.
@@ -8473,7 +8483,7 @@ class MainWindow(QMainWindow):
             text, warning, hard = self._lithic_preflight_text(
                 metrics, bpp, dpi, scale, None
             )
-            self.lithic_output_size_label.setText(text.replace("\n", "<br>"))
+            self.ui.bind(self.lithic_output_size_label, "setText", text.replace("\n", "<br>"))
             if hard or warning:
                 factor = self._large_raster_preflight_choice(
                     "画像サイズ上限超過" if hard else "大容量画像の確認",
@@ -8497,9 +8507,7 @@ class MainWindow(QMainWindow):
                         f"\n→ 書き出し解像度を線寸法 {factor * 100.0:.4g}% "
                         "へ縮小します。"
                     )
-                    self.lithic_output_size_label.setText(
-                        text.replace("\n", "<br>")
-                    )
+                    self.ui.bind(self.lithic_output_size_label, "setText", text.replace("\n", "<br>"))
             return {
                 "ppu": float(ppu),
                 "png_dpi": float(dpi),
@@ -8516,7 +8524,7 @@ class MainWindow(QMainWindow):
         text, warning, hard = self._lithic_preflight_text(
             metrics, bpp, None, None, target_mb
         )
-        self.lithic_output_size_label.setText(text.replace("\n", "<br>"))
+        self.ui.bind(self.lithic_output_size_label, "setText", text.replace("\n", "<br>"))
         if hard or warning:
             factor = self._large_raster_preflight_choice(
                 "画像サイズ上限超過" if hard else "大容量画像の確認",
@@ -8540,9 +8548,7 @@ class MainWindow(QMainWindow):
                     f"\n→ 書き出し解像度を線寸法 {factor * 100.0:.4g}% "
                     "へ縮小します。"
                 )
-                self.lithic_output_size_label.setText(
-                    text.replace("\n", "<br>")
-                )
+                self.ui.bind(self.lithic_output_size_label, "setText", text.replace("\n", "<br>"))
         return {
             "ppu": float(ppu),
             "png_dpi": None,
@@ -8560,20 +8566,18 @@ class MainWindow(QMainWindow):
         export_png_outline = self.lithic_outline_overlay.isChecked()
 
         if not views:
-            QMessageBox.warning(
-                self, "未選択", "少なくとも1つの出力面を選択してください。"
-            )
+            self._message_box("warning", "未選択", "少なくとも1つの出力面を選択してください。")
             return []
         if not export_png_plain and not export_svg and not export_png_outline:
-            QMessageBox.warning(
-                self,
+            self._message_box(
+                "warning",
                 "未選択",
                 "PNGのみ / SVG / PNG+輪郭 の少なくとも1つを選択してください。",
             )
             return []
         if (export_png_plain or export_png_outline) and not modes:
-            QMessageBox.warning(
-                self,
+            self._message_box(
+                "warning",
                 "未選択",
                 "PNG出力では少なくとも1つの表現を選択してください。",
             )
@@ -8706,7 +8710,8 @@ class MainWindow(QMainWindow):
             with Image.open(largest_png) as im:
                 w_px, h_px = im.size
             actual_mb = largest_png.stat().st_size / 1_000_000.0
-            self.lithic_output_size_label.setText(
+            self.ui.bind(
+                self.lithic_output_size_label, "setText",
                 f"実出力: {w_px:,} × {h_px:,} px / "
                 f"最大PNG {actual_mb:.1f} MB"
                 + (
@@ -8762,9 +8767,7 @@ class MainWindow(QMainWindow):
 
     def _require_confirmed_pottery_pose(self) -> bool:
         if not self.asset or self._is_lithic() or not self.posture_done:
-            QMessageBox.warning(
-                self, "姿勢未決定", "先に土器の姿勢と正面を確定してください。"
-            )
+            self._message_box("warning", "姿勢未決定", "先に土器の姿勢と正面を確定してください。")
             return False
         return True
 
@@ -8775,18 +8778,18 @@ class MainWindow(QMainWindow):
         export_svg = self.output_svg.isChecked()
         export_png_outline = self.outline_overlay.isChecked()
         if not views:
-            QMessageBox.warning(self, "未選択", "少なくとも1つのオルソ面を選択してください。")
+            self._message_box("warning", "未選択", "少なくとも1つのオルソ面を選択してください。")
             return None
         if not export_png_plain and not export_svg and not export_png_outline:
-            QMessageBox.warning(
-                self,
+            self._message_box(
+                "warning",
                 "未選択",
                 "PNGのみ / SVG / PNG+輪郭 の少なくとも1つを選択してください。",
             )
             return None
         if (export_png_plain or export_png_outline) and not modes:
-            QMessageBox.warning(
-                self,
+            self._message_box(
+                "warning",
                 "未選択",
                 "PNG出力では少なくとも1つのオルソ表現を選択してください。",
             )
@@ -8797,8 +8800,8 @@ class MainWindow(QMainWindow):
             and any(m in modes for m in ("section", "half_section", "quarter_half_section"))
             and not base_modes
         ):
-            QMessageBox.warning(
-                self,
+            self._message_box(
+                "warning",
                 "未選択",
                 "縦断面・半截・1/4半截をPNGへ配置する場合は、"
                 "テクスチャ / Normal / シェードのいずれか1つ以上を選択してください。",
@@ -8916,7 +8919,7 @@ class MainWindow(QMainWindow):
             if checkbox.isChecked()
         ]
         if not layouts:
-            QMessageBox.warning(self, "未選択", "少なくとも1つの図版を選択してください。")
+            self._message_box("warning", "未選択", "少なくとも1つの図版を選択してください。")
             return
         final_matrix = self._measurement_final_matrix()
         self.item_export_active = True
@@ -8952,7 +8955,7 @@ class MainWindow(QMainWindow):
                 self._set_export_progress(95, "計測・品質・変換情報を保存中")
                 self.last_item_output = self._publish_item(staging, final_matrix, roles)
             self._set_export_progress(100, f"資料出力完了: {self.last_item_output}")
-            QMessageBox.information(self, "資料出力", f"保存先: {self.last_item_output}")
+            self._message_box("information", "資料出力", f"保存先: {self.last_item_output}")
         except Exception as exc:
             self._set_export_progress(0, "資料の書き出しに失敗しました")
             self._show_error("資料出力エラー", exc)
@@ -9094,7 +9097,7 @@ class MainWindow(QMainWindow):
     def _append_item_inventory(self):
         folder = getattr(self, "last_item_output", None)
         if folder is None:
-            QMessageBox.warning(self, "資料未出力", "先に「資料を書き出す」を実行してください。")
+            self._message_box("warning", "資料未出力", "先に「資料を書き出す」を実行してください。")
             return
         inventory = OUTPUT_DIR / item_output.INVENTORY
         lock = QLockFile(str(inventory) + ".lock")
@@ -9105,7 +9108,7 @@ class MainWindow(QMainWindow):
         except (OSError, ValueError, RuntimeError, KeyError) as exc:
             self._show_error("一覧表への追加エラー", exc)
         else:
-            QMessageBox.information(self, "一覧表に追加", f"対象: {folder}\n保存先: {inventory}")
+            self._message_box("information", "一覧表に追加", f"対象: {folder}\n保存先: {inventory}")
         finally:
             if lock.isLocked():
                 lock.unlock()
@@ -9114,7 +9117,7 @@ class MainWindow(QMainWindow):
         if self.asset is None:
             return
         if not self._input_output_is_complete(self.asset.source_path):
-            QMessageBox.warning(self, "資料未出力", "先に「資料を書き出す」を実行してください。")
+            self._message_box("warning", "資料未出力", "先に「資料を書き出す」を実行してください。")
             return
         self.scan_queue_and_load()
 
@@ -10893,8 +10896,11 @@ class MainWindow(QMainWindow):
     # ---------- Error ----------
     def _show_error(self, title: str, exc: Exception):
         traceback.print_exc()
-        QMessageBox.critical(self, title, f"{exc}\n\n詳細はターミナル出力を確認してください。")
-        self.statusBar().showMessage(str(exc))
+        self._message_box("critical", title, f"{exc}\n\n詳細はターミナル出力を確認してください。")
+        self._show_status(str(exc))
+
+    def _message_box(self, kind, title, message, *buttons):
+        return getattr(QMessageBox, kind)(self, self.ui.text(title), self.ui.text(message), *buttons)
 
 
 def main():
