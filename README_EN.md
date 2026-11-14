@@ -45,6 +45,7 @@ Created by **Atsushi Noguchi (@fujimicho on X)**.
   - [Self-test](#self-test)
   - [Updating an existing installation](#update-procedure)
 - [Shared behavior](#common)
+  - [JSON metadata format](#metadata-json)
 - [Pottery mode](#pottery)
   - [Orientation estimation and Slice decisions](#pottery-pose)
 - [Lithic mode](#lithic)
@@ -476,6 +477,32 @@ OBJ uses separate indices for `v` and `vt`, so one geometric vertex can referenc
 ## Export workflow
 
 After confirming orientation, select **Export artifact** to save drawings, PLY and transforms, measurements, quality-control data, and the manifest together. Exporting the same artifact again saves a new processing revision.
+
+<a id="metadata-json"></a>
+## JSON metadata format
+
+**Export artifact** saves the JSON files for each processing revision in the same folder. They use UTF-8.
+
+| File | Main fields |
+|---|---|
+| `item_manifest.json` | `schema_version`, `item_id`, `item_id_basis`, `revision_id`, `artifact_type`, `application` (`name`, `version`), `created_at` (UTC), `input_unit`, `inputs`, and `outputs` |
+| `<stem>_quality.json` | `schema_version`, `item_id`, `revision_id`, `checks` (input dependencies, normals, appearance, and volume status), `warnings`, `mesh_checked`, `mesh_topology`, `vertices`, `faces`, `source_file_size_bytes`, `is_watertight`, `source_normals_present`, `notes`, `sections` (IDs and statuses), and `verified_drawings` |
+| `transform.json` | `source`, `coordinate_system`, `posture`, `transform`, and `orthographic_export`. The final matrix is `transform.matrix_4x4` for pottery and `transform.final_original_to_result_matrix_4x4` for lithics. The 4×4 matrix is stored as an array of rows and left-multiplies the homogeneous coordinate column vector. |
+| `<stem>_cylindrical_settings.json` / `<stem>_fan_settings.json` | Written for each selected and exported pottery unwrap. Includes `source_file`, `unit_to_mm`, `coordinate_system`, `projection`, `ui`, and `raster_outputs`. |
+
+The manifest and quality JSON currently use `"1.0.0"` for `schema_version`. The `item_id` is the input filename without its extension, and `item_id_basis` is `"input_stem"`. Each export generates a 32-character hexadecimal `revision_id`. Use `item_id` and `revision_id` to match the manifest, quality JSON, and measurement CSV. The `artifact_type` is `"pottery"` or `"lithic"`, and `input_unit` is `"mm"`, `"cm"`, or `"m"`.
+
+| Manifest field | Contents |
+|---|---|
+| `inputs.entry` / `inputs.source_sha256` | The input model path relative to `input/` and the SHA-256 digest of that file. |
+| `inputs.files[]` | The main model and identified companion files. Each entry has `path` relative to `input/`, `role`, `size_bytes`, and `sha256`. |
+| `inputs.references[]` / `inputs.loader_reads[]` | Declared references and the companion-file reads attempted by the OBJ loader. Each declared reference has `from`, `reference`, `target`, `role`, and `status`. |
+| `inputs.status` / `inputs.source_bundle_sha256` | If all references resolve and all reads succeed, the values are `"complete"` and the input bundle's SHA-256 digest. Missing, unsupported, or unresolved dependencies yield `"incomplete"` and `null`. |
+| `outputs[]` | Files in the same processing revision folder. Each entry has `path`, `role`, `size_bytes`, `sha256`, and `format`. Drawings and unwrap settings also have `layout`. PNG entries include `width_px`, `height_px`, and `dpi`, which is `null` when unset. |
+
+The bundle hash method appears in `inputs.bundle_hash_encoding` as `"aom-ordered-json-v1"`. Construct `[entry, [[path, sha256], ...]]` with the inner pairs sorted by `path`. Serialize it with Python's `json.dumps(value, ensure_ascii=True, separators=(",", ":"))` and compute the SHA-256 digest of the resulting ASCII bytes. Individual file digests are computed from the file bytes.
+
+See [item_output.py](item_output.py) and [app.py](app.py) for the implementation.
 
 <a id="pottery"></a>
 # Pottery mode

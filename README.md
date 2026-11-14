@@ -45,6 +45,7 @@ Repository: https://github.com/kotdijian/ArtefactsOrthoMaker
   - [SELF TEST](#self-test)
   - [更新時の推奨手順](#update-procedure)
 - [共通仕様](#common)
+  - [メタデータJSONの書式](#metadata-json)
 - [土器モード](#pottery)
   - [姿勢推定とSliceの判定](#pottery-pose)
 - [石器モード](#lithic)
@@ -498,6 +499,32 @@ OBJは `v` と `vt` が独立indexを持つため、同一幾何頂点が複数U
 ## 出力ワークフロー
 
 姿勢決定後は **「資料を書き出す」** で、図版、PLY/Transform、計測、品質管理、マニフェストをまとめて保存します。同じ資料を続けて書き出すと、別の処理版として保存されます。
+
+<a id="metadata-json"></a>
+## メタデータJSONの書式
+
+「資料を書き出す」で生成されるJSONは、処理版ごとに同じフォルダに保存されます。文字コードはUTF-8です。
+
+| ファイル | 主なフィールド |
+|---|---|
+| `item_manifest.json` | `schema_version`、`item_id`、`item_id_basis`、`revision_id`、`artifact_type`、`application`（`name`、`version`）、`created_at`（UTC）、`input_unit`、`inputs`、`outputs` |
+| `<stem>_quality.json` | `schema_version`、`item_id`、`revision_id`、`checks`（入力依存関係・法線・外観・体積の状態）、`warnings`、`mesh_checked`、`mesh_topology`、`vertices`、`faces`、`source_file_size_bytes`、`is_watertight`、`source_normals_present`、`notes`、`sections`（IDと状態）、`verified_drawings` |
+| `transform.json` | `source`、`coordinate_system`、`posture`、`transform`、`orthographic_export`。土器の最終行列は `transform.matrix_4x4`、石器は `transform.final_original_to_result_matrix_4x4`。4×4行列は行ごとの配列で、同次座標の列ベクトルに左から掛けます。 |
+| `<stem>_cylindrical_settings.json` / `<stem>_fan_settings.json` | 選択して書き出した土器の曲面展開ごとに生成します。`source_file`、`unit_to_mm`、`coordinate_system`、`projection`、`ui`、`raster_outputs` を含みます。 |
+
+マニフェストと品質管理JSONの `schema_version` は現在 `"1.0.0"` です。`item_id` は入力のファイル名から拡張子を除いた名前で、`item_id_basis` は `"input_stem"` です。`revision_id` は書き出しごとに生成する32桁の16進文字列です。マニフェスト・品質管理JSON・計測CSVは `item_id` と `revision_id` で対応付けられます。`artifact_type` は `"pottery"` または `"lithic"`、`input_unit` は `"mm"`、`"cm"`、`"m"` のいずれかです。
+
+| マニフェスト内のフィールド | 内容 |
+|---|---|
+| `inputs.entry` / `inputs.source_sha256` | `input/` 基準の入力モデルの相対パスと、そのファイル単体のSHA-256。 |
+| `inputs.files[]` | 主モデルと確認できた付属ファイルの一覧。各要素は `path`（`input/` 基準）、`role`、`size_bytes`、`sha256` を持ちます。 |
+| `inputs.references[]` / `inputs.loader_reads[]` | 宣言された参照と、OBJローダーが実際に試みた付属ファイルの読み込み。宣言参照は `from`、`reference`、`target`、`role`、`status` を持ちます。 |
+| `inputs.status` / `inputs.source_bundle_sha256` | 参照の解決と読み込みがすべて成功した場合は `"complete"` と入力一式のSHA-256。欠落・未対応・未解決がある場合は `"incomplete"` と `null`。 |
+| `outputs[]` | 同じ処理版フォルダ内のファイル一覧。各要素は `path`、`role`、`size_bytes`、`sha256`、`format` を持ちます。図版と展開設定には `layout` が付き、PNGには `width_px`、`height_px`、`dpi`（未設定の場合は `null`）が付きます。 |
+
+入力一式のハッシュ方式は `inputs.bundle_hash_encoding` に `"aom-ordered-json-v1"` として記録されます。`[entry, [[path, sha256], ...]]` を構成し、内側のペアを `path` 順で並べます。Pythonの `json.dumps(value, ensure_ascii=True, separators=(",", ":"))` で直列化し、そのASCIIバイト列のSHA-256を計算します。各ファイルのハッシュはファイルのバイト列から計算します。
+
+実装は [item_output.py](item_output.py) と [app.py](app.py) を参照してください。
 
 <a id="pottery"></a>
 # 土器モード
