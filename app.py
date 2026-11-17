@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import csv
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import io
 import json
 import math
@@ -582,6 +582,11 @@ class MainWindow(QMainWindow):
         self.pose_matrix = np.eye(4)
         self.front_angle_deg = 0.0
         self.center_axis_after_pose: AxisEstimate | None = None
+        self.pottery_base_pose_matrix = np.eye(4)
+        self.pottery_base_center_axis: AxisEstimate | None = None
+        self.pottery_tilt_angles = (0.0, 0.0)
+        self.pottery_tilt_matrix = np.eye(4)
+        self.pottery_tilt_origin_shift = np.zeros(3)
 
         # Lithic mode: minimum-volume OBB is the automatic initial pose.
         # Axis convention after OBB:
@@ -633,6 +638,7 @@ class MainWindow(QMainWindow):
         self.dragging_front = False
         self.last_mouse_x = 0.0
         self.actor = None
+        self.pottery_axis_actor = None
         self.current_poly = None
         self._viewer_scale_actor = None
         self._viewer_scale_text_actor = None
@@ -794,6 +800,35 @@ class MainWindow(QMainWindow):
         self.pose_label.setWordWrap(True)
         self.pose_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         posture_layout.addWidget(self.pose_label)
+
+        self.pottery_tilt_group = QGroupBox("手動傾き調整")
+        tilt_layout = QVBoxLayout(self.pottery_tilt_group)
+        tilt_form = QFormLayout()
+        self.pottery_tilt_spins = {}
+        for axis, label in (("x", "X軸の傾き"), ("y", "Y軸の傾き")):
+            spin = QDoubleSpinBox()
+            spin.setRange(-45.0, 45.0)
+            spin.setDecimals(2)
+            spin.setSingleStep(0.1)
+            spin.setSuffix("°")
+            self.pottery_tilt_spins[axis] = spin
+            tilt_form.addRow(label, spin)
+        tilt_layout.addLayout(tilt_form)
+        tilt_buttons = QHBoxLayout()
+        apply_tilt = QPushButton("傾きを適用")
+        apply_tilt.clicked.connect(self._apply_pottery_tilt)
+        reset_tilt = QPushButton("傾きをリセット")
+        reset_tilt.clicked.connect(self._reset_pottery_tilt)
+        tilt_buttons.addWidget(apply_tilt)
+        tilt_buttons.addWidget(reset_tilt)
+        tilt_layout.addLayout(tilt_buttons)
+        tilt_hint = QLabel(
+            "基準姿勢のX軸、次にY軸の順で回転します。適用すると曲面展開の区分点と外径を初期化します。"
+        )
+        tilt_hint.setWordWrap(True)
+        tilt_layout.addWidget(tilt_hint)
+        self.pottery_tilt_group.setEnabled(False)
+        posture_layout.addWidget(self.pottery_tilt_group)
         left_layout.addWidget(self.pottery_posture_group)
 
         self.pottery_front_group = QGroupBox("3. 正面（Z軸回転）")
@@ -1606,6 +1641,8 @@ class MainWindow(QMainWindow):
             widgets.extend(controls.values())
         for w in widgets:
             w.setEnabled(loaded)
+        if not loaded:
+            self.pottery_tilt_group.setEnabled(False)
         if loaded:
             self._update_artifact_type_ui()
             if hasattr(self, "pottery_output_branch_group") and not self._is_lithic():
@@ -1864,6 +1901,10 @@ class MainWindow(QMainWindow):
         lithic = self._is_lithic()
 
         self.pottery_posture_group.setVisible(not lithic)
+        self.pottery_tilt_group.setEnabled(
+            not lithic and self.asset is not None and self.posture_done
+            and self.pottery_base_center_axis is not None
+        )
         self.pottery_front_group.setVisible(not lithic)
         self.pottery_output_branch_group.setVisible(not lithic)
         self.pottery_image_size_group.setVisible(not lithic)
@@ -1910,6 +1951,7 @@ class MainWindow(QMainWindow):
         if not self.asset:
             return
 
+        self._clear_pottery_tilt()
         # Changing artifact type resets all pose state; the mesh itself is
         # retained and does not need to be reloaded.
         self.initial_axis = None
@@ -3511,6 +3553,7 @@ class MainWindow(QMainWindow):
             self.posture_done = False
             self.center_axis_after_pose = None
             self.pose_info = {}
+            self._clear_pottery_tilt()
 
             self.lithic_raw_to_obb_centered_matrix = np.eye(4)
             self.lithic_original_to_obb_matrix = np.eye(4)
@@ -3826,6 +3869,7 @@ class MainWindow(QMainWindow):
             angle = self.front_angle_deg if self.posture_done else 0.0
             self.current_poly = self._make_polydata(self._current_base_matrix(), preview=True)
             self.plotter.renderer.clear_actors()
+            self.pottery_axis_actor = None
             self._viewer_scale_actor = None
             self._viewer_scale_text_actor = None
             self.plotter.set_background("white")
@@ -4109,13 +4153,14 @@ class MainWindow(QMainWindow):
         p0 = axis.point - axis.direction * extent
         p1 = axis.point + axis.direction * extent
         line = pv.Line(p0, p1)
-        self.plotter.add_mesh(
+        self.pottery_axis_actor = self.plotter.add_mesh(
             line,
             color="purple",
             line_width=2,
             show_scalar_bar=False,
             lighting=False,
         )
+        self.pottery_axis_actor.orientation = (0.0, 0.0, self.front_angle_deg)
 
     # ---------- Pose estimation ----------
     def estimate_and_apply_posture(self):
@@ -4189,34 +4234,22 @@ class MainWindow(QMainWindow):
             matrix, center_axis, _, info = build_pose_transform(
                 vertices, method, axis, ref_normal, geometric_center=True,
             )
+            self._clear_pottery_tilt()
+            self.pottery_base_pose_matrix = matrix
+            self.pottery_base_center_axis = center_axis
             self.pose_matrix = matrix
             self.center_axis_after_pose = center_axis
             self.reference_plane = plane
             self.initial_axis = axis
             self.pose_info = info | {"pose_quality": quality, "manual_flip_z": self.pottery_flip_z}
             self.posture_done = True
+            self.pottery_tilt_group.setEnabled(True)
             self.set_front_angle(0.0)
             self._initialize_pottery_curve_controls()
             self.pottery_output_branch_group.setEnabled(True)
             self.pottery_image_size_group.setEnabled(True)
 
-            axis_angle = angle_between_deg(self.center_axis_after_pose.direction, np.array([0.0, 0.0, 1.0]))
-            ref_text = ""
-            if self.reference_plane is not None:
-                ref_text = (
-                    f"<br>Reference plane RMS: {self.reference_plane.residual_rms:.4g} input-unit"
-                    f" / confidence: {self.reference_plane.confidence:.2f}"
-                )
-            if "slice" in quality:
-                status_label = {"accepted": "採用", "reference": "参考", "held": "保留"}[quality["slice"]["status"]]
-                ref_text += f"<br>Slice判定: {status_label} / {quality['slice']['reason']}"
-            self.ui.bind(
-                self.pose_label, "setText",
-                f"Method: {method_text}<br>"
-                f"Center-axis confidence: {self.center_axis_after_pose.confidence:.2f}<br>"
-                f"Center axis ↔ Z: {axis_angle:.3f}°<br>"
-                f"Origin: center axis × posture BBox lower plane{ref_text}"
-            )
+            self._update_pottery_pose_label()
             self.refresh_view(reset_camera=True)
             self._schedule_preview_refresh()
             self._show_status("姿勢と原点を確定しました。次にZ軸回転で正面を決めてください。")
@@ -4224,6 +4257,29 @@ class MainWindow(QMainWindow):
             self._show_error("姿勢推定エラー", e)
         finally:
             QApplication.restoreOverrideCursor()
+
+    def _update_pottery_pose_label(self):
+        center = self.center_axis_after_pose
+        quality = self.pose_info["pose_quality"]
+        method = self.pose_info["orientation_method"]
+        method_text = "Manual (3 points)" if method == "manual" else method.title()
+        axis_angle = angle_between_deg(center.direction, np.array([0.0, 0.0, 1.0]))
+        ref_text = ""
+        if self.reference_plane is not None:
+            ref_text = (
+                f"<br>Reference plane RMS: {self.reference_plane.residual_rms:.4g} input-unit"
+                f" / confidence: {self.reference_plane.confidence:.2f}"
+            )
+        if "slice" in quality:
+            status_label = {"accepted": "採用", "reference": "参考", "held": "保留"}[quality["slice"]["status"]]
+            ref_text += f"<br>Slice判定: {status_label} / {quality['slice']['reason']}"
+        self.ui.bind(
+            self.pose_label, "setText",
+            f"Method: {method_text}<br>"
+            f"Center-axis confidence: {center.confidence:.2f}<br>"
+            f"Center axis ↔ Z: {axis_angle:.3f}°<br>"
+            f"Origin: center axis × posture BBox lower plane{ref_text}"
+        )
 
     def flip_z_and_reapply(self):
         if not self.asset:
@@ -4234,10 +4290,76 @@ class MainWindow(QMainWindow):
         if self.pose_info is previous_info:
             self.pottery_flip_z = not self.pottery_flip_z
 
+    def _clear_pottery_tilt(self):
+        self.pottery_base_pose_matrix = np.eye(4)
+        self.pottery_base_center_axis = None
+        self.pottery_tilt_angles = (0.0, 0.0)
+        self.pottery_tilt_matrix = np.eye(4)
+        self.pottery_tilt_origin_shift = np.zeros(3)
+        for spin in self.pottery_tilt_spins.values():
+            spin.setValue(0.0)
+        self.pottery_tilt_group.setEnabled(False)
+
+    def _reset_pottery_tilt(self):
+        for spin in self.pottery_tilt_spins.values():
+            spin.setValue(0.0)
+        self._apply_pottery_tilt()
+
+    def _apply_pottery_tilt(self):
+        base_axis = self.pottery_base_center_axis
+        if not self.asset or not self.posture_done or self._is_lithic() or base_axis is None:
+            return
+        x, y = (self.pottery_tilt_spins[key].value() for key in ("x", "y"))
+        if (x, y) == self.pottery_tilt_angles:
+            return
+
+        # Rotate about the origin of the base pose, then restore the pottery
+        # origin at the intersection of the rotated axis and the lower Z plane.
+        rotation = self._axis_rotation_matrix("y", y) @ self._axis_rotation_matrix("x", x)
+        tilted_pose = rotation @ self.pottery_base_pose_matrix
+        direction = rotation[:3, :3] @ base_axis.direction
+        if abs(direction[2]) < 1e-6:
+            self._message_box(
+                "warning", "傾きを適用できません",
+                "中心軸が水平面とほぼ平行です。傾き角度を変更してください。",
+            )
+            return
+        shift = np.zeros(3)
+        if x or y:
+            vertices = np.asarray(self.asset.mesh.vertices)
+            zmin = float(np.min(vertices @ tilted_pose[2, :3]) + tilted_pose[2, 3])
+            point = rotation[:3, :3] @ base_axis.point
+            shift = -_pose_core.line_plane_z_intersection(point, direction, zmin)
+        correction = self._translation_matrix_xyz(*shift) @ rotation
+
+        self.pottery_tilt_angles = (x, y)
+        self.pottery_tilt_matrix = correction
+        self.pottery_tilt_origin_shift = shift
+        self.pose_matrix = correction @ self.pottery_base_pose_matrix
+        self.center_axis_after_pose = replace(
+            base_axis,
+            point=correction[:3, :3] @ base_axis.point + shift,
+            direction=direction,
+            slice_centers=base_axis.slice_centers @ correction[:3, :3].T + shift,
+        )
+        self.pottery_curve_png_bpp_estimate = None
+        self.pottery_ortho_png_bpp_estimate = None
+        self._initialize_pottery_curve_controls()
+        self._update_pottery_pose_label()
+        self.refresh_view()
+        if self._pottery_output_branch_key() == "ortho":
+            self._schedule_preview_refresh()
+        elif self._ortho_preview_window is not None:
+            self._ortho_preview_window.set_message(
+                "傾きが変わりました。曲面展開プレビューを開き直してください。"
+            )
+        self._show_status("傾きを適用しました。曲面展開の区分点と外径を確認してください。")
+
     # ---------- Manual plane picking ----------
     def start_manual_pick(self):
         if not self.asset:
             return
+        self._clear_pottery_tilt()
         # Manual plane points must be picked in raw coordinates. Return the view to raw pose first.
         self.posture_done = False
         self.pose_matrix = np.eye(4)
@@ -4383,6 +4505,8 @@ class MainWindow(QMainWindow):
             try:
                 self.actor.origin = (0.0, 0.0, 0.0)
                 self.actor.orientation = (0.0, 0.0, self.front_angle_deg)
+                if self.pottery_axis_actor is not None:
+                    self.pottery_axis_actor.orientation = self.actor.orientation
                 self.plotter.render()
             except Exception:
                 self.refresh_view()
@@ -6141,7 +6265,10 @@ class MainWindow(QMainWindow):
                 except Exception:
                     nudge = max((zmax_mm - zmin_mm) * 0.005, 1.0e-6)
                     probe = zmm + nudge if zmm == zmin_mm else zmm - nudge
-                    dmm = self._pottery_outer_diameter_at_z_mm(probe)
+                    try:
+                        dmm = self._pottery_outer_diameter_at_z_mm(probe)
+                    except RuntimeError:
+                        dmm = None
                 self._append_pottery_fan_row(zmm, dmm)
         finally:
             self._setting_pottery_curve_controls = False
@@ -6151,14 +6278,14 @@ class MainWindow(QMainWindow):
         self._pottery_curve_output_setting_changed()
         self._refresh_pottery_curve_z_guides()
 
-    def _append_pottery_fan_row(self, z_mm: float, d_mm: float):
+    def _append_pottery_fan_row(self, z_mm: float, d_mm: float | None):
         row = self.pottery_fan_table.rowCount()
         self.pottery_fan_table.insertRow(row)
         self.pottery_fan_table.setItem(
             row, 0, QTableWidgetItem(f"{float(z_mm):.6f}")
         )
         self.pottery_fan_table.setItem(
-            row, 1, QTableWidgetItem(f"{float(d_mm):.6f}")
+            row, 1, QTableWidgetItem("" if d_mm is None else f"{d_mm:.6f}")
         )
 
     def _cylinder_existing_segment_data(self) -> dict[tuple[float, float], tuple[float, float]]:
@@ -8139,6 +8266,22 @@ class MainWindow(QMainWindow):
                     "angle_to_z_deg": angle_between_deg(center.direction, np.array([0.0, 0.0, 1.0])),
                 },
                 "front_rotation_deg": self.front_angle_deg,
+                "manual_tilt": {
+                    "applied": any(self.pottery_tilt_angles),
+                    "base_orientation_method": self.pose_info.get("orientation_method"),
+                    "applied_after_automatic_estimation": (
+                        any(self.pottery_tilt_angles)
+                        and self.pose_info.get("orientation_method") in {"slice", "rim", "base"}
+                    ),
+                    "x_deg": self.pottery_tilt_angles[0],
+                    "y_deg": self.pottery_tilt_angles[1],
+                    "rotation_order": ["X", "Y"],
+                    "rotation_frame": "fixed_base_pose_axes",
+                    "rotation_pivot_base_pose": [0.0, 0.0, 0.0],
+                    "origin_translation_after_tilt_input_unit": self.pottery_tilt_origin_shift,
+                    "base_matrix_4x4": self.pottery_base_pose_matrix,
+                    "correction_matrix_4x4": self.pottery_tilt_matrix,
+                },
                 "lithic_axis_rotations_deg": (
                     dict(self.lithic_angles_deg) if self._is_lithic() else None
                 ),

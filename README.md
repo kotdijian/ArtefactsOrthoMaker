@@ -48,6 +48,7 @@ Repository: https://github.com/kotdijian/ArtefactsOrthoMaker
   - [メタデータJSONの書式](#metadata-json)
 - [土器モード](#pottery)
   - [姿勢推定とSliceの判定](#pottery-pose)
+  - [推定後の手動傾き調整](#pottery-manual-tilt)
 - [石器モード](#lithic)
 - [画像出力サイズ](#image-output-size)
 - [大規模メッシュ](#large-mesh)
@@ -552,6 +553,15 @@ Sliceを実行すると、器軸を支持する輪郭の範囲や、断面の取
 | **保留** | Sliceの姿勢を適用せず、直前の姿勢を保持します。Rim・Base・Manualで姿勢を決め直せます。 |
 
 溢水法で姿勢による容量差を比較するときは、**採用されたSliceを主比較に使い、参考姿勢での試算は区別**します。Rim・Baseとの角度差は比較のための情報です。Sliceを適用して書き出すと、`transform.json` の `posture.pose_quality.slice` に判定・理由と、取得できたRim・Base候補との角度差が記録されます。
+
+<a id="pottery-manual-tilt"></a>
+## 推定後の手動傾き調整
+
+姿勢推定を適用した後、**手動傾き調整**でX・Yの補正角（各±45°）を入力し、**傾きを適用**を押します。角度は基準姿勢からの補正量です。**傾きをリセット**で補正を解除できます。再推定すると補正角はゼロに戻ります。
+
+基準姿勢の原点を中心に、固定X軸、固定Y軸の順で回転し、回転後の中心軸と最下点を通る水平面の交点を原点に戻します。最後に、既存のZ軸回りの正面回転を適用します。調整後の同じ変換を、オルソ、断面、曲面展開、計測、正規化PLYに使います。傾きを適用・解除すると、円筒・扇形展開の区分点と外径が初期化されます。扇形区間の端点で外径を取得できず空欄になった場合は、外径を入力してから展開してください。
+
+`transform.json` の `posture.orientation_method` に基準姿勢の方式を保持し、`posture.manual_tilt` に補正の有無（`applied`）、自動推定後の補正かどうか（`applied_after_automatic_estimation`）、基準モード、補正角、回転順と中心、原点補正の平行移動量、基準・補正行列を記録します。最終行列は `Rz @ correction_matrix_4x4 @ base_matrix_4x4` で、従来どおり `transform.matrix_4x4` に保存します。
 
 ## 円筒展開
 

@@ -8,6 +8,20 @@ from PySide6.QtGui import QAction
 
 # Source strings also serve as the fallback when a translation is unavailable.
 ENGLISH = {
+    "手動傾き調整": "Manual tilt",
+    "X軸の傾き": "Tilt about X",
+    "Y軸の傾き": "Tilt about Y",
+    "傾きを適用": "Apply tilt",
+    "傾きをリセット": "Reset tilt",
+    "基準姿勢のX軸、次にY軸の順で回転します。適用すると曲面展開の区分点と外径を初期化します。":
+        "Rotate about the base pose's X axis, then its Y axis. Applying tilt resets unwrap breakpoints and diameters.",
+    "傾きを適用できません": "Cannot apply tilt",
+    "中心軸が水平面とほぼ平行です。傾き角度を変更してください。":
+        "The center axis is nearly parallel to the horizontal plane. Change the tilt angles.",
+    "傾きが変わりました。曲面展開プレビューを開き直してください。":
+        "The tilt has changed. Reopen the surface unwrap preview.",
+    "傾きを適用しました。曲面展開の区分点と外径を確認してください。":
+        "Tilt applied. Review the unwrap breakpoints and diameters.",
     "オルソ画像プレビュー": "Orthographic preview",
     "姿勢決定後にプレビューできます。": "The preview is available after orientation is set.",
     "表示倍率": "Zoom",
