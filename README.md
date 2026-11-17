@@ -103,6 +103,8 @@ ArtefactsOrthoMaker は OBJ / PLY / GLB 形式の考古資料3Dモデルを読�
 
 すでにPowerShellで `py -3.13 --version` を実行して `Python 3.13.x` と表示される場合は、[2. フォルダの整備](#folder-setup)へ進んでください。
 
+PowerShellで `py` が認識されなくても、`python --version` が **`Python 3.13.x`** を表示する場合は、[2. フォルダの整備](#folder-setup)へ進んでください。別のバージョンが表示された場合は、以下の手順でPython 3.13を用意してください。
+
 1. [Python公式の Install Manager 配布ページ](https://www.python.org/downloads/release/pymanager-264/)を開き、**Download Installer (MSIX)** をクリックします。この `.msix` はx64とARM64の両方に対応します。
 2. ダウンロードした `.msix` をダブルクリックし、Windowsの「アプリ インストーラー」で **インストール** を選びます。
 3. スタートメニューから新しい **PowerShell** を開き、次の2行を順に実行します。1行目でAOM用のPython 3.13を指定してインストールし、2行目で3.13が利用できることを確認します。
@@ -301,6 +303,12 @@ py -3.13 -m venv venv
 
 手順1で `pymanager exec` を使って確認した場合は、代わりに `pymanager exec -V:3.13 -m venv venv` を実行します。
 
+手順1で `python --version` が **`Python 3.13.x`** を表示した場合は、上の `py` コマンドの代わりに次を実行します。
+
+```powershell
+python -m venv venv
+```
+
 以下はWindows Home／Pro共通です。通常のPowerShellで、仮想環境のPythonをパスで指定して使います。コマンドは上から1行ずつ実行してください。エラーが出たら、[Windowsでエラーが出た場合](#windows-setup-cases)を確認してから続けます。
 
 必要な外部パッケージをまとめて導入します。
@@ -405,6 +413,7 @@ ENVIRONMENT CHECK PASSED
 | 表示・状況 | 次に行う操作 |
 |---|---|
 | インストーラーにPython 3.15と表示される | [Pythonのインストール](#python-install)の手順で `py install 3.13` を実行し、`py -3.13 --version` が `Python 3.13.x` と表示することを確認します。 |
+| `py` は認識されないが `python` は使える | `python --version` が `Python 3.13.x` なら、`python -m venv venv` で仮想環境を作成します。別の版なら[Pythonのインストール](#python-install)に戻ります。 |
 | `py` が認識されない / 指定したPythonが見つからない | PowerShellを閉じて開き直します。再度失敗する場合は[Pythonのインストール](#python-install)に戻ります。旧ランチャーの場合は同節の `pymanager` 手順を使います。 |
 | `app.py` や `requirements.txt` が見つからない | `dir` で両方のファイルが見えるか確認します。見えなければ、エクスプローラーで両方があるフォルダを開き、アドレスバーに `powershell` と入力します。 |
 | 仮想環境の `python.exe` が見つからない | プロジェクトフォルダを確認し、[初回セットアップ](#windows-setup)の仮想環境作成コマンドを実行します。 |

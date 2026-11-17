@@ -101,6 +101,8 @@ On your first run, follow steps **1. Install Python → 2. Set up the project fo
 
 If `py -3.13 --version` already reports `Python 3.13.x` in PowerShell, proceed to [step 2](#folder-setup).
 
+If PowerShell does not recognize `py` but `python --version` reports **`Python 3.13.x`**, proceed to [step 2](#folder-setup). If it reports a different version, follow the instructions below to set up Python 3.13.
+
 1. Open the official release page and select **Download Installer (MSIX)**. The same installer supports x64 and ARM64. [Python Install Manager](https://www.python.org/downloads/release/pymanager-264/)
 2. Double-click the downloaded `.msix` and select **Install** in Windows App Installer.
 3. Open a new **PowerShell** window from the Start menu. The first command explicitly installs Python 3.13 for AOM, and the second checks that 3.13 is available.
@@ -295,6 +297,12 @@ py -3.13 -m venv venv
 
 If you used `pymanager exec` to check your version in step 1, create the environment with `pymanager exec -V:3.13 -m venv venv`.
 
+If `python --version` reported **`Python 3.13.x`** in step 1, use the following command in place of the `py` command above.
+
+```powershell
+python -m venv venv
+```
+
 These steps apply to Windows Home and Pro. Use a regular PowerShell window and call the virtual environment’s Python by path. Run one line at a time. If a command fails, check [Windows setup errors](#windows-setup-cases) before continuing.
 
 Install the required packages.
@@ -393,6 +401,7 @@ You can also launch AOM from the project folder by running `./venv/bin/python ap
 | What you see | What to do next |
 |---|---|
 | Installer displays Python 3.15 | Follow [Install Python](#python-install). Run `py install 3.13` and check that `py -3.13 --version` reports `Python 3.13.x`. |
+| `py` is unrecognized but `python` works | If `python --version` reports `Python 3.13.x`, create the environment with `python -m venv venv`. If it reports a different version, return to [Install Python](#python-install). |
 | `py` is unrecognized or the requested Python is missing | Close and reopen PowerShell. If the command still fails, return to [Install Python](#python-install). For a legacy launcher, use the `pymanager` steps in that section. |
 | `app.py` or `requirements.txt` is missing | Run `dir` and look for both files. If either is missing, open their folder in File Explorer and type `powershell` in the address bar. |
 | The virtual environment’s `python.exe` is missing | Check the project folder, then run the environment creation command in [first-time setup](#windows-setup). |
