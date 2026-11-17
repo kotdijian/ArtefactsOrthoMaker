@@ -595,6 +595,8 @@ settings JSONには `breakpoints_z_mm` と各区間の `z0_mm / z1_mm / referenc
 
 正規化後は `X=幅`, `Y=長さ`, `Z=厚さ`。読込姿勢保持または明示的なminimum-volume OBB姿勢推定を選択できます。中央X-Z断面によるY軸水平化と手動X/Y/Z回転、任意断面出力に対応します。
 
+正規化済みの石器PLYを用いた平面形態・連続断面の解析は、独立した [LithMorph](https://github.com/kotdijian/LithMorph) で行えます。
+
 <a id="image-output-size"></a>
 # 画像出力サイズ
 

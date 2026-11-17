@@ -571,6 +571,8 @@ See the equations in the [development report](docs/DEVELOPMENT_REPORT.md#8-土�
 
 Normalized axes are `X=width`, `Y=length`, and `Z=thickness`. You can keep the loaded orientation or run minimum-volume OBB orientation explicitly. The app supports leveling the central X–Z section by rotating about Y, manual X/Y/Z rotations, and export of custom sections.
 
+For planform and serial-section analysis of normalized lithic PLY files, use [LithMorph](https://github.com/kotdijian/LithMorph).
+
 <a id="image-output-size"></a>
 # Image output size
 
