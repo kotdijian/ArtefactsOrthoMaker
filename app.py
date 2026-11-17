@@ -75,7 +75,7 @@ from pose_core import (
 )
 
 APP_NAME = "ArtefactsOrthoMaker"
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.1.1"
 SUPPORTED_SUFFIXES = {".obj", ".ply", ".glb"}
 WORK_DIR = Path(__file__).resolve().parent
 INPUT_DIR = WORK_DIR / "input"

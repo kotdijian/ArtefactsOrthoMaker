@@ -4,7 +4,7 @@
 
 **Desktop GUI for orientation normalization, orthographic layouts, surface unwrapping, and measurement export of archaeological 3D models**
 
-> **Current version:** **v2.1.0**
+> **Current version:** **v2.1.1**
 >
 > **License:** Releases from v0.4.10 onward use the **MIT License**. Releases through v0.4.9 retain the **CC0 1.0 Universal** terms under which they were published.
 
@@ -663,5 +663,6 @@ An optional link to this repository and the credit **Created by Atsushi Noguchi 
 | **v2.0.0** | Combined artifact export, quality-control JSON, input/output manifest, and independent QA and measurement inventory append |
 | **v2.0.1** | Blue (`#6699CC`) for reverse sides of outward-facing triangles in cylindrical and fan interior views |
 | **v2.1.0** | Opening-first pottery orientation, plus Slice axis estimation from opposing contours and accepted, provisional, or withheld decisions |
+| **v2.1.1** | Added manual X/Y tilt after pottery orientation estimation, with Japanese and English controls and Transform JSON records for the base estimation mode and manual correction |
 
 Run **`app.py`** in the repository root. Previous versions are in `archive/versions/`.
