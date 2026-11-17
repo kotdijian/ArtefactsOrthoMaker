@@ -41,6 +41,7 @@ Repository: https://github.com/kotdijian/ArtefactsOrthoMaker
     - [Windowsの初期設定](#windows-setup)
     - [2回目以降の起動](#run-again)
   - [環境確認スクリプト](#environment-check-script)
+  - [Windowsでエラーが出た場合](#windows-setup-cases)
   - [よくあるエラー](#troubleshooting)
   - [SELF TEST](#self-test)
   - [更新時の推奨手順](#update-procedure)
@@ -297,38 +298,27 @@ py -3.13 -m venv venv
 
 手順1で `pymanager exec` を使って確認した場合は、代わりに `pymanager exec -V:3.13 -m venv venv` を実行します。
 
-有効化します。
-
-```powershell
-.\venv\Scripts\Activate.ps1
-```
-
-`running scripts is disabled on this system` と表示された場合だけ、現在の PowerShell セッションについて実行を許可してから再度有効化します。
-
-```powershell
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-.\venv\Scripts\Activate.ps1
-```
+以下はWindows Home／Pro共通です。通常のPowerShellで、仮想環境のPythonをパスで指定して使います。コマンドは上から1行ずつ実行してください。エラーが出たら、[Windowsでエラーが出た場合](#windows-setup-cases)を確認してから続けます。
 
 必要な外部パッケージをまとめて導入します。
 
 ```powershell
-python -m pip install --upgrade pip setuptools wheel
-python -m pip install -r requirements.txt
+.\venv\Scripts\python.exe -m pip install --upgrade pip setuptools wheel
+.\venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
 確認：
 
 ```powershell
-python -m pip check
-python check_environment.py
-python self_test.py
+.\venv\Scripts\python.exe -m pip check
+.\venv\Scripts\python.exe check_environment.py
+.\venv\Scripts\python.exe self_test.py
 ```
 
 起動する前に、エクスプローラーで作業対象の3Dモデル（`.obj`、`.ply`、`.glb`）を、`app.py` と同じ階層にある小文字の `input/` フォルダへコピーしてください。OBJに付属するMTLやテクスチャ画像がある場合は、[処理対象を置く場所](#input-files)に沿って配置します。その後、次のコマンドで起動します。
 
 ```powershell
-python app.py
+.\venv\Scripts\python.exe app.py
 ```
 
 #### requirements.txt
@@ -355,7 +345,7 @@ Python標準ライブラリはPython本体に含まれるため、個別イン�
 <a id="run-again"></a>
 #### 2回目以降の起動
 
-`app.py` を実行する前に、作業対象のファイルがプロジェクトフォルダ内の `input/` にあることを確認してください。新しく処理するファイルは、先に `input/` へコピーします。初期設定時と同じプロジェクトフォルダをターミナルまたはPowerShellで開き、仮想環境を有効にしてアプリを起動します。
+`app.py` を実行する前に、作業対象のファイルがプロジェクトフォルダ内の `input/` にあることを確認してください。新しく処理するファイルは、先に `input/` へコピーします。初期設定時と同じプロジェクトフォルダをターミナルまたはPowerShellで開き、OSに対応するコマンドで起動します。
 
 macOS
 
@@ -367,11 +357,10 @@ python app.py
 Windows
 
 ```powershell
-.\venv\Scripts\Activate.ps1
-python app.py
+.\venv\Scripts\python.exe app.py
 ```
 
-Windowsでスクリプトの実行が拒否された場合は、[Windowsの初期設定](#windows-setup)の対処手順を参照してください。処理済みの資料は、[出力先とスキップ条件](#output-skip)に従って自動でスキップされます。
+起動時にエラーが出た場合は、[Windowsでエラーが出た場合](#windows-setup-cases)を参照してください。処理済みの資料は、[出力先とスキップ条件](#output-skip)に従って自動でスキップされます。
 
 <a id="environment-check-script"></a>
 #### `check_environment.py`
@@ -392,6 +381,21 @@ ENVIRONMENT CHECK PASSED
 
 と表示します。
 
+<a id="windows-setup-cases"></a>
+#### Windowsでエラーが出た場合
+
+| 表示・状況 | 次に行う操作 |
+|---|---|
+| インストーラーにPython 3.15と表示される | [Pythonのインストール](#python-install)の手順で `py install 3.13` を実行し、`py -3.13 --version` が `Python 3.13.x` と表示することを確認します。 |
+| `py` が認識されない / 指定したPythonが見つからない | PowerShellを閉じて開き直します。再度失敗する場合は[Pythonのインストール](#python-install)に戻ります。旧ランチャーの場合は同節の `pymanager` 手順を使います。 |
+| `app.py` や `requirements.txt` が見つからない | `dir` で両方のファイルが見えるか確認します。見えなければ、エクスプローラーで両方があるフォルダを開き、アドレスバーに `powershell` と入力します。 |
+| 仮想環境の `python.exe` が見つからない | プロジェクトフォルダを確認し、[初回セットアップ](#windows-setup)の仮想環境作成コマンドを実行します。 |
+| `running scripts is disabled on this system` / `Activate.ps1` の `PSSecurityException` | `Activate.ps1` の後に入力する予定だった `python` を `.\venv\Scripts\python.exe` に置き換えます。[初回セットアップ](#windows-setup)または[2回目以降の起動](#run-again)のコマンドを使えます。 |
+| `ModuleNotFoundError`（例 `No module named 'scipy'`） | `.\venv\Scripts\python.exe -m pip install -r requirements.txt` を実行し、続けて `.\venv\Scripts\python.exe -m pip check` で確認します。 |
+| `pip install` で `No matching distribution found` | `.\venv\Scripts\python.exe --version` が `Python 3.13.x` か確認します。別の版なら新しい仮想環境を3.13で作成してください。3.13でも失敗する場合は、エラーに出たパッケージ名と表示全文を控えてください。 |
+
+仮想環境を有効化して使いたい場合だけ、実行制限エラーが出たPowerShellで `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` を実行し、`Activate.ps1` を再実行できます。この設定はそのウィンドウに限られます。組織のグループポリシーが優先される場合は、上の表にある仮想環境のPythonを直接呼び出す手順を使ってください。
+
 <a id="troubleshooting"></a>
 #### よくあるエラー
 
@@ -407,14 +411,6 @@ which python
 
 `.../ArtefactsOrthoMaker/venv/bin/python` のように表示されるのが正常です。
 
-Windows PowerShell：
-
-```powershell
-Get-Command python
-```
-
-`...\ArtefactsOrthoMaker\venv\Scripts\python.exe` を指していることを確認します。
-
 その後：
 
 ```bash
@@ -424,6 +420,8 @@ python check_environment.py
 ```
 
 を再実行してください。
+
+Windowsの場合は、[Windowsでエラーが出た場合](#windows-setup-cases)の `ModuleNotFoundError` を参照してください。
 
 ##### `No module named 'pose_core'`
 
@@ -469,7 +467,7 @@ SELF TEST PASSED
 <a id="update-procedure"></a>
 #### 更新時の推奨手順
 
-Git clone した環境を更新する場合：
+macOSでGit cloneした環境を更新する場合は、次を実行します。
 
 ```bash
 git pull
@@ -480,10 +478,14 @@ python check_environment.py
 python self_test.py
 ```
 
-Windows PowerShellでは `source venv/bin/activate` の代わりに：
+Windows PowerShellでは、プロジェクトフォルダを開いて次を実行します。
 
 ```powershell
-.\venv\Scripts\Activate.ps1
+git pull
+.\venv\Scripts\python.exe -m pip install -r requirements.txt
+.\venv\Scripts\python.exe -m pip check
+.\venv\Scripts\python.exe check_environment.py
+.\venv\Scripts\python.exe self_test.py
 ```
 
 を使用します。

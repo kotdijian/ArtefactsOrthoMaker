@@ -41,6 +41,7 @@ Created by **Atsushi Noguchi (@fujimicho on X)**.
     - [First-time setup on Windows](#windows-setup)
     - [Launching again](#run-again)
   - [Environment check script](#environment-check-script)
+  - [Windows setup errors](#windows-setup-cases)
   - [Troubleshooting](#troubleshooting)
   - [Self-test](#self-test)
   - [Updating an existing installation](#update-procedure)
@@ -291,38 +292,27 @@ py -3.13 -m venv venv
 
 If you used `pymanager exec` to check your version in step 1, create the environment with `pymanager exec -V:3.13 -m venv venv`.
 
-Activate the environment.
-
-```powershell
-.\venv\Scripts\Activate.ps1
-```
-
-If PowerShell displays `running scripts is disabled on this system`, allow script execution for the current PowerShell session, then activate again.
-
-```powershell
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-.\venv\Scripts\Activate.ps1
-```
+These steps apply to Windows Home and Pro. Use a regular PowerShell window and call the virtual environment’s Python by path. Run one line at a time. If a command fails, check [Windows setup errors](#windows-setup-cases) before continuing.
 
 Install the required packages.
 
 ```powershell
-python -m pip install --upgrade pip setuptools wheel
-python -m pip install -r requirements.txt
+.\venv\Scripts\python.exe -m pip install --upgrade pip setuptools wheel
+.\venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
 Run the checks.
 
 ```powershell
-python -m pip check
-python check_environment.py
-python self_test.py
+.\venv\Scripts\python.exe -m pip check
+.\venv\Scripts\python.exe check_environment.py
+.\venv\Scripts\python.exe self_test.py
 ```
 
 Before launching, use File Explorer to copy the `.obj`, `.ply`, or `.glb` models into the lowercase `input/` folder alongside `app.py`. Arrange any OBJ material and texture files as described in [Where to put input files](#input-files). Then launch the app.
 
 ```powershell
-python app.py
+.\venv\Scripts\python.exe app.py
 ```
 
 #### requirements.txt
@@ -347,7 +337,7 @@ Python includes its standard library. Pip automatically installs additional depe
 <a id="run-again"></a>
 #### Launching again
 
-Before running `app.py`, check that your models are in the project folder's `input/` directory. Copy in any new models first. Open the same project folder in Terminal or PowerShell, activate the virtual environment, and launch the app.
+Before running `app.py`, check that your models are in the project folder's `input/` directory. Copy in any new models first. Open the same project folder in Terminal or PowerShell, and run the commands for your operating system.
 
 macOS
 
@@ -359,11 +349,10 @@ python app.py
 Windows
 
 ```powershell
-.\venv\Scripts\Activate.ps1
-python app.py
+.\venv\Scripts\python.exe app.py
 ```
 
-If Windows blocks script execution, follow the steps under [Windows first-time setup](#windows-setup). The queue skips completed artifacts according to the [output and skip rules](#output-skip).
+If launching fails, see [Windows setup errors](#windows-setup-cases). The queue skips completed artifacts according to the [output and skip rules](#output-skip).
 
 <a id="environment-check-script"></a>
 #### `check_environment.py`
@@ -380,6 +369,21 @@ It checks NumPy, SciPy, Trimesh, PyVista, PyVistaQt, VTK, PySide6, QtPy, Pillow,
 ENVIRONMENT CHECK PASSED
 ```
 
+<a id="windows-setup-cases"></a>
+#### Windows setup errors
+
+| What you see | What to do next |
+|---|---|
+| Installer displays Python 3.15 | Follow [Install Python](#python-install). Run `py install 3.13` and check that `py -3.13 --version` reports `Python 3.13.x`. |
+| `py` is unrecognized or the requested Python is missing | Close and reopen PowerShell. If the command still fails, return to [Install Python](#python-install). For a legacy launcher, use the `pymanager` steps in that section. |
+| `app.py` or `requirements.txt` is missing | Run `dir` and look for both files. If either is missing, open their folder in File Explorer and type `powershell` in the address bar. |
+| The virtual environment’s `python.exe` is missing | Check the project folder, then run the environment creation command in [first-time setup](#windows-setup). |
+| `running scripts is disabled on this system` or `Activate.ps1` raises `PSSecurityException` | Use `.\venv\Scripts\python.exe` in place of `python` after the failed activation. Use the commands in [first-time setup](#windows-setup) or [launching again](#run-again). |
+| `ModuleNotFoundError` (such as `No module named 'scipy'`) | Run `.\venv\Scripts\python.exe -m pip install -r requirements.txt`, then check with `.\venv\Scripts\python.exe -m pip check`. |
+| `pip install` reports `No matching distribution found` | Run `.\venv\Scripts\python.exe --version` and check for `Python 3.13.x`. If it shows another version, create a fresh environment with 3.13. If it fails with 3.13, record the package name and full error. |
+
+If you prefer to activate the environment and encounter the script execution error, you can run `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` in the same PowerShell window, then retry `Activate.ps1`. This setting applies only to that window. If an organization’s Group Policy takes precedence, call the virtual environment’s Python directly as shown above.
+
 <a id="troubleshooting"></a>
 #### Troubleshooting
 
@@ -393,12 +397,6 @@ On macOS, run the following command and look for a path ending in `ArtefactsOrth
 which python
 ```
 
-In Windows PowerShell, run the following command and check that it resolves to `ArtefactsOrthoMaker\venv\Scripts\python.exe`.
-
-```powershell
-Get-Command python
-```
-
 Then run the installation and checks again.
 
 ```bash
@@ -406,6 +404,8 @@ python -m pip install -r requirements.txt
 python -m pip check
 python check_environment.py
 ```
+
+On Windows, see `ModuleNotFoundError` under [Windows setup errors](#windows-setup-cases).
 
 ##### `No module named 'pose_core'`
 
@@ -449,7 +449,7 @@ The self-test mainly covers orientation, normals, and mesh I/O. Launch `app.py` 
 <a id="update-procedure"></a>
 #### Updating an existing installation
 
-From a cloned repository, run these commands.
+On macOS, update a cloned repository with these commands.
 
 ```bash
 git pull
@@ -460,10 +460,14 @@ python check_environment.py
 python self_test.py
 ```
 
-In Windows PowerShell, use this activation command.
+In Windows PowerShell, open the project folder and run these commands.
 
 ```powershell
-.\venv\Scripts\Activate.ps1
+git pull
+.\venv\Scripts\python.exe -m pip install -r requirements.txt
+.\venv\Scripts\python.exe -m pip check
+.\venv\Scripts\python.exe check_environment.py
+.\venv\Scripts\python.exe self_test.py
 ```
 
 If the virtual environment has multiple dependency problems, recreate `venv` from `requirements.txt` to recover a reproducible setup.
