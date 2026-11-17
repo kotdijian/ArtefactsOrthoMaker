@@ -101,12 +101,14 @@ If `py -3.13 --version` already reports `Python 3.13.x` in PowerShell, proceed t
 
 1. Open the official release page and select **Download Installer (MSIX)**. The same installer supports x64 and ARM64. [Python Install Manager](https://www.python.org/downloads/release/pymanager-264/)
 2. Double-click the downloaded `.msix` and select **Install** in Windows App Installer.
-3. Open a new **PowerShell** window from the Start menu. Run the first command to install Python 3.13 and the second to check its version.
+3. Open a new **PowerShell** window from the Start menu. The first command explicitly installs Python 3.13 for AOM, and the second checks that 3.13 is available.
 
 ```powershell
 py install 3.13
 py -3.13 --version
 ```
+
+The Python Install Manager 26.4 MSIX bundles Python 3.15.0. If the installer displays 3.15, continue with the steps above and install 3.13 alongside it. The AOM virtual environment is created with `py -3.13 -m venv venv` in [Windows setup](#windows-setup).
 
 If the displayed version starts with `Python 3.13.`, proceed to [step 2](#folder-setup). When several Python versions are installed, `python --version` may report a different version, so the check above explicitly selects 3.13.
 

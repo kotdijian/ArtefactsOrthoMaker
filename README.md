@@ -103,12 +103,14 @@ ArtefactsOrthoMaker は OBJ / PLY / GLB 形式の考古資料3Dモデルを読�
 
 1. [Python公式の Install Manager 配布ページ](https://www.python.org/downloads/release/pymanager-264/)を開き、**Download Installer (MSIX)** をクリックします。この `.msix` はx64とARM64の両方に対応します。
 2. ダウンロードした `.msix` をダブルクリックし、Windowsの「アプリ インストーラー」で **インストール** を選びます。
-3. スタートメニューから新しい **PowerShell** を開き、次の2行を順に実行します。1行目でPython 3.13本体をインストールし、2行目でバージョンを確認します。
+3. スタートメニューから新しい **PowerShell** を開き、次の2行を順に実行します。1行目でAOM用のPython 3.13を指定してインストールし、2行目で3.13が利用できることを確認します。
 
 ```powershell
 py install 3.13
 py -3.13 --version
 ```
+
+Python Install Manager 26.4 のMSIXにはPython 3.15.0が同梱されています。インストーラーに3.15と表示されても、上記の手順で3.13を併設できます。[Windowsの初期設定](#windows-setup)では、`py -3.13 -m venv venv` でAOM用の仮想環境を作成します。
 
 `Python 3.13.` で始まるバージョンが表示されれば、[2. フォルダの整備](#folder-setup)へ進みます。Pythonが複数入っている場合は、`python --version` が別のバージョンを表示することがあるため、ここではバージョンを指定して確認します。
 
