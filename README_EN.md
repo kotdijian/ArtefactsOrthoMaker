@@ -41,6 +41,7 @@ Created by **Atsushi Noguchi (@fujimicho on X)**.
     - [First-time setup on Windows](#windows-setup)
     - [Launching again](#run-again)
   - [Environment check script](#environment-check-script)
+  - [macOS setup errors](#macos-setup-cases)
   - [Windows setup errors](#windows-setup-cases)
   - [Troubleshooting](#troubleshooting)
   - [Self-test](#self-test)
@@ -236,6 +237,8 @@ The first-time steps create a virtual environment named `venv` and install the p
 
 In Terminal, type `cd` followed by a space, drag the project folder from Finder into Terminal, and press Enter. Run `ls` to check that `app.py` and `requirements.txt` are listed.
 
+If a command fails, see [macOS setup errors](#macos-setup-cases) before continuing.
+
 Create and activate the virtual environment.
 
 ```bash
@@ -368,6 +371,21 @@ It checks NumPy, SciPy, Trimesh, PyVista, PyVistaQt, VTK, PySide6, QtPy, Pillow,
 ```text
 ENVIRONMENT CHECK PASSED
 ```
+
+<a id="macos-setup-cases"></a>
+#### macOS setup errors
+
+| What you see | What to do next |
+|---|---|
+| The Python `.pkg` will not open or shows a developer warning | Check that you downloaded the macOS `.pkg` from the official python.org page under [Install Python](#python-install). If the official file still will not open, record the full warning. |
+| `python3.13: command not found` or a different Python version appears | After installing Python 3.13, open a new Terminal window and run `python3.13 --version`. If the command is still unavailable, return to [Install Python](#python-install). |
+| `app.py` or `requirements.txt` is missing | Run `ls` and look for both files. If either is missing, follow [macOS first-time setup](#macos-setup) to change to the folder containing both files by dragging it from Finder into Terminal. |
+| `venv/bin/activate` or `venv/bin/python` is missing | In the folder containing `app.py`, run `python3.13 -m venv venv`. Check that `./venv/bin/python --version` reports `Python 3.13.x`. |
+| `ModuleNotFoundError` (such as `No module named 'scipy'`) | Run `./venv/bin/python -m pip install -r requirements.txt`, then check with `./venv/bin/python -m pip check`. |
+| `No matching distribution found` or `incompatible architecture` | Run `./venv/bin/python --version` to check for Python 3.13. If it still fails with 3.13, record the full error, macOS version, and whether the Mac uses Apple Silicon or Intel. |
+| `Could not find the Qt platform plugin "cocoa"` | Run `./venv/bin/python check_environment.py` to check Qt startup. If the Qt check fails, see the [macOS Qt investigation notes](docs/macos_qt_venv_issue.md). |
+
+You can also launch AOM from the project folder by running `./venv/bin/python app.py` directly.
 
 <a id="windows-setup-cases"></a>
 #### Windows setup errors

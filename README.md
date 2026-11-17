@@ -41,6 +41,7 @@ Repository: https://github.com/kotdijian/ArtefactsOrthoMaker
     - [Windowsの初期設定](#windows-setup)
     - [2回目以降の起動](#run-again)
   - [環境確認スクリプト](#environment-check-script)
+  - [macOSでエラーが出た場合](#macos-setup-cases)
   - [Windowsでエラーが出た場合](#windows-setup-cases)
   - [よくあるエラー](#troubleshooting)
   - [SELF TEST](#self-test)
@@ -240,6 +241,8 @@ OSに合った手順に進みます。初回は、アプリ専用の仮想環境
 
 ターミナルで `cd` と半角スペースを入力し、Finderからプロジェクトフォルダをターミナルのウィンドウへドラッグして、Enterを押します。`ls` を実行して `app.py` と `requirements.txt` が表示されることを確認してください。
 
+エラーが出たら、[macOSでエラーが出た場合](#macos-setup-cases)を確認してから続けます。
+
 仮想環境 `venv` を作成・有効化します。
 
 ```bash
@@ -380,6 +383,21 @@ ENVIRONMENT CHECK PASSED
 ```
 
 と表示します。
+
+<a id="macos-setup-cases"></a>
+#### macOSでエラーが出た場合
+
+| 表示・状況 | 次に行う操作 |
+|---|---|
+| Pythonの `.pkg` が開かない／開発元に関する警告が出る | [Pythonのインストール](#python-install)にある python.org の公式配布ページから、macOS用の `.pkg` を取得したか確認します。公式ファイルでも開けない場合は、警告の全文を控えてください。 |
+| `python3.13: command not found`／別のPythonバージョンが表示される | Python 3.13のインストール後に新しいターミナルを開き、`python3.13 --version` を実行します。見つからなければ[Pythonのインストール](#python-install)に戻ってください。 |
+| `app.py` や `requirements.txt` が見つからない | `ls` で両方のファイルが見えるか確認します。見えなければ、[macOSの初期設定](#macos-setup)のとおり、Finderから両方のファイルがあるフォルダをターミナルにドラッグして移動します。 |
+| `venv/bin/activate` または `venv/bin/python` が見つからない | `app.py` があるフォルダで `python3.13 -m venv venv` を実行し、`./venv/bin/python --version` が `Python 3.13.x` と表示することを確認します。 |
+| `ModuleNotFoundError`（例 `No module named 'scipy'`） | `./venv/bin/python -m pip install -r requirements.txt` を実行し、続けて `./venv/bin/python -m pip check` で確認します。 |
+| `No matching distribution found`／`incompatible architecture` | `./venv/bin/python --version` で3.13か確認します。3.13でも失敗する場合は、エラー全文、macOSのバージョン、MacがApple SiliconかIntelかを控えてください。 |
+| `Could not find the Qt platform plugin "cocoa"` | `./venv/bin/python check_environment.py` でQtの起動を確認します。Qtの段階で失敗した場合は、[macOSのQt検証記録](docs/macos_qt_venv_issue.md)を参照してください。 |
+
+プロジェクトフォルダで `./venv/bin/python app.py` と実行して起動することもできます。
 
 <a id="windows-setup-cases"></a>
 #### Windowsでエラーが出た場合
