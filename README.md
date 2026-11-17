@@ -101,24 +101,31 @@ ArtefactsOrthoMaker は OBJ / PLY / GLB 形式の考古資料3Dモデルを読�
 
 #### Windows
 
-すでにPowerShellで `py -3.13 --version` を実行して `Python 3.13.x` と表示される場合は、[2. フォルダの整備](#folder-setup)へ進んでください。
-
-PowerShellで `py` が認識されなくても、`python --version` が **`Python 3.13.x`** を表示する場合は、[2. フォルダの整備](#folder-setup)へ進んでください。別のバージョンが表示された場合は、以下の手順でPython 3.13を用意してください。
-
-1. [Python公式の Install Manager 配布ページ](https://www.python.org/downloads/release/pymanager-264/)を開き、**Download Installer (MSIX)** をクリックします。この `.msix` はx64とARM64の両方に対応します。
-2. ダウンロードした `.msix` をダブルクリックし、Windowsの「アプリ インストーラー」で **インストール** を選びます。
-3. スタートメニューから新しい **PowerShell** を開き、次の2行を順に実行します。1行目でAOM用のPython 3.13を指定してインストールし、2行目で3.13が利用できることを確認します。
+スタートメニューから **PowerShell** を開き、次の1行を実行します。
 
 ```powershell
-py install 3.13
 py -3.13 --version
 ```
 
-Python Install Manager 26.4 のMSIXにはPython 3.15.0が同梱されています。インストーラーに3.15と表示されても、上記の手順で3.13を併設できます。[Windowsの初期設定](#windows-setup)では、`py -3.13 -m venv venv` でAOM用の仮想環境を作成します。
+| PowerShellに出た表示 | 次に行う操作 |
+|---|---|
+| `Python 3.13.` で始まる | **A** と控え、[手順2「フォルダの整備」](#folder-setup)へ進みます。 |
+| エラーやそれ以外の表示 | `python --version` を実行し、次の表を見ます。 |
 
-`Python 3.13.` で始まるバージョンが表示されれば、[2. フォルダの整備](#folder-setup)へ進みます。Pythonが複数入っている場合は、`python --version` が別のバージョンを表示することがあるため、ここではバージョンを指定して確認します。
+| `python --version` の結果 | 次に行う操作 |
+|---|---|
+| `Python 3.13.` で始まる | **B** と控え、[手順2「フォルダの整備」](#folder-setup)へ進みます。 |
+| 別のバージョンやエラーが表示された、またはMicrosoft Storeが開いた | Storeが開いた場合は閉じ、[WindowsにPython 3.13を入れる](#windows-install-python313)へ進みます。 |
 
-`py install 3.13` が古いPythonランチャーの影響で動かない場合は、`pymanager install 3.13` でインストールし、`pymanager exec -V:3.13 --version` で確認できます。
+<a id="windows-install-python313"></a>
+##### WindowsにPython 3.13を入れる
+
+1. [Python公式の Install Manager 配布ページ](https://www.python.org/downloads/release/pymanager-264/)を開き、**Download Installer (MSIX)** をクリックします。この `.msix` はx64とARM64の両方に対応します。
+2. ダウンロードした `.msix` をダブルクリックし、Windowsの「アプリ インストーラー」で **インストール** を選びます。
+3. 新しいPowerShellを開き、`py install 3.13` を実行します。MSIXにPython 3.15と表示される場合も、このコマンドで3.13を追加します。
+4. `py -3.13 --version` を実行します。`Python 3.13.` で始まる表示なら **A** と控え、[手順2「フォルダの整備」](#folder-setup)へ進みます。コマンドが失敗した場合や別の版が表示された場合は、次の段落へ進みます。
+
+`pymanager install 3.13`、`pymanager exec -V:3.13 --version` の順に1行ずつ実行します。2行目が `Python 3.13.` で始まる表示なら **C** と控え、[手順2「フォルダの整備」](#folder-setup)へ進みます。エラーが出たら[Windowsでエラーが出た場合](#windows-setup-cases)を確認してください。
 
 #### macOS
 
@@ -245,37 +252,41 @@ OSに合った手順に進みます。初回は、アプリ専用の仮想環境
 
 エラーが出たら、[macOSでエラーが出た場合](#macos-setup-cases)を確認してから続けます。
 
-仮想環境 `venv` を作成・有効化します。
+仮想環境 `venv` を作成し、Pythonのバージョンを確認します。
 
 ```bash
 python3.13 -m venv venv
-source venv/bin/activate
+./venv/bin/python --version
 ```
+
+`Python 3.13.` で始まる表示なら、次のパッケージ導入へ進みます。別の版やエラーが表示された場合は、[macOSでエラーが出た場合](#macos-setup-cases)を確認してください。
 
 pip 関係を更新し、`requirements.txt` から必要な外部パッケージをまとめて導入します。
 
 ```bash
-python -m pip install --upgrade pip setuptools wheel
-python -m pip install -r requirements.txt
+./venv/bin/python -m pip install --upgrade pip setuptools wheel
+./venv/bin/python -m pip install -r requirements.txt
 ```
 
 依存関係と実行環境を確認します。
 
 ```bash
-python -m pip check
-python check_environment.py
+./venv/bin/python -m pip check
+./venv/bin/python check_environment.py
 ```
+
+`pip check` が `No broken requirements found.` と表示し、環境確認が `ENVIRONMENT CHECK PASSED` で終わったら次へ進みます。 エラーが出た場合は、[macOSでエラーが出た場合](#macos-setup-cases)を確認してください。
 
 共通計算コアのSELF TESTも実行できます。
 
 ```bash
-python self_test.py
+./venv/bin/python self_test.py
 ```
 
 起動する前に、Finderで作業対象の3Dモデル（`.obj`、`.ply`、`.glb`）を、`app.py` と同じ階層にある小文字の `input/` フォルダへコピーしてください。OBJに付属するMTLやテクスチャ画像がある場合は、[処理対象を置く場所](#input-files)に沿って配置します。その後、次のコマンドで起動します。
 
 ```bash
-python app.py
+./venv/bin/python app.py
 ```
 
 ##### macOS の Qt 起動エラー
@@ -287,7 +298,7 @@ python app.py
 最小 Qt 起動確認：
 
 ```bash
-python -c 'from PySide6.QtWidgets import QApplication; app=QApplication([]); print("QApplication OK"); app.quit()'
+./venv/bin/python -c 'from PySide6.QtWidgets import QApplication; app=QApplication([]); print("QApplication OK"); app.quit()'
 ```
 
 <a id="windows-setup"></a>
@@ -295,21 +306,21 @@ python -c 'from PySide6.QtWidgets import QApplication; app=QApplication([]); pri
 
 エクスプローラーでプロジェクトフォルダを開きます。アドレスバーに `powershell` と入力してEnterを押すと、そのフォルダでPowerShellが開きます。`dir` を実行して `app.py` と `requirements.txt` が表示されることを確認してください。
 
-Python 3.13を指定して、仮想環境を作成します。
+Windows Home・Proともに通常のPowerShellを使います。手順1で控えた記号に対応する1行だけを実行します。
+
+| 控えた記号 | 実行するコマンド |
+|---|---|
+| A | `py -3.13 -m venv venv` |
+| B | `python -m venv venv` |
+| C | `pymanager exec -V:3.13 -m venv venv` |
+
+作成が成功しても、何も表示されず入力待ちに戻ることがあります。続けて次の1行で確認します。
 
 ```powershell
-py -3.13 -m venv venv
+.\venv\Scripts\python.exe --version
 ```
 
-手順1で `pymanager exec` を使って確認した場合は、代わりに `pymanager exec -V:3.13 -m venv venv` を実行します。
-
-手順1で `python --version` が **`Python 3.13.x`** を表示した場合は、上の `py` コマンドの代わりに次を実行します。
-
-```powershell
-python -m venv venv
-```
-
-以下はWindows Home／Pro共通です。通常のPowerShellで、仮想環境のPythonをパスで指定して使います。コマンドは上から1行ずつ実行してください。エラーが出たら、[Windowsでエラーが出た場合](#windows-setup-cases)を確認してから続けます。
+`Python 3.13.` で始まる表示なら、次のパッケージ導入へ進みます。別の版やエラーが表示された場合は、[Windowsでエラーが出た場合](#windows-setup-cases)を確認してください。
 
 必要な外部パッケージをまとめて導入します。
 
@@ -325,6 +336,8 @@ python -m venv venv
 .\venv\Scripts\python.exe check_environment.py
 .\venv\Scripts\python.exe self_test.py
 ```
+
+`pip check` が `No broken requirements found.` と表示し、環境確認が `ENVIRONMENT CHECK PASSED` で終わったら次へ進みます。 エラーが出た場合は、[Windowsでエラーが出た場合](#windows-setup-cases)を確認してください。 セルフテストの成功時は `SELF TEST PASSED` と表示されます。
 
 起動する前に、エクスプローラーで作業対象の3Dモデル（`.obj`、`.ply`、`.glb`）を、`app.py` と同じ階層にある小文字の `input/` フォルダへコピーしてください。OBJに付属するMTLやテクスチャ画像がある場合は、[処理対象を置く場所](#input-files)に沿って配置します。その後、次のコマンドで起動します。
 
@@ -361,8 +374,7 @@ Python標準ライブラリはPython本体に含まれるため、個別イン�
 macOS
 
 ```bash
-source venv/bin/activate
-python app.py
+./venv/bin/python app.py
 ```
 
 Windows
@@ -428,22 +440,22 @@ ENVIRONMENT CHECK PASSED
 
 ##### `ModuleNotFoundError: No module named '...'`
 
-まず仮想環境が有効か確認します。
+プロジェクトの仮想環境にあるPythonのバージョンを確認します。
 
 macOS：
 
 ```bash
-which python
+./venv/bin/python --version
 ```
 
-`.../ArtefactsOrthoMaker/venv/bin/python` のように表示されるのが正常です。
+`Python 3.13.` で始まる表示なら次に進みます。
 
 その後：
 
 ```bash
-python -m pip install -r requirements.txt
-python -m pip check
-python check_environment.py
+./venv/bin/python -m pip install -r requirements.txt
+./venv/bin/python -m pip check
+./venv/bin/python check_environment.py
 ```
 
 を再実行してください。
@@ -498,11 +510,10 @@ macOSでGit cloneした環境を更新する場合は、次を実行します。
 
 ```bash
 git pull
-source venv/bin/activate
-python -m pip install -r requirements.txt
-python -m pip check
-python check_environment.py
-python self_test.py
+./venv/bin/python -m pip install -r requirements.txt
+./venv/bin/python -m pip check
+./venv/bin/python check_environment.py
+./venv/bin/python self_test.py
 ```
 
 Windows PowerShellでは、プロジェクトフォルダを開いて次を実行します。

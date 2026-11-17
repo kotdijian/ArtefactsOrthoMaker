@@ -99,24 +99,31 @@ On your first run, follow steps **1. Install Python → 2. Set up the project fo
 
 #### Windows
 
-If `py -3.13 --version` already reports `Python 3.13.x` in PowerShell, proceed to [step 2](#folder-setup).
-
-If PowerShell does not recognize `py` but `python --version` reports **`Python 3.13.x`**, proceed to [step 2](#folder-setup). If it reports a different version, follow the instructions below to set up Python 3.13.
-
-1. Open the official release page and select **Download Installer (MSIX)**. The same installer supports x64 and ARM64. [Python Install Manager](https://www.python.org/downloads/release/pymanager-264/)
-2. Double-click the downloaded `.msix` and select **Install** in Windows App Installer.
-3. Open a new **PowerShell** window from the Start menu. The first command explicitly installs Python 3.13 for AOM, and the second checks that 3.13 is available.
+Open **PowerShell** from the Start menu and run this line.
 
 ```powershell
-py install 3.13
 py -3.13 --version
 ```
 
-The Python Install Manager 26.4 MSIX bundles Python 3.15.0. If the installer displays 3.15, continue with the steps above and install 3.13 alongside it. The AOM virtual environment is created with `py -3.13 -m venv venv` in [Windows setup](#windows-setup).
+| What PowerShell shows | Next action |
+|---|---|
+| A line starting with `Python 3.13.` | Note **A** and go to [Step 2. Set up the project folder](#folder-setup). |
+| An error or any other result | Run `python --version` and check the next table. |
 
-If the displayed version starts with `Python 3.13.`, proceed to [step 2](#folder-setup). When several Python versions are installed, `python --version` may report a different version, so the check above explicitly selects 3.13.
+| Result of `python --version` | Next action |
+|---|---|
+| A line starting with `Python 3.13.` | Note **B** and go to [Step 2. Set up the project folder](#folder-setup). |
+| A different version, an error, or the Microsoft Store opens | If the Store opens, close it. Go to [Install Python 3.13 on Windows](#windows-install-python313). |
 
-If the legacy Python launcher prevents `py install 3.13` from working, use `pymanager install 3.13` and check it with `pymanager exec -V:3.13 --version`.
+<a id="windows-install-python313"></a>
+##### Install Python 3.13 on Windows
+
+1. Open the official release page and select **Download Installer (MSIX)**. The same installer supports x64 and ARM64. [Python Install Manager](https://www.python.org/downloads/release/pymanager-264/)
+2. Double-click the downloaded `.msix` and select **Install** in Windows App Installer.
+3. Open a new PowerShell window and run `py install 3.13`. The MSIX may display Python 3.15. The command installs 3.13 alongside it.
+4. Run `py -3.13 --version`. If it prints `Python 3.13.x`, note **A** and go to [Step 2. Set up the project folder](#folder-setup). If any command fails or the version differs, follow the next paragraph.
+
+Run `pymanager install 3.13`, then `pymanager exec -V:3.13 --version`. If the second command prints `Python 3.13.x`, note **C** and go to [Step 2. Set up the project folder](#folder-setup). If either command reports an error, check [Windows setup errors](#windows-setup-cases) before continuing.
 
 #### macOS
 
@@ -241,37 +248,41 @@ In Terminal, type `cd` followed by a space, drag the project folder from Finder 
 
 If a command fails, see [macOS setup errors](#macos-setup-cases) before continuing.
 
-Create and activate the virtual environment.
+Create the virtual environment and check its Python version.
 
 ```bash
 python3.13 -m venv venv
-source venv/bin/activate
+./venv/bin/python --version
 ```
+
+If the output starts with `Python 3.13.`, continue to package installation. If it shows another version or an error, see [macOS setup errors](#macos-setup-cases).
 
 Update the installation tools and install the required packages.
 
 ```bash
-python -m pip install --upgrade pip setuptools wheel
-python -m pip install -r requirements.txt
+./venv/bin/python -m pip install --upgrade pip setuptools wheel
+./venv/bin/python -m pip install -r requirements.txt
 ```
 
 Check installed dependencies and the runtime environment.
 
 ```bash
-python -m pip check
-python check_environment.py
+./venv/bin/python -m pip check
+./venv/bin/python check_environment.py
 ```
+
+Continue when `pip check` reports `No broken requirements found.` and the environment check ends with `ENVIRONMENT CHECK PASSED`. Otherwise, see [macOS setup errors](#macos-setup-cases).
 
 You can also run the core self-test.
 
 ```bash
-python self_test.py
+./venv/bin/python self_test.py
 ```
 
 Before launching, use Finder to copy the `.obj`, `.ply`, or `.glb` models into the lowercase `input/` folder alongside `app.py`. Arrange any OBJ material and texture files as described in [Where to put input files](#input-files). Then launch the app.
 
 ```bash
-python app.py
+./venv/bin/python app.py
 ```
 
 ##### Qt startup errors on macOS
@@ -281,7 +292,7 @@ Project testing found a Qt platform-plugin file flags issue in an environment na
 Run this command for a minimal Qt startup check.
 
 ```bash
-python -c 'from PySide6.QtWidgets import QApplication; app=QApplication([]); print("QApplication OK"); app.quit()'
+./venv/bin/python -c 'from PySide6.QtWidgets import QApplication; app=QApplication([]); print("QApplication OK"); app.quit()'
 ```
 
 <a id="windows-setup"></a>
@@ -289,21 +300,21 @@ python -c 'from PySide6.QtWidgets import QApplication; app=QApplication([]); pri
 
 Open the project folder in File Explorer. Type `powershell` in the address bar and press Enter to open PowerShell in that folder. Run `dir` to check that `app.py` and `requirements.txt` are listed.
 
-Create the virtual environment with Python 3.13.
+Use a regular PowerShell window on Windows Home or Pro. Run only the line for the letter you noted in step 1.
+
+| Letter | Run this command |
+|---|---|
+| A | `py -3.13 -m venv venv` |
+| B | `python -m venv venv` |
+| C | `pymanager exec -V:3.13 -m venv venv` |
+
+The command may return to the prompt without printing anything. Run this line to check the result.
 
 ```powershell
-py -3.13 -m venv venv
+.\venv\Scripts\python.exe --version
 ```
 
-If you used `pymanager exec` to check your version in step 1, create the environment with `pymanager exec -V:3.13 -m venv venv`.
-
-If `python --version` reported **`Python 3.13.x`** in step 1, use the following command in place of the `py` command above.
-
-```powershell
-python -m venv venv
-```
-
-These steps apply to Windows Home and Pro. Use a regular PowerShell window and call the virtual environment’s Python by path. Run one line at a time. If a command fails, check [Windows setup errors](#windows-setup-cases) before continuing.
+If the output starts with `Python 3.13.`, continue to package installation. If it shows another version or an error, see [Windows setup errors](#windows-setup-cases).
 
 Install the required packages.
 
@@ -319,6 +330,8 @@ Run the checks.
 .\venv\Scripts\python.exe check_environment.py
 .\venv\Scripts\python.exe self_test.py
 ```
+
+Continue when `pip check` reports `No broken requirements found.` and the environment check ends with `ENVIRONMENT CHECK PASSED`. Otherwise, see [Windows setup errors](#windows-setup-cases). The self-test should end with `SELF TEST PASSED`.
 
 Before launching, use File Explorer to copy the `.obj`, `.ply`, or `.glb` models into the lowercase `input/` folder alongside `app.py`. Arrange any OBJ material and texture files as described in [Where to put input files](#input-files). Then launch the app.
 
@@ -353,8 +366,7 @@ Before running `app.py`, check that your models are in the project folder's `inp
 macOS
 
 ```bash
-source venv/bin/activate
-python app.py
+./venv/bin/python app.py
 ```
 
 Windows
@@ -416,20 +428,20 @@ If you prefer to activate the environment and encounter the script execution err
 
 ##### `ModuleNotFoundError: No module named '...'`
 
-First check that the virtual environment is active.
+Check the Python executable inside the project’s virtual environment.
 
-On macOS, run the following command and look for a path ending in `ArtefactsOrthoMaker/venv/bin/python`.
+On macOS, run the following command. Continue when it prints `Python 3.13.x`.
 
 ```bash
-which python
+./venv/bin/python --version
 ```
 
 Then run the installation and checks again.
 
 ```bash
-python -m pip install -r requirements.txt
-python -m pip check
-python check_environment.py
+./venv/bin/python -m pip install -r requirements.txt
+./venv/bin/python -m pip check
+./venv/bin/python check_environment.py
 ```
 
 On Windows, see `ModuleNotFoundError` under [Windows setup errors](#windows-setup-cases).
@@ -480,11 +492,10 @@ On macOS, update a cloned repository with these commands.
 
 ```bash
 git pull
-source venv/bin/activate
-python -m pip install -r requirements.txt
-python -m pip check
-python check_environment.py
-python self_test.py
+./venv/bin/python -m pip install -r requirements.txt
+./venv/bin/python -m pip check
+./venv/bin/python check_environment.py
+./venv/bin/python self_test.py
 ```
 
 In Windows PowerShell, open the project folder and run these commands.
