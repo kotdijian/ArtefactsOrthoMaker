@@ -33,16 +33,17 @@ Created by **Atsushi Noguchi (@fujimicho on X)**.
 - [Getting started](#python-environment)
   - [1. Install Python](#python-install)
   - [2. Set up the project folder](#folder-setup)
+    - [Open PowerShell or Terminal in the project folder](#open-project-shell)
     - [Where to put input files](#input-files)
     - [Supported input files](#supported-input-files)
     - [Output location and when items are skipped](#output-skip)
   - [3. Set up and launch the app](#initial-setup)
-    - [First-time setup on macOS](#macos-setup)
     - [First-time setup on Windows](#windows-setup)
+    - [First-time setup on macOS](#macos-setup)
     - [Launching again](#run-again)
   - [Environment check script](#environment-check-script)
-  - [macOS setup errors](#macos-setup-cases)
   - [Windows setup errors](#windows-setup-cases)
+  - [macOS setup errors](#macos-setup-cases)
   - [Troubleshooting](#troubleshooting)
   - [Self-test](#self-test)
   - [Updating an existing installation](#update-procedure)
@@ -90,7 +91,7 @@ ArtefactsOrthoMaker is a Python/PySide6 desktop application. It loads archaeolog
 
 Use **言語 / Language** at the top of the left panel to switch between **日本語** and **English**. The app remembers your choice across launches.
 
-On your first run, follow steps **1. Install Python → 2. Set up the project folder → 3. Set up and launch the app**. Enter each command on its own line and press Enter in Terminal on macOS or PowerShell on Windows.
+On your first run, follow steps **1. Install Python → 2. Set up the project folder → 3. Set up and launch the app**. Enter each command on its own line and press Enter in PowerShell on Windows or Terminal on macOS.
 
 <a id="python-install"></a>
 ### 1. Install Python
@@ -148,6 +149,26 @@ If the output starts with `Python 3.13.`, such as `Python 3.13.17`, proceed to [
 4. Put the 3D models to process in the lowercase `input` folder inside the project folder. Create it if needed. Supported formats and output locations are described below.
 
 If you use Git, run `git clone https://github.com/kotdijian/ArtefactsOrthoMaker.git` instead of downloading the ZIP. If you already cloned the repository, use the existing project folder containing `app.py`.
+
+<a id="open-project-shell"></a>
+#### Open PowerShell or Terminal in the project folder
+
+After installing or checking Python and downloading and extracting the ZIP, close the PowerShell or Terminal window you used earlier. Open a new window from the project folder where you can see `app.py` and `requirements.txt`. If the app files are already in place, use that folder.
+
+**Windows**
+
+1. Open the project folder in File Explorer.
+2. Click the address bar at the top, type `powershell`, and press Enter.
+3. In the new PowerShell window, run `dir`. If the listing includes `app.py` and `requirements.txt`, continue to [Windows first-time setup](#windows-setup). If either file is missing, close PowerShell and start again from step 1 in the folder where both files are visible.
+
+**macOS**
+
+1. Open the project folder in Finder.
+2. In the menu bar, choose **View → Show Path Bar**. If the path bar is already visible at the bottom, continue to the next step.
+3. Control-click the project folder name at the right end of the path bar and choose **Services → New Terminal at Folder**.
+4. In the new Terminal window, run `ls`. If the listing includes `app.py` and `requirements.txt`, continue to [macOS first-time setup](#macos-setup). If either file is missing, close Terminal and start again from step 1 in the folder where both files are visible.
+
+[Apple Terminal User Guide](https://support.apple.com/guide/terminal/trmlb20c7888/mac)
 
 <a id="input-output"></a>
 #### Input, output, and the processing queue
@@ -241,10 +262,54 @@ The inventory is saved to `output/inventory-qa-measurements.csv`. If you want to
 
 The first-time steps create a virtual environment named `venv` and install the packages listed in `requirements.txt`.
 
+<a id="windows-setup"></a>
+#### Windows / PowerShell first-time setup
+
+Use the PowerShell window you [opened from the project folder in step 2](#open-project-shell).
+
+Use a regular PowerShell window on Windows Home or Pro. Run only the line for the letter you noted in step 1.
+
+| Letter | Run this command |
+|---|---|
+| A | `py -3.13 -m venv venv` |
+| B | `python -m venv venv` |
+| C | `pymanager exec -V:3.13 -m venv venv` |
+
+The command may return to the prompt without printing anything. Run this line to check the result.
+
+```powershell
+.\venv\Scripts\python.exe --version
+```
+
+If the output starts with `Python 3.13.`, continue to package installation. If it shows another version or an error, see [Windows setup errors](#windows-setup-cases).
+
+Install the required packages.
+
+```powershell
+.\venv\Scripts\python.exe -m pip install --upgrade pip setuptools wheel
+.\venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+Run the checks.
+
+```powershell
+.\venv\Scripts\python.exe -m pip check
+.\venv\Scripts\python.exe check_environment.py
+.\venv\Scripts\python.exe self_test.py
+```
+
+Continue when `pip check` reports `No broken requirements found.` and the environment check ends with `ENVIRONMENT CHECK PASSED`. Otherwise, see [Windows setup errors](#windows-setup-cases). The self-test should end with `SELF TEST PASSED`.
+
+Before launching, use File Explorer to copy the `.obj`, `.ply`, or `.glb` models into the lowercase `input/` folder alongside `app.py`. Arrange any OBJ material and texture files as described in [Where to put input files](#input-files). Then launch the app.
+
+```powershell
+.\venv\Scripts\python.exe app.py
+```
+
 <a id="macos-setup"></a>
 #### macOS first-time setup
 
-In Terminal, type `cd` followed by a space, drag the project folder from Finder into Terminal, and press Enter. Run `ls` to check that `app.py` and `requirements.txt` are listed.
+Use the Terminal window you [opened from the project folder in step 2](#open-project-shell).
 
 If a command fails, see [macOS setup errors](#macos-setup-cases) before continuing.
 
@@ -295,50 +360,6 @@ Run this command for a minimal Qt startup check.
 ./venv/bin/python -c 'from PySide6.QtWidgets import QApplication; app=QApplication([]); print("QApplication OK"); app.quit()'
 ```
 
-<a id="windows-setup"></a>
-#### Windows / PowerShell first-time setup
-
-Open the project folder in File Explorer. Type `powershell` in the address bar and press Enter to open PowerShell in that folder. Run `dir` to check that `app.py` and `requirements.txt` are listed.
-
-Use a regular PowerShell window on Windows Home or Pro. Run only the line for the letter you noted in step 1.
-
-| Letter | Run this command |
-|---|---|
-| A | `py -3.13 -m venv venv` |
-| B | `python -m venv venv` |
-| C | `pymanager exec -V:3.13 -m venv venv` |
-
-The command may return to the prompt without printing anything. Run this line to check the result.
-
-```powershell
-.\venv\Scripts\python.exe --version
-```
-
-If the output starts with `Python 3.13.`, continue to package installation. If it shows another version or an error, see [Windows setup errors](#windows-setup-cases).
-
-Install the required packages.
-
-```powershell
-.\venv\Scripts\python.exe -m pip install --upgrade pip setuptools wheel
-.\venv\Scripts\python.exe -m pip install -r requirements.txt
-```
-
-Run the checks.
-
-```powershell
-.\venv\Scripts\python.exe -m pip check
-.\venv\Scripts\python.exe check_environment.py
-.\venv\Scripts\python.exe self_test.py
-```
-
-Continue when `pip check` reports `No broken requirements found.` and the environment check ends with `ENVIRONMENT CHECK PASSED`. Otherwise, see [Windows setup errors](#windows-setup-cases). The self-test should end with `SELF TEST PASSED`.
-
-Before launching, use File Explorer to copy the `.obj`, `.ply`, or `.glb` models into the lowercase `input/` folder alongside `app.py`. Arrange any OBJ material and texture files as described in [Where to put input files](#input-files). Then launch the app.
-
-```powershell
-.\venv\Scripts\python.exe app.py
-```
-
 #### requirements.txt
 
 `requirements.txt` pins the versions of the app's main third-party packages.
@@ -361,13 +382,7 @@ Python includes its standard library. Pip automatically installs additional depe
 <a id="run-again"></a>
 #### Launching again
 
-Before running `app.py`, check that your models are in the project folder's `input/` directory. Copy in any new models first. Open the same project folder in Terminal or PowerShell, and run the commands for your operating system.
-
-macOS
-
-```bash
-./venv/bin/python app.py
-```
+Before running `app.py`, check that your models are in the project folder's `input/` directory. Copy in any new models first. [Open PowerShell or Terminal from the project folder](#open-project-shell), then run the command for your operating system.
 
 Windows
 
@@ -375,15 +390,29 @@ Windows
 .\venv\Scripts\python.exe app.py
 ```
 
-If launching fails, see [Windows setup errors](#windows-setup-cases). The queue skips completed artifacts according to the [output and skip rules](#output-skip).
+macOS
+
+```bash
+./venv/bin/python app.py
+```
+
+If launching fails, see [Windows setup errors](#windows-setup-cases) or [macOS setup errors](#macos-setup-cases). The queue skips completed artifacts according to the [output and skip rules](#output-skip).
 
 <a id="environment-check-script"></a>
 #### `check_environment.py`
 
 This script checks dependencies and the Qt startup environment.
 
+**Windows**
+
+```powershell
+.\venv\Scripts\python.exe check_environment.py
+```
+
+**macOS**
+
 ```bash
-python check_environment.py
+./venv/bin/python check_environment.py
 ```
 
 It checks NumPy, SciPy, Trimesh, PyVista, PyVistaQt, VTK, PySide6, QtPy, Pillow, psutil, the local `pose_core.py`, and Qt `QApplication` and its platform plugin. A successful check ends with the following message.
@@ -391,21 +420,6 @@ It checks NumPy, SciPy, Trimesh, PyVista, PyVistaQt, VTK, PySide6, QtPy, Pillow,
 ```text
 ENVIRONMENT CHECK PASSED
 ```
-
-<a id="macos-setup-cases"></a>
-#### macOS setup errors
-
-| What you see | What to do next |
-|---|---|
-| The Python `.pkg` will not open or shows a developer warning | Check that you downloaded the macOS `.pkg` from the official python.org page under [Install Python](#python-install). If the official file still will not open, record the full warning. |
-| `python3.13: command not found` or a different Python version appears | After installing Python 3.13, open a new Terminal window and run `python3.13 --version`. If the command is still unavailable, return to [Install Python](#python-install). |
-| `app.py` or `requirements.txt` is missing | Run `ls` and look for both files. If either is missing, follow [macOS first-time setup](#macos-setup) to change to the folder containing both files by dragging it from Finder into Terminal. |
-| `venv/bin/activate` or `venv/bin/python` is missing | In the folder containing `app.py`, run `python3.13 -m venv venv`. Check that `./venv/bin/python --version` reports `Python 3.13.x`. |
-| `ModuleNotFoundError` (such as `No module named 'scipy'`) | Run `./venv/bin/python -m pip install -r requirements.txt`, then check with `./venv/bin/python -m pip check`. |
-| `No matching distribution found` or `incompatible architecture` | Run `./venv/bin/python --version` to check for Python 3.13. If it still fails with 3.13, record the full error, macOS version, and whether the Mac uses Apple Silicon or Intel. |
-| `Could not find the Qt platform plugin "cocoa"` | Run `./venv/bin/python check_environment.py` to check Qt startup. If the Qt check fails, see the [macOS Qt investigation notes](docs/macos_qt_venv_issue.md). |
-
-You can also launch AOM from the project folder by running `./venv/bin/python app.py` directly.
 
 <a id="windows-setup-cases"></a>
 #### Windows setup errors
@@ -423,12 +437,27 @@ You can also launch AOM from the project folder by running `./venv/bin/python ap
 
 If you prefer to activate the environment and encounter the script execution error, you can run `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` in the same PowerShell window, then retry `Activate.ps1`. This setting applies only to that window. If an organization’s Group Policy takes precedence, call the virtual environment’s Python directly as shown above.
 
+<a id="macos-setup-cases"></a>
+#### macOS setup errors
+
+| What you see | What to do next |
+|---|---|
+| The Python `.pkg` will not open or shows a developer warning | Check that you downloaded the macOS `.pkg` from the official python.org page under [Install Python](#python-install). If the official file still will not open, record the full warning. |
+| `python3.13: command not found` or a different Python version appears | After installing Python 3.13, open a new Terminal window and run `python3.13 --version`. If the command is still unavailable, return to [Install Python](#python-install). |
+| `app.py` or `requirements.txt` is missing | Run `ls` and look for both files. If either is missing, [reopen Terminal from the project folder](#open-project-shell). |
+| `venv/bin/activate` or `venv/bin/python` is missing | In the folder containing `app.py`, run `python3.13 -m venv venv`. Check that `./venv/bin/python --version` reports `Python 3.13.x`. |
+| `ModuleNotFoundError` (such as `No module named 'scipy'`) | Run `./venv/bin/python -m pip install -r requirements.txt`, then check with `./venv/bin/python -m pip check`. |
+| `No matching distribution found` or `incompatible architecture` | Run `./venv/bin/python --version` to check for Python 3.13. If it still fails with 3.13, record the full error, macOS version, and whether the Mac uses Apple Silicon or Intel. |
+| `Could not find the Qt platform plugin "cocoa"` | Run `./venv/bin/python check_environment.py` to check Qt startup. If the Qt check fails, see the [macOS Qt investigation notes](docs/macos_qt_venv_issue.md). |
+
+You can also launch AOM from the project folder by running `./venv/bin/python app.py` directly.
+
 <a id="troubleshooting"></a>
 #### Troubleshooting
 
 ##### `ModuleNotFoundError: No module named '...'`
 
-Check the Python executable inside the project’s virtual environment.
+On Windows, see `ModuleNotFoundError` under [Windows setup errors](#windows-setup-cases).
 
 On macOS, run the following command. Continue when it prints `Python 3.13.x`.
 
@@ -444,8 +473,6 @@ Then run the installation and checks again.
 ./venv/bin/python check_environment.py
 ```
 
-On Windows, see `ModuleNotFoundError` under [Windows setup errors](#windows-setup-cases).
-
 ##### `No module named 'pose_core'`
 
 `pose_core.py` is bundled with the repository. Check that it is alongside `app.py`.
@@ -454,16 +481,32 @@ On Windows, see `ModuleNotFoundError` under [Windows setup errors](#windows-setu
 
 Install the required packages together, including SciPy.
 
+**Windows**
+
+```powershell
+.\venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+**macOS**
+
 ```bash
-python -m pip install -r requirements.txt
+./venv/bin/python -m pip install -r requirements.txt
 ```
 
 ##### Qt platform plugin errors
 
 Run the environment check to see whether the Qt step is the only one that fails.
 
+**Windows**
+
+```powershell
+.\venv\Scripts\python.exe check_environment.py
+```
+
+**macOS**
+
 ```bash
-python check_environment.py
+./venv/bin/python check_environment.py
 ```
 
 On macOS, see [macOS Qt virtual environment issue](docs/macos_qt_venv_issue.md).
@@ -473,8 +516,16 @@ On macOS, see [macOS Qt virtual environment issue](docs/macos_qt_venv_issue.md).
 
 Run the core computation checks.
 
+**Windows**
+
+```powershell
+.\venv\Scripts\python.exe self_test.py
+```
+
+**macOS**
+
 ```bash
-python self_test.py
+./venv/bin/python self_test.py
 ```
 
 On success, the script prints the following message.
@@ -488,17 +539,9 @@ The self-test mainly covers orientation, normals, and mesh I/O. Launch `app.py` 
 <a id="update-procedure"></a>
 #### Updating an existing installation
 
-On macOS, update a cloned repository with these commands.
+[Open PowerShell or Terminal from the project folder](#open-project-shell) to update a cloned repository.
 
-```bash
-git pull
-./venv/bin/python -m pip install -r requirements.txt
-./venv/bin/python -m pip check
-./venv/bin/python check_environment.py
-./venv/bin/python self_test.py
-```
-
-In Windows PowerShell, open the project folder and run these commands.
+In Windows PowerShell, run these commands.
 
 ```powershell
 git pull
@@ -506,6 +549,16 @@ git pull
 .\venv\Scripts\python.exe -m pip check
 .\venv\Scripts\python.exe check_environment.py
 .\venv\Scripts\python.exe self_test.py
+```
+
+In Terminal on macOS, run these commands.
+
+```bash
+git pull
+./venv/bin/python -m pip install -r requirements.txt
+./venv/bin/python -m pip check
+./venv/bin/python check_environment.py
+./venv/bin/python self_test.py
 ```
 
 If the virtual environment has multiple dependency problems, recreate `venv` from `requirements.txt` to recover a reproducible setup.
@@ -664,10 +717,20 @@ See [requirements.txt](requirements.txt) for tested package versions.
 <a id="environment-check"></a>
 # Environment checks
 
+**Windows**
+
+```powershell
+.\venv\Scripts\python.exe -m pip check
+.\venv\Scripts\python.exe check_environment.py
+.\venv\Scripts\python.exe self_test.py
+```
+
+**macOS**
+
 ```bash
-python -m pip check
-python check_environment.py
-python self_test.py
+./venv/bin/python -m pip check
+./venv/bin/python check_environment.py
+./venv/bin/python self_test.py
 ```
 
 [Qt / PySide6 issues on macOS](docs/macos_qt_venv_issue.md)
