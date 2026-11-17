@@ -634,6 +634,8 @@ When comparing spill-out volume estimates under different orientations, use acce
 
 After applying an orientation estimate, enter corrections for X and Y (each within ±45°) under **Manual tilt** and select **Apply tilt**. The angles are relative to the base orientation. Select **Reset tilt** to remove the correction. Running orientation estimation again resets both angles to zero.
 
+Use the **Tilt handles** above the 3D view to adjust X and Y individually. Drag a handle to preview the tilt. Release it to apply the correction, recompute the origin, and update the numeric controls.
+
 The model rotates about the base pose origin, first about the fixed X axis and then about the fixed Y axis. The origin is then reset to the intersection of the rotated center axis with the horizontal plane through the lowest point. The existing front-view rotation about Z is applied last. Orthographic views, sections, unwraps, measurements, and normalized PLY use the same corrected transform. Applying or resetting tilt reinitializes cylindrical and fan unwrap breakpoints and diameters. If a fan endpoint diameter is blank because it could not be measured, enter a diameter before unwrapping.
 
 In `transform.json`, `posture.orientation_method` retains the base orientation method. `posture.manual_tilt` records whether a correction is active (`applied`), whether it followed automatic estimation (`applied_after_automatic_estimation`), the base mode, angles, rotation order and pivot, origin translation, and base and correction matrices. The final matrix is `Rz @ correction_matrix_4x4 @ base_matrix_4x4` and is stored in `transform.matrix_4x4`.

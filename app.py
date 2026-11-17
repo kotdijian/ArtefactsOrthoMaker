@@ -20,7 +20,8 @@ import pose_core as _pose_core
 import item_output
 from ui_language import UiLanguage
 from pyvistaqt import QtInteractor
-from PySide6.QtCore import Qt, QEvent, QLockFile, QTimer
+from vtkmodules.vtkCommonMath import vtkMatrix4x4
+from PySide6.QtCore import Qt, QEvent, QLockFile, QSignalBlocker, QTimer
 from PySide6.QtGui import QAction, QColor, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -1484,6 +1485,28 @@ class MainWindow(QMainWindow):
         # Pottery viewer: the proven single interactive view from v0.1.x.
         view_widget = QWidget()
         view_layout = QVBoxLayout(view_widget)
+        self.pottery_tilt_handles = QWidget(view_widget)
+        handle_layout = QHBoxLayout(self.pottery_tilt_handles)
+        handle_layout.setContentsMargins(0, 0, 0, 0)
+        handle_layout.addWidget(QLabel("傾きハンドル"))
+        self.pottery_tilt_sliders = []
+        for index, label in enumerate(("X軸の傾き", "Y軸の傾き")):
+            handle_layout.addWidget(QLabel(label))
+            slider = QSlider(Qt.Orientation.Horizontal)
+            slider.setAccessibleName(label)
+            slider.setRange(-4500, 4500)
+            slider.setSingleStep(10)
+            slider.setPageStep(100)
+            slider.setTracking(False)
+            slider.sliderMoved.connect(lambda value, i=index: self._preview_pottery_tilt_drag(i, value))
+            slider.valueChanged.connect(lambda value, i=index: self._commit_pottery_tilt_drag(i, value))
+            slider.sliderReleased.connect(
+                lambda: QTimer.singleShot(0, self._finish_pottery_tilt_drag)
+            )
+            self.pottery_tilt_sliders.append(slider)
+            handle_layout.addWidget(slider, 1)
+        self.pottery_tilt_handles.hide()
+        view_layout.addWidget(self.pottery_tilt_handles)
         self.plotter = QtInteractor(view_widget, auto_update=False, multi_samples=0)
         self.plotter.set_background("white")
         self.plotter.add_axes()
@@ -1643,6 +1666,7 @@ class MainWindow(QMainWindow):
             w.setEnabled(loaded)
         if not loaded:
             self.pottery_tilt_group.setEnabled(False)
+            self.pottery_tilt_handles.hide()
         if loaded:
             self._update_artifact_type_ui()
             if hasattr(self, "pottery_output_branch_group") and not self._is_lithic():
@@ -1901,10 +1925,12 @@ class MainWindow(QMainWindow):
         lithic = self._is_lithic()
 
         self.pottery_posture_group.setVisible(not lithic)
-        self.pottery_tilt_group.setEnabled(
+        tilt_available = (
             not lithic and self.asset is not None and self.posture_done
             and self.pottery_base_center_axis is not None
         )
+        self.pottery_tilt_group.setEnabled(tilt_available)
+        self.pottery_tilt_handles.setVisible(tilt_available)
         self.pottery_front_group.setVisible(not lithic)
         self.pottery_output_branch_group.setVisible(not lithic)
         self.pottery_image_size_group.setVisible(not lithic)
@@ -4244,6 +4270,7 @@ class MainWindow(QMainWindow):
             self.pose_info = info | {"pose_quality": quality, "manual_flip_z": self.pottery_flip_z}
             self.posture_done = True
             self.pottery_tilt_group.setEnabled(True)
+            self.pottery_tilt_handles.show()
             self.set_front_angle(0.0)
             self._initialize_pottery_curve_controls()
             self.pottery_output_branch_group.setEnabled(True)
@@ -4298,7 +4325,62 @@ class MainWindow(QMainWindow):
         self.pottery_tilt_origin_shift = np.zeros(3)
         for spin in self.pottery_tilt_spins.values():
             spin.setValue(0.0)
+        self._sync_pottery_tilt_handles()
         self.pottery_tilt_group.setEnabled(False)
+        self.pottery_tilt_handles.hide()
+
+    def _sync_pottery_tilt_handles(self):
+        for slider, angle in zip(self.pottery_tilt_sliders, self.pottery_tilt_angles):
+            with QSignalBlocker(slider):
+                slider.setValue(round(angle * 100))
+
+    def _pottery_tilt_rotation(self, x: float, y: float) -> np.ndarray:
+        return self._axis_rotation_matrix("y", y) @ self._axis_rotation_matrix("x", x)
+
+    def _preview_pottery_tilt_drag(self, index: int, value: int):
+        if not self.pottery_tilt_handles.isVisible() or self.actor is None:
+            return
+        angles = list(self.pottery_tilt_angles)
+        angles[index] = value / 100
+        rotation = self._pottery_tilt_rotation(*angles)[:3, :3]
+        delta = rotation @ self.pottery_tilt_matrix[:3, :3].T
+        front = self._axis_rotation_matrix("z", self.front_angle_deg)[:3, :3]
+        pivot = front @ self.pottery_tilt_origin_shift
+        world_delta = front @ delta @ front.T
+        # Preview on the existing actors. The exact mesh-dependent origin is
+        # recomputed by the normal apply path once the handle is released.
+        shift = pivot - world_delta @ pivot
+        matrix = vtkMatrix4x4()
+        for row in range(3):
+            for col in range(3):
+                matrix.SetElement(row, col, world_delta[row, col])
+            matrix.SetElement(row, 3, shift[row])
+        self.actor.SetUserMatrix(matrix)
+        if self.pottery_axis_actor is not None:
+            self.pottery_axis_actor.SetUserMatrix(matrix)
+        self.plotter.render()
+
+    def _clear_pottery_tilt_drag_preview(self) -> bool:
+        cleared = False
+        for actor in (self.actor, self.pottery_axis_actor):
+            if actor is not None and actor.GetUserMatrix() is not None:
+                actor.SetUserMatrix(None)
+                cleared = True
+        return cleared
+
+    def _finish_pottery_tilt_drag(self):
+        if self._clear_pottery_tilt_drag_preview():
+            self.plotter.render()
+
+    def _commit_pottery_tilt_drag(self, index: int, value: int):
+        had_preview = self._clear_pottery_tilt_drag_preview()
+        angles = list(self.pottery_tilt_angles)
+        angles[index] = value / 100
+        self._commit_pottery_tilt(*angles)
+        if tuple(angles) != self.pottery_tilt_angles:
+            self._sync_pottery_tilt_handles()
+            if had_preview:
+                self.plotter.render()
 
     def _reset_pottery_tilt(self):
         for spin in self.pottery_tilt_spins.values():
@@ -4306,16 +4388,18 @@ class MainWindow(QMainWindow):
         self._apply_pottery_tilt()
 
     def _apply_pottery_tilt(self):
+        self._commit_pottery_tilt(*(spin.value() for spin in self.pottery_tilt_spins.values()))
+
+    def _commit_pottery_tilt(self, x: float, y: float):
         base_axis = self.pottery_base_center_axis
         if not self.asset or not self.posture_done or self._is_lithic() or base_axis is None:
             return
-        x, y = (self.pottery_tilt_spins[key].value() for key in ("x", "y"))
         if (x, y) == self.pottery_tilt_angles:
             return
 
         # Rotate about the origin of the base pose, then restore the pottery
         # origin at the intersection of the rotated axis and the lower Z plane.
-        rotation = self._axis_rotation_matrix("y", y) @ self._axis_rotation_matrix("x", x)
+        rotation = self._pottery_tilt_rotation(x, y)
         tilted_pose = rotation @ self.pottery_base_pose_matrix
         direction = rotation[:3, :3] @ base_axis.direction
         if abs(direction[2]) < 1e-6:
@@ -4333,6 +4417,9 @@ class MainWindow(QMainWindow):
         correction = self._translation_matrix_xyz(*shift) @ rotation
 
         self.pottery_tilt_angles = (x, y)
+        for spin, angle in zip(self.pottery_tilt_spins.values(), self.pottery_tilt_angles):
+            spin.setValue(angle)
+        self._sync_pottery_tilt_handles()
         self.pottery_tilt_matrix = correction
         self.pottery_tilt_origin_shift = shift
         self.pose_matrix = correction @ self.pottery_base_pose_matrix

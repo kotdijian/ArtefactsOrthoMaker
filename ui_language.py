@@ -9,6 +9,7 @@ from PySide6.QtGui import QAction
 # Source strings also serve as the fallback when a translation is unavailable.
 ENGLISH = {
     "手動傾き調整": "Manual tilt",
+    "傾きハンドル": "Tilt handles",
     "X軸の傾き": "Tilt about X",
     "Y軸の傾き": "Tilt about Y",
     "傾きを適用": "Apply tilt",
